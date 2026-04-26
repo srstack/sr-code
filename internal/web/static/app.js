@@ -35,6 +35,7 @@ function renderMarkdown(md) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
   s = s.replace(/&gt;/g, '>');
+  s = wrapTablesAsCodeFence(s);
   let html = window.snarkdown(s);
   // Block javascript:/data:/vbscript: in href / src of snarkdown output.
   html = html.replace(
@@ -43,6 +44,24 @@ function renderMarkdown(md) {
   );
   html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
   return html;
+}
+
+// snarkdown intentionally does not support markdown tables. We don't want a
+// full table parser either — a chat-aligned compromise is to wrap any block
+// of consecutive pipe-rows in a fenced code block so the columns survive in
+// monospace. This matches how Telegram / Slack already render tables and
+// keeps our IM-alignment story consistent.
+//
+// Existing fenced blocks are split out first so we never nest fences.
+function wrapTablesAsCodeFence(s) {
+  const parts = s.split(/(```[\s\S]*?```)/);
+  return parts.map((part, i) => {
+    if (i % 2 === 1) return part; // already a fence
+    return part.replace(
+      /(^|\n)((?:\|[^\n]*(?:\n|$))+)/g,
+      (_, lead, tbl) => lead + '\n```\n' + tbl.replace(/\n$/, '') + '\n```\n',
+    );
+  }).join('');
 }
 function fmt(iso) {
   if (!iso) return '';
