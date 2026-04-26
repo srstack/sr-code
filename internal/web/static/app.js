@@ -3,9 +3,11 @@
 
 const root = document.getElementById('root');
 const subtitle = document.getElementById('subtitle');
+const renderModeBtn = document.getElementById('render-mode-btn');
 
 let listInterval = null;
 let currentES = null;
+let renderMode = localStorage.getItem('usher.renderMode') === 'raw' ? 'raw' : 'md';
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
@@ -30,6 +32,9 @@ function esc(s) {
 // ergonomics and it silently corrupted fenced code blocks and lists, so
 // we left it alone. Users who want a break in chat hit Enter twice.
 function renderMarkdown(md) {
+  if (renderMode === 'raw') {
+    return '<pre class="raw-markdown">' + esc(md || '') + '</pre>';
+  }
   let s = String(md || '');
   s = s.replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -44,6 +49,35 @@ function renderMarkdown(md) {
   );
   html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
   return html;
+}
+
+// Re-render every element that carries a data-raw markdown source. Called
+// whenever the user toggles md/raw mode. Streaming response stays connected
+// because we don't tear down the SSE — only the in-place HTML changes.
+function rerenderAllContent() {
+  document.querySelectorAll('[data-raw]').forEach(el => {
+    el.innerHTML = renderMarkdown(el.dataset.raw);
+  });
+}
+
+function setRenderMode(mode) {
+  renderMode = mode === 'raw' ? 'raw' : 'md';
+  localStorage.setItem('usher.renderMode', renderMode);
+  updateRenderModeBtn();
+  rerenderAllContent();
+}
+
+function updateRenderModeBtn() {
+  if (!renderModeBtn) return;
+  renderModeBtn.textContent = 'render: ' + renderMode;
+  renderModeBtn.setAttribute('aria-pressed', renderMode === 'raw');
+}
+
+if (renderModeBtn) {
+  renderModeBtn.addEventListener('click', () => {
+    setRenderMode(renderMode === 'md' ? 'raw' : 'md');
+  });
+  updateRenderModeBtn();
 }
 
 // snarkdown intentionally does not support markdown tables. We don't want a
@@ -267,6 +301,7 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
     'subprocess.started': (d) => {
       accum = '';
       responseEl.innerHTML = '';
+      delete responseEl.dataset.raw;
       addEvent(eventsEl, 'info', `subprocess started (pid ${d.pid})`);
       onRunning();
     },
@@ -281,6 +316,7 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
       const e = d.event;
       if (e && e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
         accum += e.delta.text;
+        responseEl.dataset.raw = accum;
         responseEl.innerHTML = renderMarkdown(accum);
       }
     },
@@ -401,7 +437,7 @@ async function loadTranscript(id) {
       const ts = t.ts ? new Date(t.ts).toLocaleString() : '';
       div.innerHTML =
         `<div class="role">${esc(t.role)}<span class="ts">${esc(ts)}</span></div>` +
-        `<div class="content">${renderMarkdown(t.content || '')}</div>`;
+        `<div class="content" data-raw="${esc(t.content || '')}">${renderMarkdown(t.content || '')}</div>`;
       el.appendChild(div);
     }
     el.scrollTop = el.scrollHeight;
@@ -425,7 +461,9 @@ function appendChatMessage(m) {
   const div = document.createElement('div');
   div.className = 'chat-message ' + (m.role || 'agent');
   const role = m.role || 'agent';
-  div.innerHTML = `<div class="role">${esc(role)}</div><div class="content">${renderMarkdown(m.content || '')}</div>`;
+  div.innerHTML =
+    `<div class="role">${esc(role)}</div>` +
+    `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
 }
