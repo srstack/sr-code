@@ -12,6 +12,37 @@ function esc(s) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
 }
+
+// renderMarkdown turns assistant/user content into safe HTML using the
+// vendored snarkdown. Three things keep this safe:
+//
+//   1. snarkdown does NOT escape ordinary text — any raw `<script>` in the
+//      input would otherwise pass through. We HTML-escape the input first,
+//      then re-allow `>` so blockquote `> ` still parses (a stray `>` can't
+//      form an opening tag because `<` stays escaped).
+//
+//   2. snarkdown happily emits `<a href="javascript:…">` from user-supplied
+//      markdown. We strip risky URL schemes from any anchor / image tag
+//      it emits before handing the HTML to the DOM.
+//
+//   3. Single newlines become soft breaks (markdown convention `  \n`) for
+//      chat ergonomics; double newlines keep their block semantics.
+function renderMarkdown(md) {
+  let s = String(md || '');
+  s = s.replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+  s = s.replace(/&gt;/g, '>');
+  s = s.replace(/(?<!\n)\n(?!\n)/g, '  \n');
+  let html = window.snarkdown(s);
+  // Block javascript:/data:/vbscript: in href / src of snarkdown output.
+  html = html.replace(
+    /(<(?:a|img)\b[^>]*?\b(?:href|src)=")\s*(?:javascript|data|vbscript)\s*:[^"]*"/gi,
+    '$1#unsafe"',
+  );
+  html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
+  return html;
+}
 function fmt(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -121,7 +152,7 @@ async function showDetail(id) {
     </section>
     <section>
       <h3>response (current send)</h3>
-      <pre id="response"></pre>
+      <div id="response" class="content"></div>
     </section>
     <section>
       <h3>events</h3>
@@ -200,6 +231,8 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
 
+  let accum = ''; // raw markdown text accumulated from text_delta events
+
   const onIdle = () => {
     sendBtn.disabled = false;
     sendBtn.textContent = 'send';
@@ -212,7 +245,8 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
 
   const handlers = {
     'subprocess.started': (d) => {
-      responseEl.textContent = '';
+      accum = '';
+      responseEl.innerHTML = '';
       addEvent(eventsEl, 'info', `subprocess started (pid ${d.pid})`);
       onRunning();
     },
@@ -226,7 +260,8 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
     'stream_event': (d) => {
       const e = d.event;
       if (e && e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
-        responseEl.textContent += e.delta.text;
+        accum += e.delta.text;
+        responseEl.innerHTML = renderMarkdown(accum);
       }
     },
     'assistant': () => {/* full message; we already streamed via deltas */},
@@ -346,7 +381,7 @@ async function loadTranscript(id) {
       const ts = t.ts ? new Date(t.ts).toLocaleString() : '';
       div.innerHTML =
         `<div class="role">${esc(t.role)}<span class="ts">${esc(ts)}</span></div>` +
-        `<pre class="content">${esc(t.content || '')}</pre>`;
+        `<div class="content">${renderMarkdown(t.content || '')}</div>`;
       el.appendChild(div);
     }
     el.scrollTop = el.scrollHeight;
@@ -370,7 +405,7 @@ function appendChatMessage(m) {
   const div = document.createElement('div');
   div.className = 'chat-message ' + (m.role || 'agent');
   const role = m.role || 'agent';
-  div.innerHTML = `<div class="role">${esc(role)}</div><pre class="content">${esc(m.content || '')}</pre>`;
+  div.innerHTML = `<div class="role">${esc(role)}</div><div class="content">${renderMarkdown(m.content || '')}</div>`;
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
 }

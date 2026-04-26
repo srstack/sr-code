@@ -28,9 +28,11 @@ v0.1 is feature-complete.
 - **No process ownership.** Each "send" is a fresh `claude -p --resume`
   subprocess. Claude Code internally serializes concurrent resumes via
   filesystem-based queue events, so usher needs no locks of its own.
-- **Stdlib first.** Two third-party Go deps (`fsnotify`, `google/uuid`); no
-  HTTP framework, no ORM, no logger lib, no testing lib. Frontend is plain
-  HTML + a small `app.js`, no build step.
+- **Stdlib first.** One direct third-party Go dep (`fsnotify`); no HTTP
+  framework, no ORM, no logger lib, no testing lib. Frontend is plain HTML
+  + a small `app.js` plus one vendored 2 KB markdown renderer
+  (`snarkdown`, MIT, single file under `internal/web/static/vendor/`).
+  No build step, no npm.
 
 ## Build & run
 
@@ -173,6 +175,29 @@ switch to that session's tab to watch the response stream in.
   `Session.Status` with `running` while one is in flight. The list view
   shows `● running` next to live sessions; the detail view's transcript
   refreshes automatically when the in-flight send exits.
+
+## Markdown rendering
+
+Assistant + user content (transcripts, current-send response, main-chat
+messages) is rendered through `snarkdown` 2.0.0 (MIT, vendored as a single
+2 KB file at `internal/web/static/vendor/snarkdown.js`). This handles the
+LCD subset that maps cleanly onto IM platforms: bold, italic, inline code,
+fenced code blocks, links, lists, headings, blockquotes.
+
+The wrapper `renderMarkdown(md)` in `app.js` does three things snarkdown
+itself won't:
+
+1. HTML-escape the input first (snarkdown does **not** escape ordinary
+   text, so a raw `<script>` would otherwise pass through). `>` is
+   re-allowed afterward so blockquotes still parse — `<` stays escaped,
+   so no real tag can form.
+2. Strip `javascript:` / `data:` / `vbscript:` URL schemes from any anchor
+   or image emitted by snarkdown.
+3. Add `target="_blank" rel="noopener"` to all rendered links.
+
+Future IM adapters (Telegram, Slack, …) take the same raw markdown source
+from `Message.Content` and re-encode to their native flavor — markdown is
+the lingua franca rather than HTML.
 
 ## v0.1 architecture summary
 
