@@ -1,0 +1,6 @@
+{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"sample"}
+{"type":"file-history-snapshot","messageId":"m1","snapshot":{},"isSnapshotUpdate":false}
+{"parentUuid":null,"isSidechain":false,"promptId":"p1","type":"user","message":{"role":"user","content":"first prompt"},"uuid":"u1","timestamp":"2026-04-26T10:00:00.000Z","cwd":"/tmp/test-project","sessionId":"sample"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first response"}]},"uuid":"u2","timestamp":"2026-04-26T10:00:01.000Z","cwd":"/tmp/test-project","sessionId":"sample"}
+{"type":"ai-title","title":"Hand-titled Session","sessionId":"sample","timestamp":"2026-04-26T10:00:02.000Z"}
+{"parentUuid":"u2","isSidechain":false,"promptId":"p2","type":"user","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]},"uuid":"u3","timestamp":"2026-04-26T10:00:03.000Z","cwd":"/tmp/test-project","sessionId":"sample"}

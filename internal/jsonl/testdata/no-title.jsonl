@@ -1,0 +1,3 @@
+{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"no-title"}
+{"parentUuid":null,"isSidechain":false,"promptId":"p1","type":"user","message":{"role":"user","content":"Reply with exactly: APPLE"},"uuid":"u1","timestamp":"2026-04-26T10:00:00.000Z","cwd":"/tmp/short","sessionId":"no-title"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"APPLE"}]},"uuid":"u2","timestamp":"2026-04-26T10:00:01.000Z","cwd":"/tmp/short","sessionId":"no-title"}
