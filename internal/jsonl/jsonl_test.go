@@ -154,7 +154,7 @@ func TestExtractTextContent_ToolUseAndResult(t *testing.T) {
 		{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}
 	]}`)
 	got := extractTextContent(msg)
-	if !strings.Contains(got, "running ls") || !strings.Contains(got, "[tool: Bash]") {
+	if !strings.Contains(got, "running ls") || !strings.Contains(got, "`tool: Bash`") {
 		t.Errorf("got %q", got)
 	}
 
@@ -162,7 +162,7 @@ func TestExtractTextContent_ToolUseAndResult(t *testing.T) {
 	msg2 := []byte(`{"role":"user","content":[
 		{"type":"tool_result","tool_use_id":"tu1","content":"file1.txt\nfile2.txt"}
 	]}`)
-	if got := extractTextContent(msg2); !strings.Contains(got, "[result: file1.txt") {
+	if got := extractTextContent(msg2); !strings.Contains(got, "`result: file1.txt") {
 		t.Errorf("string result got %q", got)
 	}
 
@@ -170,7 +170,15 @@ func TestExtractTextContent_ToolUseAndResult(t *testing.T) {
 	msg3 := []byte(`{"role":"user","content":[
 		{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"some output"}]}
 	]}`)
-	if got := extractTextContent(msg3); !strings.Contains(got, "[result: some output") {
+	if got := extractTextContent(msg3); !strings.Contains(got, "`result: some output") {
 		t.Errorf("block result got %q", got)
+	}
+
+	// backticks in tool result are sanitized so the wrapping ` survives
+	msg4 := []byte(`{"role":"user","content":[
+		{"type":"tool_result","content":"echo ` + "`hi`" + `"}
+	]}`)
+	if got := extractTextContent(msg4); strings.Count(got, "`") != 2 {
+		t.Errorf("backtick sanitization failed: %q", got)
 	}
 }

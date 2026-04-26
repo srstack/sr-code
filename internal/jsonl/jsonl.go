@@ -213,15 +213,20 @@ func extractTextContent(msg json.RawMessage) string {
 				parts = append(parts, b.Text)
 			}
 		case "tool_use":
+			// Wrap in backticks so the markdown renderer treats it as inline
+			// code (distinct visual + non-link). snarkdown otherwise sees
+			// `[tool: Bash]` as a malformed reference link.
 			if b.Name != "" {
-				parts = append(parts, "[tool: "+b.Name+"]")
+				parts = append(parts, "`tool: "+b.Name+"`")
 			}
 		case "tool_result":
 			if txt := flattenToolResult(b.Content); txt != "" {
 				if len([]rune(txt)) > 200 {
 					txt = string([]rune(txt)[:200]) + "…"
 				}
-				parts = append(parts, "[result: "+txt+"]")
+				// Strip backticks from the inner text so wrapping survives.
+				txt = strings.ReplaceAll(txt, "`", "'")
+				parts = append(parts, "`result: "+txt+"`")
 			}
 		}
 	}

@@ -14,7 +14,7 @@ function esc(s) {
 }
 
 // renderMarkdown turns assistant/user content into safe HTML using the
-// vendored snarkdown. Three things keep this safe:
+// vendored snarkdown. Two things keep this safe:
 //
 //   1. snarkdown does NOT escape ordinary text — any raw `<script>` in the
 //      input would otherwise pass through. We HTML-escape the input first,
@@ -25,15 +25,16 @@ function esc(s) {
 //      markdown. We strip risky URL schemes from any anchor / image tag
 //      it emits before handing the HTML to the DOM.
 //
-//   3. Single newlines become soft breaks (markdown convention `  \n`) for
-//      chat ergonomics; double newlines keep their block semantics.
+// Newlines follow Markdown convention: single \n = space, double \n+ =
+// soft line break. We tried preprocessing single \n → soft break for chat
+// ergonomics and it silently corrupted fenced code blocks and lists, so
+// we left it alone. Users who want a break in chat hit Enter twice.
 function renderMarkdown(md) {
   let s = String(md || '');
   s = s.replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
   s = s.replace(/&gt;/g, '>');
-  s = s.replace(/(?<!\n)\n(?!\n)/g, '  \n');
   let html = window.snarkdown(s);
   // Block javascript:/data:/vbscript: in href / src of snarkdown output.
   html = html.replace(
