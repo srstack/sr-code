@@ -52,9 +52,26 @@ func New(claudeCmd, permissionMode string, logger *slog.Logger) *Sender {
 // the subprocess exits or ctx is cancelled. Cancelling ctx sends SIGINT and,
 // after a 5s grace period, SIGKILL via exec.WaitDelay.
 func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
+	return s.run(ctx, sessionID, prompt, cwd, false)
+}
+
+// SendNew is like Send but creates a brand-new session with the given UUID.
+// It uses `--session-id <uuid>` instead of `--resume <id>`. Claude Code
+// initializes the jsonl at ~/.claude/projects/<sanitized-cwd>/<uuid>.jsonl
+// the first time the subprocess writes anything; usher's discovery picks
+// it up via fsnotify.
+func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
+	return s.run(ctx, sessionID, prompt, cwd, true)
+}
+
+func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd string, isNew bool) (<-chan StreamEvent, error) {
+	idFlag := "--resume"
+	if isNew {
+		idFlag = "--session-id"
+	}
 	args := []string{
 		"-p",
-		"--resume", sessionID,
+		idFlag, sessionID,
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--verbose",

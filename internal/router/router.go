@@ -7,9 +7,11 @@ package router
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -250,4 +252,61 @@ func extractErrorMessage(raw json.RawMessage) string {
 		return "unknown error"
 	}
 	return e.Message
+}
+
+// CreateSession spawns a brand-new Claude Code session in cwd and waits for
+// the assistant's first response (subject to timeout). Returns the
+// generated session id and the accumulated assistant text. The session
+// will appear in discovery via fsnotify shortly after the subprocess
+// starts writing its jsonl.
+func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, timeout time.Duration) (string, string, error) {
+	if cwd == "" {
+		return "", "", errors.New("cwd is required")
+	}
+	if info, err := os.Stat(cwd); err != nil {
+		return "", "", fmt.Errorf("cwd %q: %w", cwd, err)
+	} else if !info.IsDir() {
+		return "", "", fmt.Errorf("cwd %q is not a directory", cwd)
+	}
+	if initialMsg == "" {
+		return "", "", errors.New("initial_message is required")
+	}
+
+	sessionID := newUUIDv4()
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ch, err := r.sender.SendNew(waitCtx, sessionID, initialMsg, cwd)
+	if err != nil {
+		return "", "", err
+	}
+
+	var buf strings.Builder
+	for ev := range ch {
+		// Forward to broker so any session-detail subscriber that opens
+		// the new tab sees the live stream too.
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
+		if ev.Type == "stream_event" {
+			if t := extractTextDelta(ev.Raw); t != "" {
+				buf.WriteString(t)
+			}
+		}
+	}
+
+	if waitCtx.Err() != nil && buf.Len() == 0 {
+		return sessionID, "", fmt.Errorf("create_session timeout (no response received within %s)", timeout)
+	}
+	return sessionID, buf.String(), nil
+}
+
+// newUUIDv4 produces a randomly-generated UUIDv4 string. We avoid the
+// google/uuid dep — Claude Code accepts any RFC 4122 v4 string.
+func newUUIDv4() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

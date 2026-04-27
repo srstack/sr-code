@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -102,10 +104,49 @@ type apiErrorBody struct {
 	} `json:"error"`
 }
 
-// ChatCompletion sends a single non-streaming request and returns the
-// decoded response. Multi-turn conversations are the caller's job (append
-// the assistant message + any tool messages to req.Messages and call again).
+// APIError carries the HTTP status alongside the message so retry logic
+// can distinguish 429 / 5xx from permanent failures without string-matching.
+type APIError struct {
+	StatusCode int
+	Message    string
+	// RetryAfter is the parsed `Retry-After` header in seconds, if present.
+	// 0 means the header was absent or unparseable.
+	RetryAfter int
+}
+
+func (e *APIError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message) }
+
+// retry config — single retry on 429 or 5xx with a bounded back-off.
+const (
+	maxRetryAttempts = 1
+	defaultBackoff   = 2 * time.Second
+	maxBackoff       = 60 * time.Second
+)
+
+// ChatCompletion sends a non-streaming request and returns the decoded
+// response. On a transient failure (HTTP 429 or 5xx), retries once,
+// honoring the `Retry-After` header (capped at 60s) when present.
 func (c *ChatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+	var resp ChatResponse
+	var err error
+	for attempt := 0; ; attempt++ {
+		resp, err = c.doChatCompletion(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		if attempt >= maxRetryAttempts || !shouldRetry(err) {
+			return resp, err
+		}
+		delay := backoffFor(err)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return resp, ctx.Err()
+		}
+	}
+}
+
+func (c *ChatClient) doChatCompletion(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
@@ -134,11 +175,18 @@ func (c *ChatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatR
 	}
 
 	if httpResp.StatusCode >= 400 {
+		msg := ""
 		var e apiErrorBody
 		if err := json.Unmarshal(raw, &e); err == nil && e.Error.Message != "" {
-			return ChatResponse{}, fmt.Errorf("HTTP %d: %s", httpResp.StatusCode, e.Error.Message)
+			msg = e.Error.Message
+		} else {
+			msg = truncate(string(raw), 500)
 		}
-		return ChatResponse{}, fmt.Errorf("HTTP %d: %s", httpResp.StatusCode, truncate(string(raw), 500))
+		return ChatResponse{}, &APIError{
+			StatusCode: httpResp.StatusCode,
+			Message:    msg,
+			RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+		}
 	}
 
 	var resp ChatResponse
@@ -146,4 +194,43 @@ func (c *ChatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatR
 		return ChatResponse{}, fmt.Errorf("decode response: %w", err)
 	}
 	return resp, nil
+}
+
+// shouldRetry returns true for 429 and 5xx APIErrors. Network errors are
+// not retried — most are local and unlikely to self-heal in 2s.
+func shouldRetry(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.StatusCode == http.StatusTooManyRequests || (ae.StatusCode >= 500 && ae.StatusCode < 600)
+}
+
+// backoffFor returns the wait duration before retrying err. For 429 with
+// a Retry-After header, that's the requested delay (capped at 60s); for
+// other retryable errors it's a fixed default.
+func backoffFor(err error) time.Duration {
+	var ae *APIError
+	if errors.As(err, &ae) && ae.RetryAfter > 0 {
+		d := time.Duration(ae.RetryAfter) * time.Second
+		if d > maxBackoff {
+			d = maxBackoff
+		}
+		return d
+	}
+	return defaultBackoff
+}
+
+// parseRetryAfter parses the Retry-After header. The HTTP spec allows both
+// "delta seconds" and an HTTP-date; we only handle the integer form, which
+// is what every LLM provider uses in practice.
+func parseRetryAfter(h string) int {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(h); err == nil && n > 0 {
+		return n
+	}
+	return 0
 }

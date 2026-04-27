@@ -56,8 +56,14 @@ type fakeAgentAPI struct {
 	waitReplies map[string]string
 	waitErrs    map[string]error
 	waitedFor   []sendCall
+
+	created      []createCall
+	createReply  string
+	createNewID  string
+	createErr    error
 }
 type sendCall struct{ ID, Text string }
+type createCall struct{ Cwd, Msg string }
 
 func newFakeAgentAPI() *fakeAgentAPI {
 	return &fakeAgentAPI{
@@ -96,6 +102,13 @@ func (f *fakeAgentAPI) SendToSessionAndWait(_ context.Context, id, text string, 
 		return reply, nil
 	}
 	return "", nil
+}
+func (f *fakeAgentAPI) CreateSession(_ context.Context, cwd, msg string, _ time.Duration) (string, string, error) {
+	f.created = append(f.created, createCall{cwd, msg})
+	if f.createErr != nil {
+		return f.createNewID, f.createReply, f.createErr
+	}
+	return f.createNewID, f.createReply, nil
 }
 
 // --- helpers ---
@@ -409,6 +422,39 @@ func TestLLMAgent_RequiresClientAndModel(t *testing.T) {
 	}
 	if _, err := NewLLM(newFakeAgentAPI(), LLMConfig{Client: NewChatClient("http://x", "k")}); err == nil {
 		t.Error("expected error for empty Model")
+	}
+}
+
+func TestLLMAgent_CreateSession(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.createNewID = "new-uuid-1234"
+	api.createReply = "Hi! I'm ready to help."
+
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c", "create_session", `{"cwd":"/tmp","initial_message":"hello there"}`),
+		chatTextResp("created session new-uuid (assistant said hi)"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res := runHandle(t, a, "open a tmp scratch session")
+	if res.FocusSession != "new-uuid-1234" {
+		t.Errorf("focus = %q, want new-uuid-1234", res.FocusSession)
+	}
+	if len(api.created) != 1 || api.created[0].Cwd != "/tmp" || api.created[0].Msg != "hello there" {
+		t.Errorf("created = %+v", api.created)
+	}
+}
+
+func TestLLMAgent_CreateSessionMissingArgs(t *testing.T) {
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c", "create_session", `{"cwd":""}`),
+		chatTextResp("you'll need a cwd"),
+	})
+	defer srv.Close()
+	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
+	if _, err := a.Handle(context.Background(), nil, "", "scratch"); err != nil {
+		t.Fatal(err)
 	}
 }
 

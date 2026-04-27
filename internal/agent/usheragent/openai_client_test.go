@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func atomicAdd(p *int32, n int32) int32 { return atomic.AddInt32(p, n) }
 
 func TestChatClient_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +100,102 @@ func TestChatClient_NonJSONErrorBody(t *testing.T) {
 	_, err := c.ChatCompletion(context.Background(), ChatRequest{Model: "x", Messages: []ChatMessage{{Role: "user", Content: "x"}}})
 	if err == nil || !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "upstream") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestChatClient_RetriesOn429(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomicAdd(&calls, 1)
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"after retry"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewChatClient(srv.URL+"/v1", "k")
+	resp, err := c.ChatCompletion(context.Background(), ChatRequest{
+		Model:    "x",
+		Messages: []ChatMessage{{Role: "user", Content: "x"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Choices[0].Message.Content != "after retry" {
+		t.Errorf("Content = %q", resp.Choices[0].Message.Content)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls (1 retry), got %d", calls)
+	}
+}
+
+func TestChatClient_RetriesOn5xx(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomicAdd(&calls, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+	c := NewChatClient(srv.URL+"/v1", "k")
+	resp, err := c.ChatCompletion(context.Background(), ChatRequest{Model: "x", Messages: []ChatMessage{{Role: "user", Content: "x"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Choices[0].Message.Content != "recovered" {
+		t.Errorf("Content = %q", resp.Choices[0].Message.Content)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestChatClient_NoRetryOn4xxOther(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomicAdd(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"nope"}}`))
+	}))
+	defer srv.Close()
+	c := NewChatClient(srv.URL+"/v1", "k")
+	if _, err := c.ChatCompletion(context.Background(), ChatRequest{Model: "x", Messages: []ChatMessage{{Role: "user", Content: "x"}}}); err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 call (no retry on 400), got %d", calls)
+	}
+}
+
+func TestChatClient_GivesUpAfterOneRetry(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomicAdd(&calls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	c := NewChatClient(srv.URL+"/v1", "k")
+	if _, err := c.ChatCompletion(context.Background(), ChatRequest{Model: "x", Messages: []ChatMessage{{Role: "user", Content: "x"}}}); err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls (1 + 1 retry), got %d", calls)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := map[string]int{"": 0, "5": 5, "0": 0, "-3": 0, "abc": 0, "  10  ": 10}
+	for in, want := range cases {
+		if got := parseRetryAfter(in); got != want {
+			t.Errorf("parseRetryAfter(%q) = %d, want %d", in, got, want)
+		}
 	}
 }
 

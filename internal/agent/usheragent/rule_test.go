@@ -74,6 +74,9 @@ func (f *fakeAPI) SendToSessionAndWait(_ context.Context, id, text string, _ tim
 	}
 	return "", nil
 }
+func (f *fakeAPI) CreateSession(_ context.Context, _, _ string, _ time.Duration) (string, string, error) {
+	return "", "", fmt.Errorf("rule agent test fake: CreateSession not used")
+}
 
 func handle(t *testing.T, a *RuleAgent, msg string) string {
 	t.Helper()

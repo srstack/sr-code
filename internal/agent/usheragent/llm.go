@@ -60,10 +60,12 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 }
 
 const (
-	defaultWaitTimeout = 300 * time.Second  // 5 min — covers most non-coding turns
-	maxWaitTimeout     = 1800 * time.Second // 30 min — hard ceiling
-	defaultReadTurns   = 20
-	maxReadTurns       = 200
+	defaultWaitTimeout   = 300 * time.Second  // 5 min — covers most non-coding turns
+	maxWaitTimeout       = 1800 * time.Second // 30 min — hard ceiling
+	defaultReadTurns     = 20
+	maxReadTurns         = 200
+	defaultCreateTimeout = 300 * time.Second // 5 min — initial-message turn
+	maxCreateTimeout     = 900 * time.Second // 15 min — hard ceiling
 )
 
 // Handle drives the tool-call loop until the model returns finish_reason="stop"
@@ -216,6 +218,34 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		b, _ := json.Marshal(turns)
 		return string(b), args.SessionID
 
+	case "create_session":
+		var args struct {
+			Cwd            string `json:"cwd"`
+			InitialMessage string `json:"initial_message"`
+			TimeoutSeconds int    `json:"timeout_seconds"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.Cwd == "" || args.InitialMessage == "" {
+			return errResult("cwd and initial_message are required"), ""
+		}
+		timeout := defaultCreateTimeout
+		if args.TimeoutSeconds > 0 {
+			t := time.Duration(args.TimeoutSeconds) * time.Second
+			if t > maxCreateTimeout {
+				t = maxCreateTimeout
+			}
+			timeout = t
+		}
+		newID, text, err := a.api.CreateSession(ctx, args.Cwd, args.InitialMessage, timeout)
+		if err != nil {
+			payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text, "error": err.Error()})
+			return string(payload), newID
+		}
+		payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text})
+		return string(payload), newID
+
 	case "list_pending_interactions":
 		b, _ := json.Marshal(a.api.ListPendingInteractions())
 		return string(b), ""
@@ -319,6 +349,23 @@ func defaultTools() []ChatTool {
 						"limit":      map[string]any{"type": "integer", "description": "Optional. Default 20, max 200."},
 					},
 					"required":             []string{"session_id"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name:        "create_session",
+				Description: "Start a NEW Claude Code session in cwd with an initial message. Returns the new session id and the assistant's first response. Use when the user wants fresh context — scratch work, a new project — that doesn't fit any existing session. cwd MUST exist; the agent shouldn't invent a path. Default timeout 300s, max 900s. After creation, the new session's id becomes the focus and follow-up tools (send_to_session, read_session_transcript, send_and_wait_for_response) target it.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"cwd":             map[string]any{"type": "string", "description": "Working directory for the new session. Must exist."},
+						"initial_message": map[string]any{"type": "string", "description": "First message sent to the new session."},
+						"timeout_seconds": map[string]any{"type": "integer", "description": "Optional. Default 300, max 900."},
+					},
+					"required":             []string{"cwd", "initial_message"},
 					"additionalProperties": false,
 				},
 			},

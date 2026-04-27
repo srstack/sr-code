@@ -33,6 +33,11 @@ type AgentAPI interface {
 	// as SendToSession but blocks until the assistant turn completes (or
 	// timeout/ctx cancel), returning the accumulated assistant text.
 	SendToSessionAndWait(ctx context.Context, id, text string, timeout time.Duration) (string, error)
+
+	// CreateSession starts a brand-new session in cwd with the given initial
+	// message and waits for the first assistant response. Returns the new
+	// session id and the assistant text.
+	CreateSession(ctx context.Context, cwd, initialMsg string, timeout time.Duration) (string, string, error)
 }
 
 // HistoryMessage is one prior turn handed to Agent.Handle. The Agent is
