@@ -133,7 +133,9 @@ the primary permission UI.
 - `internal/mainchat` — append-only jsonl per chat at
   `$XDG_DATA_HOME/usher/mainchats/<id>.jsonl`. Single-process mutex
   serializes appends; missing files mean "empty chat".
-- `internal/agent/usheragent` — the rule-based main-chat agent. Commands:
+- `internal/agent/usheragent` — main-chat agent. Two backends behind one
+  `Agent` interface: rule-based (default) and LLM. Commands for the rule
+  agent:
 
   ```
   /list                       list all Claude Code sessions
@@ -160,6 +162,58 @@ the primary permission UI.
 `/send` from main chat dispatches the same fire-and-forget subprocess as the
 session detail view: the agent confirms with `sent to <id>`, and you can
 switch to that session's tab to watch the response stream in.
+
+## LLM agent (v0.2)
+
+A natural-language agent backend lives behind the same `Agent` interface.
+Switch backends with `--agent-mode llm`:
+
+```
+./usher serve \
+  --agent-mode llm \
+  --llm-base-url https://api.openai.com/v1 \
+  --llm-model gpt-4o-mini \
+  --llm-api-key-env OPENAI_API_KEY
+```
+
+It speaks the **OpenAI Chat Completions** wire format (`/v1/chat/completions`)
+— the de facto standard implemented by OpenAI, Anthropic's OpenAI-compatible
+endpoint, Ollama, DeepSeek, Together, Groq, OpenRouter, vLLM, LM Studio,
+and most local-model servers. Examples:
+
+```
+# Local Ollama (no API key needed)
+./usher serve --agent-mode llm \
+  --llm-base-url http://localhost:11434/v1 \
+  --llm-model qwen2.5:14b \
+  --llm-api-key-env ""
+
+# DeepSeek
+./usher serve --agent-mode llm \
+  --llm-base-url https://api.deepseek.com/v1 \
+  --llm-model deepseek-chat \
+  --llm-api-key-env DEEPSEEK_API_KEY
+
+# Anthropic via its OpenAI-compatible mode
+./usher serve --agent-mode llm \
+  --llm-base-url https://api.anthropic.com/v1 \
+  --llm-model claude-haiku-4-5 \
+  --llm-api-key-env ANTHROPIC_API_KEY
+```
+
+The agent has access to four tools mirroring the agent's `AgentAPI` (a
+strict subset of `router.Router`): `list_sessions`, `send_to_session`,
+`list_pending_interactions`, `respond_to_interaction`. Tool definitions
+live inline in `internal/agent/usheragent/llm.go`; the system prompt is
+embedded from `internal/agent/usheragent/prompts/system_prompt.md`.
+
+We deliberately do **not** vendor an LLM SDK. The Chat Completions HTTP
+client is ~120 lines of pure stdlib (`internal/agent/usheragent/openai_client.go`),
+which keeps the dependency tree at one direct third-party package
+(`fsnotify`) and lets users bring any provider they like. Tradeoff:
+provider-specific features (Anthropic prompt caching, OpenAI structured
+outputs, adaptive thinking) are out of scope. For usher's routing agent
+this is the right balance — Haiku-tier or local models handle the workload.
 
 ## What commit 5 adds
 

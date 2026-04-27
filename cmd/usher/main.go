@@ -74,6 +74,14 @@ func serve(args []string) error {
 	claudeCmd := fs.String("claude", "claude", "path to the claude binary")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
+	agentMode := fs.String("agent-mode", "rule",
+		"main-chat agent backend: rule | llm")
+	llmBaseURL := fs.String("llm-base-url", "https://api.openai.com/v1",
+		"OpenAI-compatible chat completions base URL (e.g. https://api.openai.com/v1, http://localhost:11434/v1)")
+	llmModel := fs.String("llm-model", "",
+		"model identifier when --agent-mode=llm (e.g. gpt-4o-mini, claude-haiku-4-5, qwen2.5:14b)")
+	llmAPIKeyEnv := fs.String("llm-api-key-env", "OPENAI_API_KEY",
+		"env var holding the API key (use empty value for backends without auth, e.g. local Ollama)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -101,7 +109,10 @@ func serve(args []string) error {
 		return fmt.Errorf("init main chat store: %w", err)
 	}
 
-	agent := usheragent.NewRule(r)
+	agent, err := buildAgent(r, *agentMode, *llmBaseURL, *llmModel, *llmAPIKeyEnv)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -112,6 +123,25 @@ func serve(args []string) error {
 
 	srv := web.NewServer(*addr, r, mainStore, agent, logger)
 	return srv.Run(ctx)
+}
+
+func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string) (usheragent.Agent, error) {
+	switch mode {
+	case "", "rule":
+		return usheragent.NewRule(r), nil
+	case "llm":
+		if model == "" {
+			return nil, fmt.Errorf("--agent-mode=llm requires --llm-model (e.g. --llm-model gpt-4o-mini)")
+		}
+		var apiKey string
+		if apiKeyEnv != "" {
+			apiKey = os.Getenv(apiKeyEnv)
+		}
+		client := usheragent.NewChatClient(baseURL, apiKey)
+		return usheragent.NewLLM(r, usheragent.LLMConfig{Client: client, Model: model})
+	default:
+		return nil, fmt.Errorf("unknown --agent-mode: %q (want rule | llm)", mode)
+	}
 }
 
 func defaultProjectsDir() string {

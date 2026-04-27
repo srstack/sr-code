@@ -206,6 +206,7 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 .chat-message.user .role { color: #1f6feb; }
 .chat-message.agent .role { color: #6e40c9; }
 .chat-message.error .role { color: #cf222e; }
+.chat-message.placeholder .content { color: #9ca3af; font-style: italic; }
 .chat-message .content { margin: 0; }
 .chat-message .role .ts {
   font-size: 0.7rem;

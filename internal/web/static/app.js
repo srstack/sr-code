@@ -389,6 +389,10 @@ async function showMainChat(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    // Optimistic: show the user's message immediately and a "thinking" placeholder
+    // since LLM agents may take 5–30s before any response comes back.
+    appendChatMessage({ role: 'user', content: text });
+    const placeholder = appendChatMessage({ role: 'agent', content: 'thinking…', _placeholder: true });
     try {
       const res = await fetch('/api/mainchats/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
@@ -396,12 +400,17 @@ async function showMainChat(id) {
         body: JSON.stringify({ text }),
       });
       const data = await res.json();
+      if (placeholder) placeholder.remove();
       if (!res.ok) {
         appendChatMessage({ role: 'error', content: data.error || 'send failed' });
       } else {
-        for (const m of (data.messages || [])) appendChatMessage(m);
+        // Server returns the persisted user+agent pair. We already showed user
+        // optimistically, so only render the agent reply (and any extras) here.
+        const msgs = (data.messages || []).filter(m => m.role !== 'user');
+        for (const m of msgs) appendChatMessage(m);
       }
     } catch (e) {
+      if (placeholder) placeholder.remove();
       appendChatMessage({ role: 'error', content: String(e) });
     } finally {
       sendBtn.disabled = false;
@@ -457,15 +466,16 @@ async function loadChatMessages(id) {
 
 function appendChatMessage(m) {
   const list = document.getElementById('chat-scroll');
-  if (!list) return;
+  if (!list) return null;
   const div = document.createElement('div');
-  div.className = 'chat-message ' + (m.role || 'agent');
+  div.className = 'chat-message ' + (m.role || 'agent') + (m._placeholder ? ' placeholder' : '');
   const role = m.role || 'agent';
   div.innerHTML =
     `<div class="role">${esc(role)}</div>` +
     `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
+  return div;
 }
 
 // ---------- Permission-request modal (global, runs in all views) ----------
