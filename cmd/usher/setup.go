@@ -61,7 +61,11 @@ func runSetup(args []string) error {
 				map[string]any{
 					"type":    "command",
 					"command": cmd,
-					"timeout": 600,
+					// 60s gives the user enough time to react in the modal
+					// without leaving Claude blocked indefinitely. If the
+					// hook times out it returns no decision and Claude
+					// proceeds with its default permission flow.
+					"timeout": 60,
 				},
 			},
 		})
@@ -88,7 +92,7 @@ func runSetup(args []string) error {
 		fmt.Printf("installed usher hook in %s\n", settingsPath)
 		fmt.Printf("  matcher: (all tools)\n")
 		fmt.Printf("  command: %s\n", cmd)
-		fmt.Printf("  timeout: 600s\n")
+		fmt.Printf("  timeout: 60s\n")
 		fmt.Println()
 		fmt.Println("Re-run with --remove to uninstall.")
 	}

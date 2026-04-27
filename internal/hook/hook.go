@@ -2,6 +2,12 @@
 // UI. The CLI subcommand `usher hook <event>` POSTs a hook payload to the
 // running server, which holds a pending interaction until a UI client decides
 // allow / deny, then returns the decision back to Claude Code on stdout.
+//
+// "Remember this choice" decisions are kept per-session in memory: when the
+// user picks Allow / Deny "always", the manager derives a matcher from the
+// payload (Bash uses a "Bash(<first-word>:*)" pattern, every other tool just
+// matches by name) and stores it; subsequent identical hook events for the
+// same session are answered automatically without bothering the UI.
 package hook
 
 import (
@@ -10,6 +16,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,8 +41,22 @@ type pendingEntry struct {
 
 // Response is the user's decision on a pending interaction.
 type Response struct {
-	Behavior string `json:"behavior"` // allow | deny
+	Behavior string `json:"behavior"`        // allow | deny
 	Reason   string `json:"reason,omitempty"`
+	// Scope is "once" (default) or "session". A "session"-scope decision is
+	// remembered for the originating session and reapplied to matching
+	// future hook events without prompting the UI again.
+	Scope string `json:"scope,omitempty"`
+}
+
+// Rule is a remembered allow/deny decision derived from a Response with
+// Scope="session". Matcher is either an exact tool name or a Bash subset
+// pattern "Bash(<prefix>:*)" — same shape as claudecodeui's allowedTools
+// entries.
+type Rule struct {
+	SessionID string `json:"session_id"`
+	Behavior  string `json:"behavior"` // allow | deny
+	Matcher   string `json:"matcher"`
 }
 
 // Event is the input usher receives from `usher hook` and forwards to Submit.
@@ -45,24 +68,36 @@ type Event struct {
 	Cwd       string
 }
 
-// Manager owns the in-memory map of pending interactions and serializes
-// access through Submit/Respond/List. There is no on-disk persistence:
-// pending interactions survive only as long as the process and the hook's
-// own timeout (Claude Code defaults to 60s, usher's `usher setup` raises
-// that to 600s).
+// Manager owns the in-memory map of pending interactions and the per-
+// session remembered-rule list. Both are process-lifetime only.
 type Manager struct {
 	mu      sync.Mutex
 	pending map[string]*pendingEntry
+
+	rememberMu sync.Mutex
+	remembered map[string][]Rule // sessionID → rules
 }
 
 func New() *Manager {
-	return &Manager{pending: map[string]*pendingEntry{}}
+	return &Manager{
+		pending:    map[string]*pendingEntry{},
+		remembered: map[string][]Rule{},
+	}
 }
 
 // Submit registers a pending interaction and blocks until either the user
-// responds via Respond or ctx is cancelled. It cleans up the entry before
-// returning.
+// responds via Respond or ctx is cancelled. If a remembered rule already
+// matches the incoming event, it returns that decision immediately without
+// touching the UI. If the user's response carries Scope="session", the
+// derived rule is stored before returning.
 func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
+	if rule := m.findMatchingRule(ev); rule != nil {
+		return Response{
+			Behavior: rule.Behavior,
+			Reason:   "remembered: " + rule.Matcher,
+		}, nil
+	}
+
 	p := &pendingEntry{
 		Pending: Pending{
 			ID:        newID(),
@@ -87,6 +122,9 @@ func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
 
 	select {
 	case r := <-p.response:
+		if r.Scope == "session" {
+			m.rememberRule(ev, r.Behavior)
+		}
 		return r, nil
 	case <-ctx.Done():
 		return Response{}, ctx.Err()
@@ -125,4 +163,98 @@ func newID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// --- Remembered rules ----------------------------------------------------
+
+// ListRules returns a snapshot of all remembered rules across all sessions.
+func (m *Manager) ListRules() []Rule {
+	m.rememberMu.Lock()
+	defer m.rememberMu.Unlock()
+	var out []Rule
+	for _, rules := range m.remembered {
+		out = append(out, rules...)
+	}
+	return out
+}
+
+// ForgetSessionRules clears all remembered rules for sessionID.
+func (m *Manager) ForgetSessionRules(sessionID string) {
+	m.rememberMu.Lock()
+	delete(m.remembered, sessionID)
+	m.rememberMu.Unlock()
+}
+
+func (m *Manager) findMatchingRule(ev Event) *Rule {
+	m.rememberMu.Lock()
+	rules := m.remembered[ev.SessionID]
+	m.rememberMu.Unlock()
+	for i := range rules {
+		if matchRule(rules[i], ev.ToolName, ev.ToolInput) {
+			return &rules[i]
+		}
+	}
+	return nil
+}
+
+func (m *Manager) rememberRule(ev Event, behavior string) {
+	matcher := deriveMatcher(ev.ToolName, ev.ToolInput)
+	if matcher == "" {
+		return
+	}
+	rule := Rule{SessionID: ev.SessionID, Behavior: behavior, Matcher: matcher}
+
+	m.rememberMu.Lock()
+	defer m.rememberMu.Unlock()
+	for _, existing := range m.remembered[ev.SessionID] {
+		if existing.Matcher == matcher && existing.Behavior == behavior {
+			return // dedupe
+		}
+	}
+	m.remembered[ev.SessionID] = append(m.remembered[ev.SessionID], rule)
+}
+
+var bashPrefixRE = regexp.MustCompile(`^Bash\((.+):\*\)$`)
+
+// matchRule reports whether a remembered rule applies to the given event.
+func matchRule(rule Rule, toolName string, toolInput json.RawMessage) bool {
+	if rule.Matcher == toolName {
+		return true
+	}
+	if m := bashPrefixRE.FindStringSubmatch(rule.Matcher); m != nil && toolName == "Bash" {
+		var in struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(toolInput, &in); err != nil {
+			return false
+		}
+		return strings.HasPrefix(strings.TrimSpace(in.Command), m[1])
+	}
+	return false
+}
+
+// deriveMatcher picks a session-scope matcher for ev. Bash commands turn
+// into "Bash(<first-word>:*)" so e.g. "git push" remembered means future
+// "git status" / "git log" / "git pull" are also auto-allowed. Every other
+// tool collapses to the bare tool name (a single Read decision applies to
+// all later Read calls in this session).
+func deriveMatcher(toolName string, toolInput json.RawMessage) string {
+	if toolName == "" {
+		return ""
+	}
+	if toolName == "Bash" {
+		var in struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(toolInput, &in); err == nil {
+			cmd := strings.TrimSpace(in.Command)
+			if cmd != "" {
+				first := strings.SplitN(cmd, " ", 2)[0]
+				if first != "" {
+					return fmt.Sprintf("Bash(%s:*)", first)
+				}
+			}
+		}
+	}
+	return toolName
 }

@@ -369,6 +369,7 @@ func (s *Server) handleListInteractions(w http.ResponseWriter, r *http.Request) 
 type respondReq struct {
 	Behavior string `json:"behavior"`
 	Reason   string `json:"reason"`
+	Scope    string `json:"scope"` // "" or "once" or "session"
 }
 
 func (s *Server) handleRespondInteraction(w http.ResponseWriter, r *http.Request) {
@@ -382,7 +383,15 @@ func (s *Server) handleRespondInteraction(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "behavior must be allow|deny")
 		return
 	}
-	if err := s.router.RespondInteraction(id, hook.Response{Behavior: req.Behavior, Reason: req.Reason}); err != nil {
+	if req.Scope != "" && req.Scope != "once" && req.Scope != "session" {
+		writeErr(w, http.StatusBadRequest, "scope must be once|session")
+		return
+	}
+	if err := s.router.RespondInteraction(id, hook.Response{
+		Behavior: req.Behavior,
+		Reason:   req.Reason,
+		Scope:    req.Scope,
+	}); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}

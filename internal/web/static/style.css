@@ -258,14 +258,33 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   overflow: auto;
   margin: 0 0 0.5rem 0;
 }
-.interaction .actions { display: flex; gap: 0.5rem; }
+.interaction .actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .interaction button {
-  padding: 0.4rem 1rem;
+  padding: 0.4rem 0.8rem;
   border-radius: 6px;
-  border: 1px solid #1f6feb;
-  background: #1f6feb;
-  color: white;
   cursor: pointer;
   font: inherit;
+  font-size: 0.85rem;
+  border: 1px solid transparent;
 }
-.interaction button.deny { background: #cf222e; border-color: #cf222e; }
+.interaction button.allow.primary {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: white;
+}
+.interaction button.deny.primary {
+  background: #cf222e;
+  border-color: #cf222e;
+  color: white;
+}
+.interaction button.allow.secondary {
+  background: white;
+  border-color: #1f6feb;
+  color: #1f6feb;
+}
+.interaction button.deny.secondary {
+  background: white;
+  border-color: #cf222e;
+  color: #cf222e;
+}
+.interaction button:hover { filter: brightness(0.95); }

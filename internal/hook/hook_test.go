@@ -2,6 +2,8 @@ package hook
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +88,188 @@ func TestManager_RespondTwice(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if err := m.Respond(id, Response{Behavior: "allow"}); err == nil {
 		t.Error("expected error on second respond")
+	}
+}
+
+func TestManager_RememberRule_Bash(t *testing.T) {
+	m := New()
+
+	// First call: user allows with session scope.
+	done := make(chan Response, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), Event{
+			SessionID: "s",
+			Event:     "PreToolUse",
+			ToolName:  "Bash",
+			ToolInput: []byte(`{"command":"git status"}`),
+		})
+		done <- r
+	}()
+	id := waitForPending(t, m)
+	if err := m.Respond(id, Response{Behavior: "allow", Scope: "session"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	rules := m.ListRules()
+	if len(rules) != 1 || rules[0].Matcher != "Bash(git:*)" || rules[0].Behavior != "allow" {
+		t.Fatalf("unexpected rules: %+v", rules)
+	}
+
+	// Second call to the same session with another git command — should not
+	// touch the UI. We assert by ensuring Submit returns immediately and no
+	// pending entry is registered.
+	r, err := m.Submit(context.Background(), Event{
+		SessionID: "s",
+		Event:     "PreToolUse",
+		ToolName:  "Bash",
+		ToolInput: []byte(`{"command":"git log --oneline"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Behavior != "allow" {
+		t.Errorf("Behavior = %q", r.Behavior)
+	}
+	if !strings.Contains(r.Reason, "Bash(git:*)") {
+		t.Errorf("Reason should reference rule, got %q", r.Reason)
+	}
+	if len(m.List()) != 0 {
+		t.Errorf("expected no pending interactions; got %d", len(m.List()))
+	}
+}
+
+func TestManager_RememberRule_NonBash(t *testing.T) {
+	m := New()
+	done := make(chan struct{})
+	go func() {
+		_, _ = m.Submit(context.Background(), Event{
+			SessionID: "s",
+			ToolName:  "Read",
+			ToolInput: []byte(`{"file_path":"/tmp/a.txt"}`),
+		})
+		close(done)
+	}()
+	id := waitForPending(t, m)
+	if err := m.Respond(id, Response{Behavior: "allow", Scope: "session"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	// Another Read on a different file — auto-allowed because the matcher is
+	// the bare tool name.
+	r, err := m.Submit(context.Background(), Event{
+		SessionID: "s",
+		ToolName:  "Read",
+		ToolInput: []byte(`{"file_path":"/etc/passwd"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Behavior != "allow" {
+		t.Errorf("Behavior = %q", r.Behavior)
+	}
+}
+
+func TestManager_RememberRule_DoesNotLeakAcrossSessions(t *testing.T) {
+	m := New()
+	done := make(chan struct{})
+	go func() {
+		_, _ = m.Submit(context.Background(), Event{
+			SessionID: "s1",
+			ToolName:  "Bash",
+			ToolInput: []byte(`{"command":"rm -rf /"}`),
+		})
+		close(done)
+	}()
+	id := waitForPending(t, m)
+	_ = m.Respond(id, Response{Behavior: "allow", Scope: "session"})
+	<-done
+
+	// Different session — should still prompt.
+	go func() { _, _ = m.Submit(context.Background(), Event{
+		SessionID: "s2",
+		ToolName:  "Bash",
+		ToolInput: []byte(`{"command":"rm /tmp/x"}`),
+	}) }()
+
+	id2 := waitForPending(t, m)
+	if id2 == "" {
+		t.Fatal("expected new pending in different session")
+	}
+}
+
+func TestManager_OnceScopeIsNotRemembered(t *testing.T) {
+	m := New()
+	done := make(chan struct{})
+	go func() {
+		_, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Read"})
+		close(done)
+	}()
+	id := waitForPending(t, m)
+	_ = m.Respond(id, Response{Behavior: "allow"}) // no scope
+	<-done
+	if rules := m.ListRules(); len(rules) != 0 {
+		t.Errorf("once-scope must not be remembered, got %v", rules)
+	}
+}
+
+func TestManager_ForgetSessionRules(t *testing.T) {
+	m := New()
+	go func() { _, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Read"}) }()
+	id := waitForPending(t, m)
+	_ = m.Respond(id, Response{Behavior: "allow", Scope: "session"})
+	// give goroutine a beat to record
+	time.Sleep(20 * time.Millisecond)
+	if len(m.ListRules()) == 0 {
+		t.Fatal("rule not stored")
+	}
+	m.ForgetSessionRules("s")
+	if len(m.ListRules()) != 0 {
+		t.Error("rule not cleared")
+	}
+}
+
+func TestDeriveMatcher(t *testing.T) {
+	cases := []struct {
+		tool  string
+		input string
+		want  string
+	}{
+		{"Bash", `{"command":"git push origin main"}`, "Bash(git:*)"},
+		{"Bash", `{"command":"  ls -la  "}`, "Bash(ls:*)"},
+		{"Bash", `{"command":""}`, "Bash"},
+		{"Bash", `{}`, "Bash"},
+		{"Read", `{"file_path":"/x"}`, "Read"},
+		{"", `{}`, ""},
+	}
+	for _, c := range cases {
+		got := deriveMatcher(c.tool, json.RawMessage(c.input))
+		if got != c.want {
+			t.Errorf("deriveMatcher(%q,%q) = %q, want %q", c.tool, c.input, got, c.want)
+		}
+	}
+}
+
+func TestMatchRule(t *testing.T) {
+	cases := []struct {
+		rule  Rule
+		tool  string
+		input string
+		want  bool
+	}{
+		{Rule{Matcher: "Bash(git:*)"}, "Bash", `{"command":"git status"}`, true},
+		{Rule{Matcher: "Bash(git:*)"}, "Bash", `{"command":"  git push"}`, true},
+		{Rule{Matcher: "Bash(git:*)"}, "Bash", `{"command":"rm -rf /"}`, false},
+		{Rule{Matcher: "Bash(git:*)"}, "Read", `{}`, false},
+		{Rule{Matcher: "Read"}, "Read", `{"file_path":"/x"}`, true},
+		{Rule{Matcher: "Read"}, "Write", `{}`, false},
+	}
+	for _, c := range cases {
+		got := matchRule(c.rule, c.tool, json.RawMessage(c.input))
+		if got != c.want {
+			t.Errorf("matchRule(%+v, %q, %q) = %v, want %v", c.rule, c.tool, c.input, got, c.want)
+		}
 	}
 }
 

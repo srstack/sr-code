@@ -506,6 +506,7 @@ function renderInteractions() {
     let inputJSON = '';
     try { inputJSON = JSON.stringify(p.tool_input || {}, null, 2); }
     catch { inputJSON = String(p.tool_input || ''); }
+    const matcher = deriveMatcherPreview(p.tool_name, p.tool_input);
     return `
       <div class="interaction" data-id="${esc(p.id)}">
         <div class="meta">
@@ -514,8 +515,10 @@ function renderInteractions() {
         </div>
         <pre class="tool-input">${esc(inputJSON)}</pre>
         <div class="actions">
-          <button class="allow">allow</button>
-          <button class="deny">deny</button>
+          <button class="allow primary" data-scope="once">allow</button>
+          <button class="allow secondary" data-scope="session" title="auto-allow ${esc(matcher)} for this session">allow always</button>
+          <button class="deny secondary" data-scope="session" title="auto-deny ${esc(matcher)} for this session">deny always</button>
+          <button class="deny primary" data-scope="once">deny</button>
         </div>
       </div>
     `;
@@ -529,22 +532,38 @@ function renderInteractions() {
   `;
   modal.querySelectorAll('.interaction').forEach(node => {
     const id = node.dataset.id;
-    node.querySelector('.allow').addEventListener('click', () => respond(id, 'allow'));
-    node.querySelector('.deny').addEventListener('click', () => respond(id, 'deny'));
+    node.querySelectorAll('button.allow,button.deny').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const behavior = btn.classList.contains('allow') ? 'allow' : 'deny';
+        const scope = btn.dataset.scope || 'once';
+        respond(id, behavior, scope);
+      });
+    });
   });
 }
 
-async function respond(id, behavior) {
+async function respond(id, behavior, scope) {
   try {
     await fetch('/api/interactions/' + encodeURIComponent(id) + '/respond', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ behavior, reason: 'via usher web UI' }),
+      body: JSON.stringify({ behavior, scope: scope || 'once', reason: 'via usher web UI' }),
     });
   } catch (e) {
     console.error('respond', e);
   }
   pollInteractions();
+}
+
+// Mirror of internal/hook/hook.go deriveMatcher — used purely for the
+// tooltip preview ("auto-allow Bash(git:*)" etc). Server is authoritative.
+function deriveMatcherPreview(toolName, toolInput) {
+  if (!toolName) return '(unknown)';
+  if (toolName === 'Bash' && toolInput && typeof toolInput.command === 'string') {
+    const cmd = toolInput.command.trim();
+    if (cmd) return 'Bash(' + cmd.split(/\s+/, 1)[0] + ':*)';
+  }
+  return toolName;
 }
 
 setInterval(pollInteractions, 2000);
