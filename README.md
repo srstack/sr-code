@@ -10,15 +10,18 @@ are delivered via headless `claude -p --resume`.
 
 ## Status
 
-v0.1, in active development.
-
-- [x] commit 1 — skeleton, jsonl discovery, read-only session list
-- [x] commit 2 — `claude -p --resume` sender + SSE streaming (mode A)
-- [x] commit 3 — hook server + permission relay
-- [x] commit 4 — main chat + Usher Agent (rule-based)
-- [x] **commit 5** — polish: transcript, cancel, run-state indicator
-
-v0.1 is feature-complete.
+- [x] **v0.1** — feature complete: jsonl discovery, send/cancel/transcript,
+  permission hook bridge, rule-based main chat, run-state indicator.
+- [x] **v0.2** — provider-agnostic LLM main chat: OpenAI Chat Completions
+  client (any backend — OpenAI, Anthropic OAI-compat, Ollama, DeepSeek,
+  Gemini, Groq, OpenRouter, vLLM, LM Studio), tool loop with 6 tools
+  (list/send/wait/read-transcript/list-pending/respond), 20-turn
+  conversation memory, `FocusSession` tracking that lets the user
+  pretend it's a single session.
+- [ ] streaming LLM output through main chat SSE (5-30s "thinking…"
+  becomes visible progress)
+- [ ] mid-flight LLM cancel from main chat
+- [ ] new-session creation from main chat
 
 ## Design
 
@@ -36,26 +39,43 @@ v0.1 is feature-complete.
 
 ## Build & run
 
+Requires Go 1.22+. There is no other toolchain — no npm, no make extensions,
+nothing to bootstrap.
+
 ```
-go build -o usher ./cmd/usher
-./usher serve
+make build       # → ./usher (CGO off, stripped, ~7 MB)
+make run         # build + ./usher serve (loopback on :7777)
+make test        # go test ./...
+make check       # vet + test
+make install     # → $GOBIN/usher
+make dist        # cross-compile linux/darwin × amd64/arm64 into dist/
+make help        # list targets
 ```
 
 Then open <http://127.0.0.1:7777>.
 
-Flags:
+The full flag set:
 
 ```
 ./usher serve \
   --addr 127.0.0.1:7777 \
   --projects-dir ~/.claude/projects \
+  --data-dir ~/.local/share/usher \
   --claude claude \
-  --permission-mode bypassPermissions
+  --permission-mode default \
+  --agent-mode rule \
+  --llm-base-url https://api.openai.com/v1 \
+  --llm-model "" \
+  --llm-api-key-env OPENAI_API_KEY
 ```
 
-`--permission-mode` is passed straight to `claude`. The default is now `default`,
-which routes tool permission decisions through usher's hook UI (see below).
-Pass `--permission-mode bypassPermissions` to run without prompting.
+`--permission-mode` is passed straight to `claude`. Default `default`
+routes tool permission decisions through usher's hook UI (see below);
+pass `bypassPermissions` to skip prompting entirely.
+
+`--agent-mode rule` is the slash-command agent (see *Main chat* below).
+`--agent-mode llm` switches to the LLM backend; see *LLM agent* below
+for working configurations of common providers.
 
 ## Permission hook setup
 
@@ -78,11 +98,6 @@ Uninstall:
 ./usher setup --remove
 ```
 
-## Test
-
-```
-go test ./...
-```
 
 ## What commit 1 includes
 
@@ -201,11 +216,28 @@ and most local-model servers. Examples:
   --llm-api-key-env ANTHROPIC_API_KEY
 ```
 
-The agent has access to four tools mirroring the agent's `AgentAPI` (a
-strict subset of `router.Router`): `list_sessions`, `send_to_session`,
-`list_pending_interactions`, `respond_to_interaction`. Tool definitions
-live inline in `internal/agent/usheragent/llm.go`; the system prompt is
-embedded from `internal/agent/usheragent/prompts/system_prompt.md`.
+The agent has six tools mirroring the agent's `AgentAPI` (a strict subset of
+`router.Router`):
+
+| Tool | Effect | Updates focus? |
+|---|---|---|
+| `list_sessions` | enumerate sessions on disk | no |
+| `read_session_transcript` | quote / summarize a session's recent turns | yes |
+| `send_to_session` | fire-and-forget delivery | yes |
+| `send_and_wait_for_response` | deliver and block for assistant text (default 5 min, max 30 min) | yes |
+| `list_pending_interactions` | enumerate pending PreToolUse permissions | no |
+| `respond_to_interaction` | allow/deny a pending permission | no |
+
+Tool definitions live inline in `internal/agent/usheragent/llm.go`; the
+system prompt is embedded from
+`internal/agent/usheragent/prompts/system_prompt.md`.
+
+Each turn the agent is fed up to **20 turns of prior history** plus a
+`Current focus: session <id>` system message synthesized from the most
+recent tool call that targeted a session. Result: the user can pretend
+there's a single session ("refactor auth", "now run the tests") and usher
+implicitly routes to the focused one — or asks for clarification when
+genuinely ambiguous.
 
 We deliberately do **not** vendor an LLM SDK. The Chat Completions HTTP
 client is ~120 lines of pure stdlib (`internal/agent/usheragent/openai_client.go`),
@@ -253,7 +285,7 @@ Future IM adapters (Telegram, Slack, …) take the same raw markdown source
 from `Message.Content` and re-encode to their native flavor — markdown is
 the lingua franca rather than HTML.
 
-## v0.1 architecture summary
+## Architecture summary
 
 ```
                             +------------------+
