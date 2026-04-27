@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"usher/internal/hook"
 )
@@ -23,7 +24,7 @@ type LLMConfig struct {
 
 // LLMAgent is a provider-agnostic main-chat agent built on the OpenAI
 // Chat Completions wire format. It calls a small set of tools (mirroring
-// AgentAPI) on the user's behalf and answers in natural language. v0.2.
+// AgentAPI) on the user's behalf and answers in natural language.
 type LLMAgent struct {
 	api       AgentAPI
 	client    *ChatClient
@@ -58,14 +59,39 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 	}, nil
 }
 
+const (
+	defaultWaitTimeout = 300 * time.Second  // 5 min — covers most non-coding turns
+	maxWaitTimeout     = 1800 * time.Second // 30 min — hard ceiling
+	defaultReadTurns   = 20
+	maxReadTurns       = 200
+)
+
 // Handle drives the tool-call loop until the model returns finish_reason="stop"
-// or maxIter is exhausted. Tool-result content is JSON for structured tools
-// and falls back to a `{"error":...}` shape on failure.
-func (a *LLMAgent) Handle(ctx context.Context, userMsg string) (string, error) {
-	msgs := []ChatMessage{
-		{Role: "system", Content: a.sysPrompt},
-		{Role: "user", Content: userMsg},
+// or maxIter is exhausted. history (≤ 40 messages = 20 turns) is mapped to
+// OpenAI roles. currentFocus is injected as a separate system message —
+// kept distinct from the static prompt so prompt-cache hit rate isn't
+// disturbed if/when caching is added later.
+func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string) (AgentResult, error) {
+	msgs := []ChatMessage{{Role: "system", Content: a.sysPrompt}}
+	if currentFocus != "" {
+		msgs = append(msgs, ChatMessage{
+			Role: "system",
+			Content: fmt.Sprintf(
+				"Current focus: session %s. When the user gives an instruction without naming a session, default to this one. Switch transparently if they refer to another, and briefly disclose the switch.",
+				currentFocus,
+			),
+		})
 	}
+	for _, h := range history {
+		role := "user"
+		if h.Role == "agent" {
+			role = "assistant"
+		}
+		msgs = append(msgs, ChatMessage{Role: role, Content: h.Content})
+	}
+	msgs = append(msgs, ChatMessage{Role: "user", Content: userMsg})
+
+	focus := "" // session id touched this turn; carries across the loop's tool calls
 
 	for i := 0; i < a.maxIter; i++ {
 		resp, err := a.client.ChatCompletion(ctx, ChatRequest{
@@ -74,24 +100,26 @@ func (a *LLMAgent) Handle(ctx context.Context, userMsg string) (string, error) {
 			Tools:    a.tools,
 		})
 		if err != nil {
-			return "", err
+			return AgentResult{}, err
 		}
 		if len(resp.Choices) == 0 {
-			return "", errors.New("empty choices in chat response")
+			return AgentResult{}, errors.New("empty choices in chat response")
 		}
 		choice := resp.Choices[0]
-		// Always append the assistant turn so subsequent calls see it.
 		msgs = append(msgs, choice.Message)
 
 		switch choice.FinishReason {
 		case "stop", "end_turn", "":
-			return choice.Message.Content, nil
+			return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
 		case "tool_calls":
 			if len(choice.Message.ToolCalls) == 0 {
-				return "", errors.New("finish_reason=tool_calls but no tool_calls returned")
+				return AgentResult{}, errors.New("finish_reason=tool_calls but no tool_calls returned")
 			}
 			for _, call := range choice.Message.ToolCalls {
-				out := a.executeTool(call.Function.Name, call.Function.Arguments)
+				out, focusUpdate := a.executeTool(ctx, call.Function.Name, call.Function.Arguments)
+				if focusUpdate != "" {
+					focus = focusUpdate
+				}
 				msgs = append(msgs, ChatMessage{
 					Role:       "tool",
 					ToolCallID: call.ID,
@@ -100,22 +128,24 @@ func (a *LLMAgent) Handle(ctx context.Context, userMsg string) (string, error) {
 			}
 			continue
 		case "length":
-			return "", errors.New("response truncated by max_tokens")
+			return AgentResult{}, errors.New("response truncated by max_tokens")
 		default:
-			return "", fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
+			return AgentResult{}, fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
 		}
 	}
-	return "", fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
+	return AgentResult{}, fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
 }
 
 // executeTool dispatches a tool call to AgentAPI. Output is always a JSON
 // string (or `{"error":"..."}`) — that's what OpenAI-protocol `role:"tool"`
-// messages expect for `content`.
-func (a *LLMAgent) executeTool(name, argsJSON string) string {
+// messages expect for `content`. The second return value is the session id
+// this tool touched (empty for read-only / non-targeted tools); used by
+// Handle to compute the turn's FocusSession.
+func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (string, string) {
 	switch name {
 	case "list_sessions":
 		b, _ := json.Marshal(a.api.ListSessions())
-		return string(b)
+		return string(b), ""
 
 	case "send_to_session":
 		var args struct {
@@ -123,19 +153,72 @@ func (a *LLMAgent) executeTool(name, argsJSON string) string {
 			Text      string `json:"text"`
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			return errResult("invalid arguments: " + err.Error())
+			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.SessionID == "" || args.Text == "" {
-			return errResult("session_id and text are required")
+			return errResult("session_id and text are required"), ""
 		}
 		if err := a.api.SendToSession(args.SessionID, args.Text); err != nil {
-			return errResult(err.Error())
+			return errResult(err.Error()), ""
 		}
-		return `{"status":"sent"}`
+		return `{"status":"sent"}`, args.SessionID
+
+	case "send_and_wait_for_response":
+		var args struct {
+			SessionID      string `json:"session_id"`
+			Text           string `json:"text"`
+			TimeoutSeconds int    `json:"timeout_seconds"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" || args.Text == "" {
+			return errResult("session_id and text are required"), ""
+		}
+		timeout := defaultWaitTimeout
+		if args.TimeoutSeconds > 0 {
+			t := time.Duration(args.TimeoutSeconds) * time.Second
+			if t > maxWaitTimeout {
+				t = maxWaitTimeout
+			}
+			timeout = t
+		}
+		text, err := a.api.SendToSessionAndWait(ctx, args.SessionID, args.Text, timeout)
+		if err != nil {
+			payload, _ := json.Marshal(map[string]any{"response": text, "error": err.Error()})
+			return string(payload), args.SessionID
+		}
+		payload, _ := json.Marshal(map[string]any{"response": text})
+		return string(payload), args.SessionID
+
+	case "read_session_transcript":
+		var args struct {
+			SessionID string `json:"session_id"`
+			Limit     int    `json:"limit"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" {
+			return errResult("session_id is required"), ""
+		}
+		limit := args.Limit
+		if limit <= 0 {
+			limit = defaultReadTurns
+		}
+		if limit > maxReadTurns {
+			limit = maxReadTurns
+		}
+		turns, err := a.api.ReadSessionTranscript(args.SessionID, limit)
+		if err != nil {
+			return errResult(err.Error()), ""
+		}
+		b, _ := json.Marshal(turns)
+		return string(b), args.SessionID
 
 	case "list_pending_interactions":
 		b, _ := json.Marshal(a.api.ListPendingInteractions())
-		return string(b)
+		return string(b), ""
 
 	case "respond_to_interaction":
 		var args struct {
@@ -144,22 +227,25 @@ func (a *LLMAgent) executeTool(name, argsJSON string) string {
 			Reason   string `json:"reason"`
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			return errResult("invalid arguments: " + err.Error())
+			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.ID == "" || (args.Behavior != "allow" && args.Behavior != "deny") {
-			return errResult("id and behavior (allow|deny) are required")
+			return errResult("id and behavior (allow|deny) are required"), ""
 		}
 		if err := a.api.RespondInteraction(args.ID, hook.Response{
 			Behavior: args.Behavior,
 			Reason:   args.Reason,
 			Scope:    "once",
 		}); err != nil {
-			return errResult(err.Error())
+			return errResult(err.Error()), ""
 		}
-		return `{"status":"ok"}`
+		// Don't update focus from respond_to_interaction; keep it tied to
+		// send-class operations so "now show me" reliably means the session
+		// the agent last sent to.
+		return `{"status":"ok"}`, ""
 
 	default:
-		return errResult("unknown tool: " + name)
+		return errResult("unknown tool: " + name), ""
 	}
 }
 
@@ -186,7 +272,7 @@ func defaultTools() []ChatTool {
 			Type: "function",
 			Function: ChatFunction{
 				Name:        "send_to_session",
-				Description: "Deliver a message to a specific Claude Code session. The session is resumed via `claude -p --resume`; this returns immediately and does not block on the session's response. Use list_sessions first if you don't already know the id.",
+				Description: "Deliver a message to a specific Claude Code session and return immediately (does NOT wait for the assistant's response). Use this when the user just wants to queue work and will check the session detail tab themselves. Use list_sessions first if you don't already know the id.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -200,6 +286,39 @@ func defaultTools() []ChatTool {
 						},
 					},
 					"required":             []string{"session_id", "text"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name:        "send_and_wait_for_response",
+				Description: "Send a message to a session AND block until the assistant responds, returning the accumulated text. Use this when the user wants to SEE the result here in the chat. For long autonomous tasks (multi-minute coding runs), prefer send_to_session and tell the user to watch the session tab — this tool's default timeout is 300s (5min) and ceiling is 1800s (30min).",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"session_id":      map[string]any{"type": "string"},
+						"text":            map[string]any{"type": "string"},
+						"timeout_seconds": map[string]any{"type": "integer", "description": "Optional. Default 300, max 1800."},
+					},
+					"required":             []string{"session_id", "text"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name:        "read_session_transcript",
+				Description: "Read the most recent N user/assistant turns from a session's transcript. Use this to summarize, quote, or answer questions about what's happening inside a specific session. Tool calls within the session are inlined as `tool: Name` markers. Returns an array of turn objects {role, content, ts}.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"session_id": map[string]any{"type": "string"},
+						"limit":      map[string]any{"type": "integer", "description": "Optional. Default 20, max 200."},
+					},
+					"required":             []string{"session_id"},
 					"additionalProperties": false,
 				},
 			},
@@ -235,4 +354,3 @@ func defaultTools() []ChatTool {
 		},
 	}
 }
-

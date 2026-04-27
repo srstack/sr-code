@@ -10,8 +10,8 @@ import (
 )
 
 // RuleAgent is the v0.1 main-chat agent: a small dispatcher over slash
-// commands. v0.2 will replace it with an LLM agent behind the same Agent
-// interface.
+// commands. v0.2 introduced LLMAgent (provider-agnostic OpenAI-compatible)
+// behind the same Agent interface.
 type RuleAgent struct {
 	api AgentAPI
 }
@@ -26,31 +26,40 @@ const helpText = `commands:
   /deny <id-prefix>           deny a pending request
   /help                       show this help`
 
-func (a *RuleAgent) Handle(_ context.Context, userMsg string) (string, error) {
+// Handle implements Agent. The rule agent ignores history and currentFocus —
+// every command is parsed in isolation. /send sets FocusSession in the
+// returned result so the server can carry it forward, matching the contract
+// LLMAgent uses.
+func (a *RuleAgent) Handle(_ context.Context, _ []HistoryMessage, _ string, userMsg string) (AgentResult, error) {
 	msg := strings.TrimSpace(userMsg)
 	if msg == "" {
-		return "", nil
+		return AgentResult{}, nil
 	}
 
 	cmd, rest := splitOnce(msg)
+	var reply, focus string
+
 	switch cmd {
 	case "/help":
-		return helpText, nil
+		reply = helpText
 	case "/list":
-		return a.list(), nil
+		reply = a.list()
 	case "/send":
-		return a.send(rest), nil
+		reply, focus = a.send(rest)
 	case "/pending":
-		return a.pending(), nil
+		reply = a.pending()
 	case "/approve":
-		return a.respond(rest, "allow"), nil
+		reply = a.respond(rest, "allow")
 	case "/deny":
-		return a.respond(rest, "deny"), nil
+		reply = a.respond(rest, "deny")
+	default:
+		if strings.HasPrefix(cmd, "/") {
+			reply = "unknown command: " + cmd + ". Try /help."
+		} else {
+			reply = "natural-language routing isn't implemented in v0.1; try /help for available commands."
+		}
 	}
-	if strings.HasPrefix(cmd, "/") {
-		return "unknown command: " + cmd + ". Try /help.", nil
-	}
-	return "natural-language routing isn't implemented in v0.1; try /help for available commands.", nil
+	return AgentResult{Reply: reply, FocusSession: focus}, nil
 }
 
 func (a *RuleAgent) list() string {
@@ -66,27 +75,27 @@ func (a *RuleAgent) list() string {
 	return strings.Join(lines, "\n")
 }
 
-func (a *RuleAgent) send(args string) string {
+func (a *RuleAgent) send(args string) (string, string) {
 	prefix, text := splitOnce(args)
 	text = strings.TrimSpace(text)
 	if prefix == "" || text == "" {
-		return "usage: /send <session-prefix> <text>"
+		return "usage: /send <session-prefix> <text>", ""
 	}
 	matches := matchSessions(a.api.ListSessions(), prefix)
 	if len(matches) == 0 {
-		return "no sessions match: " + prefix
+		return "no sessions match: " + prefix, ""
 	}
 	if len(matches) > 1 {
 		var lines []string
 		for _, m := range matches {
 			lines = append(lines, fmt.Sprintf("  %s  %s", shortID(m.ID), titleOr(m)))
 		}
-		return "ambiguous; matches:\n" + strings.Join(lines, "\n")
+		return "ambiguous; matches:\n" + strings.Join(lines, "\n"), ""
 	}
 	if err := a.api.SendToSession(matches[0].ID, text); err != nil {
-		return "send failed: " + err.Error()
+		return "send failed: " + err.Error(), ""
 	}
-	return fmt.Sprintf("sent to %s (%s)", shortID(matches[0].ID), titleOr(matches[0]))
+	return fmt.Sprintf("sent to %s (%s)", shortID(matches[0].ID), titleOr(matches[0])), matches[0].ID
 }
 
 func (a *RuleAgent) pending() string {
@@ -105,8 +114,7 @@ func (a *RuleAgent) pending() string {
 func (a *RuleAgent) respond(prefix, behavior string) string {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
-		verb := behavior
-		return fmt.Sprintf("usage: /%s <interaction-id-prefix>", verb)
+		return fmt.Sprintf("usage: /%s <interaction-id-prefix>", behavior)
 	}
 	list := a.api.ListPendingInteractions()
 	var matches []hook.Pending

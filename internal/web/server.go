@@ -63,6 +63,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
 
 	mux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
+	mux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
 	mux.HandleFunc("GET /api/mainchats/{id}/messages", s.handleListMainChatMessages)
 	mux.HandleFunc("POST /api/mainchats/{id}/send", s.handleMainChatSend)
 
@@ -266,6 +267,49 @@ func (s *Server) handleListMainChatMessages(w http.ResponseWriter, r *http.Reque
 
 type mainChatSendResponse struct {
 	Messages []mainchat.Message `json:"messages"`
+	Focus    *focusDetail       `json:"focus,omitempty"`
+}
+
+type focusDetail struct {
+	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd,omitempty"`
+	Title     string `json:"title,omitempty"`
+}
+
+type mainChatInfo struct {
+	ID    string       `json:"id"`
+	Focus *focusDetail `json:"focus,omitempty"`
+}
+
+const mainChatHistoryCap = 40 // 20 turns of user+agent
+
+func (s *Server) handleGetMainChat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgs, err := s.main.Read(id, 0)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info := mainChatInfo{ID: id, Focus: s.lastFocus(msgs)}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// lastFocus walks msgs newest-first and returns the most recent non-empty
+// FocusSession decorated with current session metadata (cwd, title) if
+// the session is still discoverable.
+func (s *Server) lastFocus(msgs []mainchat.Message) *focusDetail {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].FocusSession == "" {
+			continue
+		}
+		fd := &focusDetail{SessionID: msgs[i].FocusSession}
+		if sess, ok := s.router.GetSession(msgs[i].FocusSession); ok {
+			fd.Cwd = sess.Cwd
+			fd.Title = sess.Title
+		}
+		return fd
+	}
+	return nil
 }
 
 func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
@@ -280,25 +324,57 @@ func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read history (and prior focus) BEFORE persisting the new user message.
+	prior, err := s.main.Read(id, mainChatHistoryCap)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	history := make([]usheragent.HistoryMessage, 0, len(prior))
+	for _, m := range prior {
+		history = append(history, usheragent.HistoryMessage{Role: m.Role, Content: m.Content})
+	}
+	prevFocus := ""
+	if fd := s.lastFocus(prior); fd != nil {
+		prevFocus = fd.SessionID
+	}
+
 	userMsg := mainchat.Message{Role: "user", Content: req.Text, Time: time.Now().UTC()}
 	if err := s.main.Append(id, userMsg); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	reply, err := s.agent.Handle(r.Context(), req.Text)
+	res, err := s.agent.Handle(r.Context(), history, prevFocus, req.Text)
 	if err != nil {
 		s.logger.Warn("agent handle", "err", err)
-		reply = "agent error: " + err.Error()
+		res = usheragent.AgentResult{Reply: "agent error: " + err.Error()}
 	}
-	agentMsg := mainchat.Message{Role: "agent", Content: reply, Time: time.Now().UTC()}
+	// Carry forward focus when this turn didn't touch any session.
+	newFocus := res.FocusSession
+	if newFocus == "" {
+		newFocus = prevFocus
+	}
+	agentMsg := mainchat.Message{
+		Role:         "agent",
+		Content:      res.Reply,
+		Time:         time.Now().UTC(),
+		FocusSession: newFocus,
+	}
 	if err := s.main.Append(id, agentMsg); err != nil {
 		s.logger.Warn("main chat append agent", "err", err)
 	}
 
-	writeJSON(w, http.StatusOK, mainChatSendResponse{
-		Messages: []mainchat.Message{userMsg, agentMsg},
-	})
+	resp := mainChatSendResponse{Messages: []mainchat.Message{userMsg, agentMsg}}
+	if newFocus != "" {
+		fd := &focusDetail{SessionID: newFocus}
+		if sess, ok := s.router.GetSession(newFocus); ok {
+			fd.Cwd = sess.Cwd
+			fd.Title = sess.Title
+		}
+		resp.Focus = fd
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // --- hooks ---------------------------------------------------------------

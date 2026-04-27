@@ -21,6 +21,11 @@ type Message struct {
 	Role    string    `json:"role"`    // "user" | "agent"
 	Content string    `json:"content"`
 	Time    time.Time `json:"ts"`
+	// FocusSession records which Claude Code session the agent operated on
+	// during this turn (only set on agent messages; "" when the turn didn't
+	// touch any session). Server uses the most recent non-empty value as
+	// the implicit focus when the next user message is ambiguous.
+	FocusSession string `json:"focus_session,omitempty"`
 }
 
 type Chat struct {

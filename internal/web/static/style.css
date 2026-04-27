@@ -184,6 +184,18 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   color: #4b5563;
 }
 
+.chat-focus {
+  font-size: 0.78rem;
+  margin-bottom: 0.4rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 0.3rem 0.5rem;
+  background: #fafafa;
+  border-radius: 4px;
+}
+.chat-focus a { color: #6e40c9; text-decoration: none; }
+.chat-focus a:hover { text-decoration: underline; }
+.chat-focus.empty { color: #b1b6bd; font-style: italic; }
+
 .chat-scroll {
   background: #fcfcfc;
   border: 1px solid #eee;

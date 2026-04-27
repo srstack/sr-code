@@ -23,3 +23,12 @@ type Session struct {
 	StartedAt   time.Time `json:"started_at"`
 	LastEventAt time.Time `json:"last_event_at"`
 }
+
+// TranscriptTurn is a single user/assistant turn extracted from a session
+// jsonl. Shared across packages so the router and the LLM agent can pass
+// transcripts through without copying types.
+type TranscriptTurn struct {
+	Role    string    `json:"role"`
+	Content string    `json:"content"`
+	Time    time.Time `json:"ts"`
+}

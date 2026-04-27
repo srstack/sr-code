@@ -9,12 +9,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"usher/internal/broker"
 	"usher/internal/core"
 	"usher/internal/discovery"
 	"usher/internal/hook"
+	"usher/internal/jsonl"
 	"usher/internal/sender"
 )
 
@@ -149,4 +153,101 @@ func (r *Router) RespondInteraction(id string, resp hook.Response) error {
 
 func (r *Router) HandleHook(ctx context.Context, ev hook.Event) (hook.Response, error) {
 	return r.hooks.Submit(ctx, ev)
+}
+
+// --- transcript / blocking send (v0.2 LLM agent helpers) ----------------
+
+// ReadSessionTranscript projects the most recent N user/assistant turns of
+// a session's jsonl into core.TranscriptTurn. limit ≤ 0 returns everything.
+func (r *Router) ReadSessionTranscript(id string, limit int) ([]core.TranscriptTurn, error) {
+	path, ok := r.discovery.Path(id)
+	if !ok {
+		return nil, errors.New("session not found")
+	}
+	turns, err := jsonl.ReadTurns(path, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.TranscriptTurn, len(turns))
+	for i, t := range turns {
+		out[i] = core.TranscriptTurn{Role: t.Role, Content: t.Content, Time: t.Time}
+	}
+	return out, nil
+}
+
+// SendToSessionAndWait spawns the same fire-and-forget send as
+// SendToSession but blocks until subprocess.exit (or timeout / ctx cancel),
+// returning the accumulated assistant text streamed during this turn.
+//
+// We subscribe to the broker BEFORE issuing the send so no events are
+// missed in the window between SendToSession returning and the subscriber
+// being attached.
+func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, timeout time.Duration) (string, error) {
+	if _, ok := r.discovery.Get(id); !ok {
+		return "", errors.New("session not found")
+	}
+	ch, cancel := r.broker.Subscribe(id)
+	defer cancel()
+
+	if err := r.SendToSession(id, text); err != nil {
+		return "", err
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
+	defer waitCancel()
+
+	var buf strings.Builder
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return buf.String(), nil
+			}
+			switch ev.Type {
+			case "stream_event":
+				if t := extractTextDelta(ev.Raw); t != "" {
+					buf.WriteString(t)
+				}
+			case "subprocess.exit":
+				return buf.String(), nil
+			case "error":
+				return buf.String(), errors.New(extractErrorMessage(ev.Raw))
+			}
+		case <-waitCtx.Done():
+			if buf.Len() == 0 {
+				return "", errors.New("timeout (no response received)")
+			}
+			return buf.String(), fmt.Errorf("timeout after %d chars (partial response retained)", buf.Len())
+		}
+	}
+}
+
+func extractTextDelta(raw json.RawMessage) string {
+	var d struct {
+		Event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return ""
+	}
+	if d.Event.Type == "content_block_delta" && d.Event.Delta.Type == "text_delta" {
+		return d.Event.Delta.Text
+	}
+	return ""
+}
+
+func extractErrorMessage(raw json.RawMessage) string {
+	var e struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(raw, &e)
+	if e.Message == "" {
+		return "unknown error"
+	}
+	return e.Message
 }

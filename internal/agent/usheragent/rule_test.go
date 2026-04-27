@@ -3,6 +3,7 @@ package usheragent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +20,20 @@ type fakeAPI struct {
 	resolved   map[string]hook.Response
 	sendErr    error
 	respondErr error
+
+	transcripts map[string][]core.TranscriptTurn
+	waitReplies map[string]string
+	waitErrs    map[string]error
+	waitedFor   []string
 }
 
 func newFakeAPI() *fakeAPI {
-	return &fakeAPI{resolved: map[string]hook.Response{}}
+	return &fakeAPI{
+		resolved:    map[string]hook.Response{},
+		transcripts: map[string][]core.TranscriptTurn{},
+		waitReplies: map[string]string{},
+		waitErrs:    map[string]error{},
+	}
 }
 
 func (f *fakeAPI) ListSessions() []core.Session            { return f.sessions }
@@ -42,14 +53,44 @@ func (f *fakeAPI) RespondInteraction(id string, r hook.Response) error {
 	f.resolved[id] = r
 	return nil
 }
+func (f *fakeAPI) ReadSessionTranscript(id string, limit int) ([]core.TranscriptTurn, error) {
+	turns, ok := f.transcripts[id]
+	if !ok {
+		return nil, fmt.Errorf("no transcript for %q", id)
+	}
+	if limit > 0 && len(turns) > limit {
+		turns = turns[len(turns)-limit:]
+	}
+	return turns, nil
+}
+func (f *fakeAPI) SendToSessionAndWait(_ context.Context, id, text string, _ time.Duration) (string, error) {
+	f.waitedFor = append(f.waitedFor, id)
+	_ = text
+	if err, ok := f.waitErrs[id]; ok && err != nil {
+		return f.waitReplies[id], err
+	}
+	if reply, ok := f.waitReplies[id]; ok {
+		return reply, nil
+	}
+	return "", nil
+}
 
 func handle(t *testing.T, a *RuleAgent, msg string) string {
 	t.Helper()
-	out, err := a.Handle(context.Background(), msg)
+	res, err := a.Handle(context.Background(), nil, "", msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return out
+	return res.Reply
+}
+
+func handleFull(t *testing.T, a *RuleAgent, msg string) AgentResult {
+	t.Helper()
+	res, err := a.Handle(context.Background(), nil, "", msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }
 
 func TestRule_HelpAndUnknown(t *testing.T) {
@@ -97,15 +138,30 @@ func TestRule_SendByIDPrefix(t *testing.T) {
 		{ID: "def67890", Title: "two", Cwd: "/tmp"},
 	}
 	a := NewRule(api)
-	out := handle(t, a, "/send abc hello world")
-	if !strings.Contains(out, "sent to abc12345") {
-		t.Errorf("got %q", out)
+	res := handleFull(t, a, "/send abc hello world")
+	if !strings.Contains(res.Reply, "sent to abc12345") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if res.FocusSession != "abc12345" {
+		t.Errorf("FocusSession = %q, want abc12345", res.FocusSession)
 	}
 	if len(api.sentTo) != 1 || api.sentTo[0] != "abc12345" {
 		t.Errorf("sentTo = %v", api.sentTo)
 	}
 	if api.sentText[0] != "hello world" {
 		t.Errorf("sentText = %q", api.sentText[0])
+	}
+}
+
+func TestRule_NonSendCommandDoesNotChangeFocus(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "one"}}
+	a := NewRule(api)
+	if res := handleFull(t, a, "/list"); res.FocusSession != "" {
+		t.Errorf("/list should not set focus, got %q", res.FocusSession)
+	}
+	if res := handleFull(t, a, "/help"); res.FocusSession != "" {
+		t.Errorf("/help should not set focus, got %q", res.FocusSession)
 	}
 }
 

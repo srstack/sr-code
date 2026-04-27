@@ -369,6 +369,7 @@ async function showMainChat(id) {
   subtitle.textContent = 'main chat · ' + id;
 
   root.innerHTML = `
+    <div id="chat-focus" class="chat-focus muted"></div>
     <div id="chat-scroll" class="chat-scroll"></div>
     <section>
       <div class="input-row">
@@ -382,6 +383,7 @@ async function showMainChat(id) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
 
+  await loadMainChatInfo(id);
   await loadChatMessages(id);
 
   const submit = async () => {
@@ -408,6 +410,8 @@ async function showMainChat(id) {
         // optimistically, so only render the agent reply (and any extras) here.
         const msgs = (data.messages || []).filter(m => m.role !== 'user');
         for (const m of msgs) appendChatMessage(m);
+        // Focus may have shifted this turn — update the header.
+        renderFocus(data.focus);
       }
     } catch (e) {
       if (placeholder) placeholder.remove();
@@ -462,6 +466,30 @@ async function loadChatMessages(id) {
     list.innerHTML = '';
     for (const m of data) appendChatMessage(m);
   } catch {}
+}
+
+async function loadMainChatInfo(id) {
+  try {
+    const res = await fetch('/api/mainchats/' + encodeURIComponent(id));
+    if (!res.ok) return;
+    const info = await res.json();
+    renderFocus(info.focus);
+  } catch {}
+}
+
+function renderFocus(focus) {
+  const el = document.getElementById('chat-focus');
+  if (!el) return;
+  if (!focus || !focus.session_id) {
+    el.textContent = 'no focus session yet';
+    el.classList.add('empty');
+    return;
+  }
+  el.classList.remove('empty');
+  const sid = (focus.session_id || '').slice(0, 8);
+  const cwd = focus.cwd ? ' · ' + focus.cwd : '';
+  const title = focus.title ? ' · ' + focus.title : '';
+  el.innerHTML = `<a href="#/s/${esc(focus.session_id)}">focus: ${esc(sid)}</a>${esc(cwd)}${esc(title)}`;
 }
 
 function appendChatMessage(m) {

@@ -121,6 +121,12 @@ func serve(args []string) error {
 		return err
 	}
 
+	logger.Info("agent backend",
+		"mode", *agentMode,
+		"model", *llmModel,
+		"base_url", *llmBaseURL,
+	)
+
 	srv := web.NewServer(*addr, r, mainStore, agent, logger)
 	return srv.Run(ctx)
 }
