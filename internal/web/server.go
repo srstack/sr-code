@@ -323,7 +323,7 @@ func (s *Server) renderStateBlock(focusID string) string {
 			mark = "  [FOCUS]"
 		}
 		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %s%s\n",
-			shortIDForState(sess.ID),
+			sess.ID,
 			truncateRunes(sess.Cwd, 30),
 			string(sess.Status),
 			truncateRunes(sess.Title, 50),
@@ -334,13 +334,6 @@ func (s *Server) renderStateBlock(focusID string) string {
 	}
 	b.WriteString("</current_state>")
 	return b.String()
-}
-
-func shortIDForState(id string) string {
-	if len(id) >= 8 {
-		return id[:8]
-	}
-	return id
 }
 
 func truncateRunes(s string, n int) string {
