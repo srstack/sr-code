@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"usher/internal/hook"
@@ -20,6 +22,7 @@ type LLMConfig struct {
 	Model        string
 	SystemPrompt string // optional override; defaults to embedded prompts/system_prompt.md
 	MaxIters     int    // default 10; bounds runaway tool-call loops
+	Strict       bool   // append small-model enforcement block to the system prompt
 }
 
 // LLMAgent is a provider-agnostic main-chat agent built on the OpenAI
@@ -44,6 +47,9 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 	sys := cfg.SystemPrompt
 	if sys == "" {
 		sys = defaultLLMSystemPrompt
+	}
+	if cfg.Strict {
+		sys = sys + strictModeAddendum
 	}
 	iters := cfg.MaxIters
 	if iters <= 0 {
@@ -154,7 +160,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 			SessionID string `json:"session_id"`
 			Text      string `json:"text"`
 		}
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.SessionID == "" || args.Text == "" {
@@ -171,7 +177,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 			Text           string `json:"text"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
 		}
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.SessionID == "" || args.Text == "" {
@@ -198,7 +204,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 			SessionID string `json:"session_id"`
 			Limit     int    `json:"limit"`
 		}
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.SessionID == "" {
@@ -224,7 +230,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 			InitialMessage string `json:"initial_message"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
 		}
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.Cwd == "" || args.InitialMessage == "" {
@@ -256,7 +262,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 			Behavior string `json:"behavior"`
 			Reason   string `json:"reason"`
 		}
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
 		}
 		if args.ID == "" || (args.Behavior != "allow" && args.Behavior != "deny") {
@@ -284,13 +290,68 @@ func errResult(msg string) string {
 	return string(b)
 }
 
+// repairJSONArgs makes a best-effort fix to malformed tool-call argument
+// JSON emitted by small models. Patterned after Hermes-Agent's 5-pass
+// repair pipeline. Returns the original string if it parses cleanly, the
+// repaired string if any pass succeeds, or "{}" if everything fails (a
+// recoverable empty object beats a hard error mid-loop).
+//
+// We only touch arguments that already FAILED to parse — never modify
+// already-valid JSON. The tool dispatch path calls Unmarshal on the
+// returned string and reports its own errors as usual.
+func repairJSONArgs(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "{}"
+	}
+	var probe any
+	if err := json.Unmarshal([]byte(raw), &probe); err == nil {
+		return raw
+	}
+	s := raw
+	// 1. Strip trailing commas before } or ]
+	s = jsonTrailingComma.ReplaceAllString(s, "$1")
+	// 2. Quote unquoted keys ({key: 1} → {"key": 1}). Conservative — only
+	//    matches positions clearly inside an object (after `{` or `,`).
+	s = jsonUnquotedKey.ReplaceAllString(s, `$1"$2":`)
+	// 3. Python literal sentinels → JSON
+	s = jsonPyNone.ReplaceAllString(s, "null")
+	s = jsonPyTrue.ReplaceAllString(s, "true")
+	s = jsonPyFalse.ReplaceAllString(s, "false")
+	// 4. Single-quoted string values → double-quoted (very narrow: covers
+	//    {key: 'value'} mistake, not nested complex strings).
+	s = jsonSingleQuoteVal.ReplaceAllStringFunc(s, func(m string) string {
+		// Replace surrounding single quotes with double; escape any
+		// embedded double quotes.
+		inner := m[1 : len(m)-1]
+		inner = strings.ReplaceAll(inner, `"`, `\"`)
+		return `"` + inner + `"`
+	})
+	if err := json.Unmarshal([]byte(s), &probe); err == nil {
+		return s
+	}
+	return "{}"
+}
+
+var (
+	jsonTrailingComma  = regexp.MustCompile(`,(\s*[}\]])`)
+	jsonUnquotedKey    = regexp.MustCompile(`([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:`)
+	jsonPyNone         = regexp.MustCompile(`\bNone\b`)
+	jsonPyTrue         = regexp.MustCompile(`\bTrue\b`)
+	jsonPyFalse        = regexp.MustCompile(`\bFalse\b`)
+	jsonSingleQuoteVal = regexp.MustCompile(`'[^'\n]*'`)
+)
+
 func defaultTools() []ChatTool {
 	return []ChatTool{
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "list_sessions",
-				Description: "List all known Claude Code sessions discovered on this machine. Returns id, cwd, title, status, and last_event_at for each. No arguments.",
+				Name: "list_sessions",
+				Description: `Refresh the full list of Claude Code sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at for each.
+
+USE FOR: questions you can't answer from <current_state> — exact timestamps, status that may have changed in the last few seconds.
+
+DO NOT USE FOR: simple metadata trivia like "how many sessions", "which session is in /tmp", "what's the focused cwd" — that's already in the <current_state> block at the end of the user message.`,
 				Parameters: map[string]any{
 					"type":                 "object",
 					"properties":           map[string]any{},
@@ -301,8 +362,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "send_to_session",
-				Description: "Deliver a message to a specific Claude Code session and return immediately (does NOT wait for the assistant's response). Use this when the user just wants to queue work and will check the session detail tab themselves. Use list_sessions first if you don't already know the id.",
+				Name: "send_to_session",
+				Description: `Deliver a message to a session and return immediately. The session keeps working in the background; you do NOT see its response here. Updates focus to the target session.
+
+USE FOR: explicit "kick off X", "let it run", "I'll check the tab myself", or known long-running work (full test suites, deploys) that exceeds the 30-min wait ceiling.
+
+DO NOT USE WHEN: the user wants to see the answer in this chat. Default to send_and_wait_for_response in that case.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -323,8 +388,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "send_and_wait_for_response",
-				Description: "Send a message to a session AND block until the assistant responds, returning the accumulated text. Use this when the user wants to SEE the result here in the chat. For long autonomous tasks (multi-minute coding runs), prefer send_to_session and tell the user to watch the session tab — this tool's default timeout is 300s (5min) and ceiling is 1800s (30min).",
+				Name: "send_and_wait_for_response",
+				Description: `Send a message to a session AND block until the assistant's reply (default 300s, max 1800s). Returns {response, error?}. Updates focus to the target session.
+
+USE FOR: the default way to relay an instruction that has a visible answer — "ask X to ...", "have X explain Y", "run Z and tell me what it says", any "and tell me" follow-up.
+
+DO NOT USE FOR: tasks obviously > 30 min (deploys, full builds). Use send_to_session for those instead.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -340,8 +409,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "read_session_transcript",
-				Description: "Read the most recent N user/assistant turns from a session's transcript. Use this to summarize, quote, or answer questions about what's happening inside a specific session. Tool calls within the session are inlined as `tool: Name` markers. Returns an array of turn objects {role, content, ts}.",
+				Name: "read_session_transcript",
+				Description: `Read recent user/assistant turns from a session's transcript. Tool uses inside the session are inlined as ` + "`tool: Name`" + ` annotations. Returns [{role, content, ts}, ...].
+
+USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives.
+
+DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For "switch to session X" prefer send_and_wait_for_response so a visible action confirms the switch.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -356,8 +429,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "create_session",
-				Description: "Start a NEW Claude Code session in cwd with an initial message. Returns the new session id and the assistant's first response. Use when the user wants fresh context — scratch work, a new project — that doesn't fit any existing session. cwd MUST exist; the agent shouldn't invent a path. Default timeout 300s, max 900s. After creation, the new session's id becomes the focus and follow-up tools (send_to_session, read_session_transcript, send_and_wait_for_response) target it.",
+				Name: "create_session",
+				Description: `Start a brand-new Claude Code session in cwd, send it an initial message, wait for first reply (default 300s, max 900s). Returns {session_id, response, error?}. New id becomes focus.
+
+USE FOR: the user wants fresh context that doesn't fit any session in <current_state> — scratch experiments, a new project, isolated debugging.
+
+DO NOT USE FOR: routing into an existing session that matches the work — use send_and_wait_for_response on that one. cwd must already exist; do not invent paths. /tmp is a safe default for ephemeral / scratch work when the user gives no hint.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -373,8 +450,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "list_pending_interactions",
-				Description: "List PreToolUse permission requests that are waiting for a user decision across all sessions. No arguments.",
+				Name: "list_pending_interactions",
+				Description: `List PreToolUse permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
+
+USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
+
+DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. The count alone is in <current_state>.pending_permission_requests.`,
 				Parameters: map[string]any{
 					"type":                 "object",
 					"properties":           map[string]any{},
@@ -385,8 +466,12 @@ func defaultTools() []ChatTool {
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name:        "respond_to_interaction",
-				Description: "Approve or deny a single pending permission request by id.",
+				Name: "respond_to_interaction",
+				Description: `Approve or deny a single pending PreToolUse permission request by id.
+
+USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
+
+DO NOT blanket-approve anything dangerous-looking (mass deletes, sending sensitive data, broad access) without confirming with the user first.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{

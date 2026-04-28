@@ -64,3 +64,32 @@ type AgentResult struct {
 type Agent interface {
 	Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string) (AgentResult, error)
 }
+
+// strictModeAddendum is appended to the system prompt when LLMConfig.Strict
+// is set. Designed to harden small / mid-tier models (Haiku, Flash, mini,
+// Qwen-7B-class) against the metadata-hallucination failure mode where the
+// model answers from memory of earlier turns instead of using the current
+// state injected by the server. Patterned after Hermes-Agent's
+// TOOL_USE_ENFORCEMENT_MODELS prompt fragments.
+const strictModeAddendum = `
+
+## Strict mode (small-model enforcement)
+
+Every user message ends with a <current_state> block listing all sessions
+(id prefix, cwd, status, title) and the current focus with cwd + title.
+This block is the ground truth.
+
+- Trivia about session count, cwd, title, status, or focus → answer
+  from <current_state>. Do NOT call list_sessions for these; the answer
+  is already in the message.
+- Questions about session CONTENT (what was said, what was done, how
+  something was implemented) → call read_session_transcript or
+  send_and_wait_for_response. Never paraphrase from memory of an earlier
+  reply you wrote.
+- "Switch to session X" / "use the X one" → you MUST call a tool that
+  targets X (read_session_transcript, send_to_session,
+  send_and_wait_for_response). Do NOT claim a switch without a tool call;
+  the focus only updates when a tool actually fires.
+- If you find yourself writing "as I mentioned earlier", "based on my
+  summary", or "you have N sessions" without a verifying tool call,
+  stop and either consult <current_state> or call a tool first.`

@@ -82,6 +82,8 @@ func serve(args []string) error {
 		"model identifier when --agent-mode=llm (e.g. gpt-4o-mini, claude-haiku-4-5, qwen2.5:14b)")
 	llmAPIKeyEnv := fs.String("llm-api-key-env", "OPENAI_API_KEY",
 		"env var holding the API key (use empty value for backends without auth, e.g. local Ollama)")
+	llmStrict := fs.Bool("llm-strict", false,
+		"append a small-model enforcement block to the system prompt (recommended for haiku / mini / flash / 7B-class models)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,7 +111,7 @@ func serve(args []string) error {
 		return fmt.Errorf("init main chat store: %w", err)
 	}
 
-	agent, err := buildAgent(r, *agentMode, *llmBaseURL, *llmModel, *llmAPIKeyEnv)
+	agent, err := buildAgent(r, *agentMode, *llmBaseURL, *llmModel, *llmAPIKeyEnv, *llmStrict)
 	if err != nil {
 		return err
 	}
@@ -125,13 +127,14 @@ func serve(args []string) error {
 		"mode", *agentMode,
 		"model", *llmModel,
 		"base_url", *llmBaseURL,
+		"strict", *llmStrict,
 	)
 
 	srv := web.NewServer(*addr, r, mainStore, agent, logger)
 	return srv.Run(ctx)
 }
 
-func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string) (usheragent.Agent, error) {
+func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string, strict bool) (usheragent.Agent, error) {
 	switch mode {
 	case "", "rule":
 		return usheragent.NewRule(r), nil
@@ -144,7 +147,7 @@ func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string) (usher
 			apiKey = os.Getenv(apiKeyEnv)
 		}
 		client := usheragent.NewChatClient(baseURL, apiKey)
-		return usheragent.NewLLM(r, usheragent.LLMConfig{Client: client, Model: model})
+		return usheragent.NewLLM(r, usheragent.LLMConfig{Client: client, Model: model, Strict: strict})
 	default:
 		return nil, fmt.Errorf("unknown --agent-mode: %q (want rule | llm)", mode)
 	}

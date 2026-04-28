@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"usher/internal/agent/usheragent"
@@ -281,7 +282,74 @@ type mainChatInfo struct {
 	Focus *focusDetail `json:"focus,omitempty"`
 }
 
-const mainChatHistoryCap = 40 // 20 turns of user+agent
+const (
+	mainChatHistoryCap = 40 // 20 turns of user+agent
+	stateBlockMaxRows  = 30 // session rows in the rendered <current_state> preamble
+)
+
+// renderStateBlock produces a compact ground-truth dump of the router's
+// current view of sessions + the active focus. We append it to the user's
+// message every turn so trivia questions ("how many sessions?", "what's
+// the focused cwd?", "is X running?") can be answered straight from
+// context instead of hallucinated. Patterned after Hermes-Agent's
+// per-turn state injection — kept off the system prompt so cache hits
+// still happen on the static prefix.
+func (s *Server) renderStateBlock(focusID string) string {
+	sessions := s.router.ListSessions()
+	pending := s.router.ListPendingInteractions()
+
+	var b strings.Builder
+	b.WriteString("<current_state>\n")
+	fmt.Fprintf(&b, "session_count: %d\n", len(sessions))
+	fmt.Fprintf(&b, "pending_permission_requests: %d\n", len(pending))
+	if focusID != "" {
+		if sess, ok := s.router.GetSession(focusID); ok {
+			fmt.Fprintf(&b, "focus: %s (cwd %s, title %q)\n",
+				focusID, sess.Cwd, truncateRunes(sess.Title, 60))
+		} else {
+			fmt.Fprintf(&b, "focus: %s (no longer in discovery)\n", focusID)
+		}
+	} else {
+		b.WriteString("focus: (none yet)\n")
+	}
+	b.WriteString("sessions:\n")
+	rows := sessions
+	if len(rows) > stateBlockMaxRows {
+		rows = rows[:stateBlockMaxRows]
+	}
+	for _, sess := range rows {
+		mark := ""
+		if sess.ID == focusID {
+			mark = "  [FOCUS]"
+		}
+		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %s%s\n",
+			shortIDForState(sess.ID),
+			truncateRunes(sess.Cwd, 30),
+			string(sess.Status),
+			truncateRunes(sess.Title, 50),
+			mark)
+	}
+	if len(sessions) > stateBlockMaxRows {
+		fmt.Fprintf(&b, "  … %d more (truncated)\n", len(sessions)-stateBlockMaxRows)
+	}
+	b.WriteString("</current_state>")
+	return b.String()
+}
+
+func shortIDForState(id string) string {
+	if len(id) >= 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
 
 func (s *Server) handleGetMainChat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -345,7 +413,13 @@ func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.agent.Handle(r.Context(), history, prevFocus, req.Text)
+	// Append a compact ground-truth block to the user message. The agent
+	// (especially small models like Haiku / Flash / mini) uses it to answer
+	// metadata trivia without hallucinating, and to verify focus before
+	// claiming a switch.
+	enrichedUserMsg := req.Text + "\n\n" + s.renderStateBlock(prevFocus)
+
+	res, err := s.agent.Handle(r.Context(), history, prevFocus, enrichedUserMsg)
 	if err != nil {
 		s.logger.Warn("agent handle", "err", err)
 		res = usheragent.AgentResult{Reply: "agent error: " + err.Error()}

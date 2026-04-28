@@ -463,11 +463,82 @@ func TestExecuteTool_BadJSONArgs(t *testing.T) {
 		Client: NewChatClient("http://x", "k"),
 		Model:  "m",
 	})
+	// "not json" is unparseable; repair pipeline collapses to "{}" which
+	// then fails the per-tool required-arg check with a clear message.
 	got, focus := a.executeTool(context.Background(), "send_to_session", "not json")
-	if !strings.Contains(got, "invalid arguments") {
-		t.Errorf("got %q", got)
+	if !strings.Contains(got, "required") {
+		t.Errorf("got %q (want 'required' from arg validation)", got)
 	}
 	if focus != "" {
 		t.Errorf("focus = %q, want empty", focus)
+	}
+}
+
+func TestRepairJSONArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want any // the parsed Go value we expect after repair+Unmarshal
+	}{
+		{"valid passes through", `{"a":1}`, map[string]any{"a": float64(1)}},
+		{"trailing comma", `{"a":1,}`, map[string]any{"a": float64(1)}},
+		{"unquoted key", `{a:1}`, map[string]any{"a": float64(1)}},
+		{"python None", `{"a":None}`, map[string]any{"a": nil}},
+		{"python True/False", `{"a":True,"b":False}`, map[string]any{"a": true, "b": false}},
+		{"single-quoted value", `{"a":'hi'}`, map[string]any{"a": "hi"}},
+		{"empty string", "", map[string]any{}},
+		{"unrecoverable junk", "<<<not json>>>", map[string]any{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			repaired := repairJSONArgs(c.in)
+			var got any
+			if err := json.Unmarshal([]byte(repaired), &got); err != nil {
+				t.Fatalf("repaired %q didn't parse: %v (repaired=%q)", c.in, err, repaired)
+			}
+			gotJSON, _ := json.Marshal(got)
+			wantJSON, _ := json.Marshal(c.want)
+			if string(gotJSON) != string(wantJSON) {
+				t.Errorf("repair(%q) → %q\n  got  %s\n  want %s", c.in, repaired, gotJSON, wantJSON)
+			}
+		})
+	}
+}
+
+func TestLLMStrictModeAddsEnforcementToSystemPrompt(t *testing.T) {
+	srv, m := newMockChatServer(t, []ChatResponse{chatTextResp("ok")})
+	defer srv.Close()
+	a, err := NewLLM(newFakeAgentAPI(), LLMConfig{
+		Client: NewChatClient(srv.URL+"/v1", "k"),
+		Model:  "m",
+		Strict: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.lastReq.Messages) == 0 || m.lastReq.Messages[0].Role != "system" {
+		t.Fatal("missing system message")
+	}
+	if !strings.Contains(m.lastReq.Messages[0].Content, "Strict mode") {
+		t.Errorf("system prompt missing strict block:\n%s", m.lastReq.Messages[0].Content)
+	}
+}
+
+func TestLLMNonStrictHasNoEnforcement(t *testing.T) {
+	srv, m := newMockChatServer(t, []ChatResponse{chatTextResp("ok")})
+	defer srv.Close()
+	a, _ := NewLLM(newFakeAgentAPI(), LLMConfig{
+		Client: NewChatClient(srv.URL+"/v1", "k"),
+		Model:  "m",
+		// Strict not set
+	})
+	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(m.lastReq.Messages[0].Content, "Strict mode") {
+		t.Error("non-strict run leaked strict block into system prompt")
 	}
 }
