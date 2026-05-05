@@ -157,6 +157,14 @@ func (r *Router) HandleHook(ctx context.Context, ev hook.Event) (hook.Response, 
 	return r.hooks.Submit(ctx, ev)
 }
 
+func (r *Router) SetAutoApprove(sessionID string, enabled bool) {
+	r.hooks.SetAutoApprove(sessionID, enabled)
+}
+
+func (r *Router) IsAutoApprove(sessionID string) bool {
+	return r.hooks.IsAutoApprove(sessionID)
+}
+
 // --- transcript / blocking send (v0.2 LLM agent helpers) ----------------
 
 // ReadSessionTranscript projects the most recent N user/assistant turns of

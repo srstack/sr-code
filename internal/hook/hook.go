@@ -68,20 +68,25 @@ type Event struct {
 	Cwd       string
 }
 
-// Manager owns the in-memory map of pending interactions and the per-
-// session remembered-rule list. Both are process-lifetime only.
+// Manager owns the in-memory map of pending interactions, the per-session
+// remembered-rule list, and the per-session auto-approve flag. All are
+// process-lifetime only — a server restart re-arms the consent boundary.
 type Manager struct {
 	mu      sync.Mutex
 	pending map[string]*pendingEntry
 
 	rememberMu sync.Mutex
 	remembered map[string][]Rule // sessionID → rules
+
+	autoMu      sync.Mutex
+	autoApprove map[string]bool // sessionID → true when blanket-allow is on
 }
 
 func New() *Manager {
 	return &Manager{
-		pending:    map[string]*pendingEntry{},
-		remembered: map[string][]Rule{},
+		pending:     map[string]*pendingEntry{},
+		remembered:  map[string][]Rule{},
+		autoApprove: map[string]bool{},
 	}
 }
 
@@ -95,6 +100,16 @@ func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
 		return Response{
 			Behavior: rule.Behavior,
 			Reason:   "remembered: " + rule.Matcher,
+		}, nil
+	}
+	// Per-session auto-approve runs *after* matchers — a deliberate
+	// "deny always X" rule still wins over the blanket flag, which keeps
+	// users' specific opt-outs intact when they later toggle auto-approve
+	// on globally for the session.
+	if m.IsAutoApprove(ev.SessionID) {
+		return Response{
+			Behavior: "allow",
+			Reason:   "auto-approve",
 		}, nil
 	}
 
@@ -183,6 +198,25 @@ func (m *Manager) ForgetSessionRules(sessionID string) {
 	m.rememberMu.Lock()
 	delete(m.remembered, sessionID)
 	m.rememberMu.Unlock()
+}
+
+// SetAutoApprove flips the blanket "allow every tool call" flag for a
+// session. Process-lifetime only.
+func (m *Manager) SetAutoApprove(sessionID string, enabled bool) {
+	m.autoMu.Lock()
+	defer m.autoMu.Unlock()
+	if enabled {
+		m.autoApprove[sessionID] = true
+	} else {
+		delete(m.autoApprove, sessionID)
+	}
+}
+
+// IsAutoApprove reports whether sessionID is currently in blanket-allow mode.
+func (m *Manager) IsAutoApprove(sessionID string) bool {
+	m.autoMu.Lock()
+	defer m.autoMu.Unlock()
+	return m.autoApprove[sessionID]
 }
 
 func (m *Manager) findMatchingRule(ev Event) *Rule {

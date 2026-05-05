@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"usher/internal/agent/usheragent"
+	"usher/internal/core"
 	"usher/internal/hook"
 	"usher/internal/jsonl"
 	"usher/internal/mainchat"
@@ -62,6 +63,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
 	mux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
+	mux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 
 	mux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
 	mux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
@@ -115,17 +117,50 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 
 // --- sessions ------------------------------------------------------------
 
+// sessionDTO wraps core.Session with web-only fields (currently just the
+// auto-approve flag). We don't put auto_approve on core.Session because
+// hook state is process-local and shouldn't leak into the discovery model.
+type sessionDTO struct {
+	core.Session
+	AutoApprove bool `json:"auto_approve"`
+}
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.router.ListSessions())
+	sessions := s.router.ListSessions()
+	out := make([]sessionDTO, len(sessions))
+	for i, sess := range sessions {
+		out[i] = sessionDTO{Session: sess, AutoApprove: s.router.IsAutoApprove(sess.ID)}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.router.GetSession(r.PathValue("id"))
+	id := r.PathValue("id")
+	sess, ok := s.router.GetSession(id)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, sess)
+	writeJSON(w, http.StatusOK, sessionDTO{Session: sess, AutoApprove: s.router.IsAutoApprove(id)})
+}
+
+type autoApproveRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleAutoApprove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	var req autoApproveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	s.router.SetAutoApprove(id, req.Enabled)
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": req.Enabled})
 }
 
 type sendRequest struct {

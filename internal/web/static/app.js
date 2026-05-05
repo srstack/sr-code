@@ -126,6 +126,86 @@ function route() {
   } else if (hash.startsWith('#/s/')) {
     showDetail(decodeURIComponent(hash.slice(4)));
   }
+  updateSidebarActive();
+}
+
+// ---------- Sidebar ----------
+//
+// Polled every 5s independently of the active route. Renders Claude Code
+// sessions grouped by cwd, recent activity first. The "main chat" entry is
+// static markup in index.html — no fetch needed since we only ever route
+// to a single mainchat (id=default).
+
+async function loadSidebar() {
+  try {
+    const res = await fetch('/api/sessions');
+    const sessions = res.ok ? (await res.json() || []) : [];
+    renderSidebarSessions(sessions);
+    updateSidebarActive();
+  } catch {/* server may be down briefly */}
+}
+
+function renderSidebarSessions(sessions) {
+  const wrap = document.getElementById('sidebar-sessions');
+  const count = document.getElementById('sidebar-session-count');
+  if (count) count.textContent = '(' + sessions.length + ')';
+  if (!wrap) return;
+  if (!sessions.length) {
+    wrap.innerHTML = '<div class="sidebar-empty">no sessions found</div>';
+    return;
+  }
+  const groups = new Map();
+  for (const s of sessions) {
+    const cwd = s.cwd || '(unknown)';
+    if (!groups.has(cwd)) groups.set(cwd, []);
+    groups.get(cwd).push(s);
+  }
+  const recencyOf = arr => Math.max(...arr.map(s => Date.parse(s.last_event_at) || 0));
+  const cwds = [...groups.keys()].sort((a, b) => recencyOf(groups.get(b)) - recencyOf(groups.get(a)));
+  wrap.innerHTML = cwds.map(cwd => {
+    const items = groups.get(cwd).slice().sort((a, b) =>
+      (Date.parse(b.last_event_at) || 0) - (Date.parse(a.last_event_at) || 0)
+    );
+    const lis = items.map(s => {
+      const href = '#/s/' + encodeURIComponent(s.id);
+      const dot = s.status === 'running'
+        ? '<span class="running-dot" title="active subprocess">●</span>'
+        : '';
+      const auto = s.auto_approve
+        ? '<span class="auto-dot" title="auto-approve enabled">⚡</span>'
+        : '';
+      const title = s.title || '(untitled)';
+      return `<li><a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a></li>`;
+    }).join('');
+    return `<div class="cwd-group">
+      <div class="cwd-label" title="${esc(cwd)}">${esc(cwd)} (${items.length})</div>
+      <ul class="sidebar-list">${lis}</ul>
+    </div>`;
+  }).join('');
+}
+
+function updateSidebarActive() {
+  const hash = location.hash || '#/';
+  const inMainChat = hash === '#/chat' || hash.startsWith('#/chat/');
+  document.querySelectorAll('.sidebar-mainchat').forEach(a => {
+    a.classList.toggle('active', inMainChat);
+  });
+  let sessionKey = '';
+  if (hash.startsWith('#/s/')) {
+    sessionKey = 's:' + decodeURIComponent(hash.slice(4));
+  }
+  document.querySelectorAll('#sidebar a[data-route]').forEach(a => {
+    a.classList.toggle('active', a.dataset.route === sessionKey);
+  });
+}
+
+// Mobile sidebar toggle. The sidebar is fixed-position with a slide-in
+// transform under 720px wide; the hamburger button toggles .open.
+const mobileToggle = document.getElementById('mobile-toggle');
+const sidebarEl = document.getElementById('sidebar');
+if (mobileToggle && sidebarEl) {
+  mobileToggle.addEventListener('click', () => sidebarEl.classList.toggle('open'));
+  window.addEventListener('hashchange', () => sidebarEl.classList.remove('open'));
 }
 
 // ---------- List view ----------
@@ -194,12 +274,16 @@ async function showDetail(id) {
     return;
   }
 
+  // Show title / cwd / short id in the page header subtitle so it stays
+  // visible while transcript / response sections scroll. Mirrors how main
+  // chat surfaces its focus block — the page header is the only sticky
+  // band, no fragile second-tier sticky element.
+  subtitle.innerHTML =
+    `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+    ` <span class="session-cwd">${esc(sess.cwd || '')}</span>` +
+    ` <span class="session-id">${esc(sess.id.slice(0, 8))}</span>`;
+
   root.innerHTML = `
-    <div class="session-meta">
-      <div class="title">${esc(sess.title || '(untitled)')}</div>
-      <div class="cwd">${esc(sess.cwd || '')}</div>
-      <div class="id">id: ${esc(sess.id)}</div>
-    </div>
     <section>
       <h3>transcript</h3>
       <div id="transcript" class="chat-scroll"><div class="muted" style="padding:0.5rem">loading…</div></div>
@@ -219,7 +303,14 @@ async function showDetail(id) {
         <button id="send">send</button>
         <button id="cancel" class="cancel" hidden>cancel</button>
       </div>
-      <div class="kbd-hint">Ctrl/Cmd + Enter to send</div>
+      <div class="send-controls">
+        <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
+          aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
+          title="when on, every PreToolUse hook for this session is allowed without prompting">
+          auto-approve: ${sess.auto_approve ? 'on' : 'off'}
+        </button>
+        <span class="kbd-hint">Ctrl/Cmd + Enter to send</span>
+      </div>
     </section>
   `;
 
@@ -230,6 +321,29 @@ async function showDetail(id) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cancelBtn = document.getElementById('cancel');
+
+  const autoBtn = document.getElementById('auto-approve-toggle');
+  if (autoBtn) {
+    autoBtn.addEventListener('click', async () => {
+      const next = autoBtn.getAttribute('aria-pressed') !== 'true';
+      autoBtn.disabled = true;
+      try {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/auto-approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: next }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        autoBtn.setAttribute('aria-pressed', next ? 'true' : 'false');
+        autoBtn.textContent = 'auto-approve: ' + (next ? 'on' : 'off');
+        loadSidebar(); // refresh sidebar marker immediately
+      } catch (e) {
+        addEvent(eventsEl, 'error', 'auto-approve toggle failed: ' + String(e));
+      } finally {
+        autoBtn.disabled = false;
+      }
+    });
+  }
 
   cancelBtn.addEventListener('click', async () => {
     cancelBtn.disabled = true;
@@ -606,5 +720,8 @@ function deriveMatcherPreview(toolName, toolInput) {
 
 setInterval(pollInteractions, 2000);
 pollInteractions();
+
+setInterval(loadSidebar, 5000);
+loadSidebar();
 
 route();

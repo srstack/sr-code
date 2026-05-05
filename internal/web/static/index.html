@@ -6,13 +6,22 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>
-  <h1><a href="#/">usher</a></h1>
-  <a href="#/chat" class="nav">main chat</a>
-  <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering">render: md</button>
-  <span id="subtitle" class="muted">discovered Claude Code sessions</span>
-</header>
-<main id="root"></main>
+<aside id="sidebar">
+  <h1 class="sidebar-brand"><a href="#/">usher</a></h1>
+  <a href="#/chat/default" class="sidebar-mainchat">main chat</a>
+  <div class="sidebar-section">
+    <div class="sidebar-heading">sessions <span id="sidebar-session-count" class="muted"></span></div>
+    <div id="sidebar-sessions"></div>
+  </div>
+</aside>
+<div class="main-wrap">
+  <header>
+    <button id="mobile-toggle" class="mobile-toggle" aria-label="toggle sidebar" type="button">☰</button>
+    <span id="subtitle" class="muted">discovered Claude Code sessions</span>
+    <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering">render: md</button>
+  </header>
+  <main id="root"></main>
+</div>
 <script src="/vendor/snarkdown.js"></script>
 <script src="/app.js"></script>
 </body>
