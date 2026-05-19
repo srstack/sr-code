@@ -1,6 +1,6 @@
 # usher
 
-A thin router that ushers messages to the right coding agent session.
+**U**ltra-**S**imple **H**arness for **E**verything **R**outing — a thin router that ushers messages to the right coding agent session.
 
 usher gives you a web UI for managing multiple Claude Code sessions on your
 machine. Send messages from any browser — including your phone over Tailscale —
@@ -394,3 +394,7 @@ Direct deps: `fsnotify` (filesystem watching), `golang.org/x/crypto`
 (argon2id), `golang.org/x/term` (echoless password prompt). No SQL, no
 HTTP framework, no logger lib, no testing lib, no JS framework. The
 LLM HTTP client is hand-rolled in ~120 lines.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
