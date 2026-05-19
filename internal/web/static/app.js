@@ -1,6 +1,22 @@
 // usher SPA: hash-based routing between session list and detail view.
 // Detail view streams subprocess events via SSE.
 
+// Wrap fetch so any 401 from the API navigates to /login. SSE can't see
+// HTTP status, so we rely on the polling fetches (session list, etc.) to
+// trip this path within a few seconds of a cookie going bad.
+const _origFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const res = await _origFetch(...args);
+  if (res.status === 401) {
+    const next = encodeURIComponent(location.pathname + location.search + location.hash);
+    location.href = '/login?next=' + next;
+    // Return a never-resolving promise so callers don't proceed with the
+    // 401 body. Navigation is about to take over the page anyway.
+    return new Promise(() => {});
+  }
+  return res;
+};
+
 const root = document.getElementById('root');
 const subtitle = document.getElementById('subtitle');
 const renderModeBtn = document.getElementById('render-mode-btn');

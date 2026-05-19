@@ -18,10 +18,12 @@ are delivered via headless `claude -p --resume`.
   (list/send/wait/read-transcript/list-pending/respond), 20-turn
   conversation memory, `FocusSession` tracking that lets the user
   pretend it's a single session.
+- [x] **auth** — argon2id password + HMAC-signed stateless cookie for
+  the web UI, Unix-socket hook channel, bind-gate that refuses
+  non-loopback `--addr` without a password (see *Authentication* below).
 - [ ] streaming LLM output through main chat SSE (5-30s "thinking…"
   becomes visible progress)
 - [ ] mid-flight LLM cancel from main chat
-- [ ] new-session creation from main chat
 
 ## Design
 
@@ -87,16 +89,79 @@ Once you've installed the binary, register usher with Claude Code:
 
 This adds a `PreToolUse` hook in `~/.claude/settings.json` that calls
 `usher hook PreToolUse`. When any Claude Code session (managed by usher or
-not) requests a tool, the hook posts to your running `usher serve` and
+not) requests a tool, the hook talks to your running `usher serve` over
+a **Unix domain socket** at `<data-dir>/hook.sock` (mode 0600) and
 displays an "allow / deny" modal in the web UI. If `usher serve` isn't
 running, the hook fails open (exits 0 with empty output) so your normal
 Claude usage is not affected.
 
-Uninstall:
+Pass `--sock /path/to/hook.sock` to `usher setup` if you run `usher serve`
+with a non-default `--data-dir`. Uninstall:
 
 ```
 ./usher setup --remove
 ```
+
+## Authentication
+
+The web UI is unauthenticated by default and binds to `127.0.0.1:7777`.
+That is safe for local-only use. To expose usher on a non-loopback
+interface (e.g. so you can reach it from your phone over Tailscale), set
+a password first:
+
+```
+./usher set-password               # prompts twice on the terminal
+# or, for scripting:
+echo -n 'hunter2' | ./usher set-password --password-stdin
+```
+
+`usher serve` will then **refuse to bind a non-loopback `--addr` until a
+password exists** (e.g. `--addr 0.0.0.0:7777` or `--addr <tailnet-ip>:7777`).
+Once set, every request goes through a login page, with state carried by
+an HttpOnly + SameSite=Lax cookie.
+
+Implementation:
+
+- **argon2id** hash of the password is stored in `<data-dir>/auth.json`
+  (mode 0600). No plaintext is ever read from a flag, env var, or config
+  file — only stdin, on a TTY or via `--password-stdin`.
+- A separate 32-byte HMAC secret is generated on first start at
+  `<data-dir>/secret` (mode 0600) and reused on subsequent restarts so
+  cookies survive a restart.
+- Each cookie value is `base64url(HMAC(secret, password_hash))` — there
+  is **no server-side session table**. Rotating the password (via
+  `set-password`) changes the hash, which invalidates every cookie ever
+  issued. That is the only way to forcibly sign out other devices.
+- `/login` rate-limits per client IP with exponential backoff (1s → 2s →
+  4s … capped at 60s) after 5 consecutive failed attempts; a successful
+  login resets the counter.
+
+The hook socket is **always** Unix-domain regardless of whether a
+password is set: that channel never traverses the public web port and
+is protected by filesystem permissions instead.
+
+### Threat model
+
+What auth in v0.1 **does** defend against:
+
+- Other devices on your LAN or tailnet (the original motivation).
+- A compromised tailnet peer trying to talk to your usher.
+- Accidental `--addr 0.0.0.0` exposure (the bind gate refuses to start).
+- A neighboring container that shares your host's network namespace but
+  not its filesystem (e.g. `--network host`) — it can't reach the hook
+  Unix socket and can't read `auth.json` / `secret` to forge a cookie.
+
+What it **does not** defend against:
+
+- Code running as your OS user on the host. Such code can read
+  `auth.json` + `secret` and forge a cookie, read your jsonl session
+  history directly, or just run `claude -p --resume <id>` itself —
+  bypassing usher entirely. The OS user account is the trust boundary;
+  applying further isolation is out of scope (use a dedicated UID,
+  container, or sandbox if that matters to you).
+
+This is the same posture as code-server, Jupyter, and most other
+single-user local web tools.
 
 
 ## What commit 1 includes
@@ -325,5 +390,7 @@ the lingua franca rather than HTML.
                                           router methods
 ```
 
-Direct deps: `fsnotify` (filesystem watching) + `golang.org/x/sys` (transitive).
-No SQL, no HTTP framework, no logger lib, no testing lib, no JS framework.
+Direct deps: `fsnotify` (filesystem watching), `golang.org/x/crypto`
+(argon2id), `golang.org/x/term` (echoless password prompt). No SQL, no
+HTTP framework, no logger lib, no testing lib, no JS framework. The
+LLM HTTP client is hand-rolled in ~120 lines.

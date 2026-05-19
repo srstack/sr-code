@@ -14,9 +14,14 @@ import (
 // hook that runs `usher hook PreToolUse`. Existing user-defined hooks are
 // preserved; previous usher entries (identified by command suffix) are
 // replaced so re-running is idempotent.
+//
+// The hook talks to usher over a Unix domain socket (see runHook). By
+// default `usher hook` resolves the socket path from the data dir at
+// runtime; pass --sock here to pin a specific path into the hook command
+// (useful if you run usher with a non-default --data-dir).
 func runSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
-	addr := fs.String("addr", "", "USHER_ADDR to set in the hook command (defaults to 127.0.0.1:7777 at runtime)")
+	sock := fs.String("sock", "", "USHER_HOOK_SOCK to set in the hook command (defaults to <data-dir>/hook.sock at runtime)")
 	remove := fs.Bool("remove", false, "remove the usher hook from settings.json")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -52,8 +57,8 @@ func runSetup(args []string) error {
 
 	if !*remove {
 		cmd := exe + " hook PreToolUse"
-		if *addr != "" {
-			cmd = "USHER_ADDR=" + *addr + " " + cmd
+		if *sock != "" {
+			cmd = "USHER_HOOK_SOCK=" + *sock + " " + cmd
 		}
 		preToolUse = append(preToolUse, map[string]any{
 			"matcher": "",
@@ -135,7 +140,9 @@ func isUsherHookCmd(cmd string) bool {
 	if cmd == "" {
 		return false
 	}
-	// Tolerate optional leading env var assignment: "USHER_ADDR=... <exe> hook PreToolUse"
+	// Tolerate optional leading env var assignments. Both the current
+	// USHER_HOOK_SOCK and the historical USHER_ADDR get stripped by
+	// suffix match alone, so re-running setup cleans up old entries.
 	return strings.HasSuffix(strings.TrimSpace(cmd), usherHookCmdSuffix)
 }
 

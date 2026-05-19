@@ -319,6 +319,13 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   color: #6e40c9;
 }
 
+.header-logout {
+  font-size: 0.78rem;
+  margin-left: 0.5rem;
+  text-decoration: none;
+}
+.header-logout:hover { text-decoration: underline; }
+
 .raw-markdown {
   background: #fcfcfc;
   border: 1px solid #eee;

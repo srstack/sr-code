@@ -1,4 +1,14 @@
 // Package web serves the usher HTTP API and embedded static UI.
+//
+// Two listeners run side by side:
+//
+//   - the **web** listener (TCP at s.addr) serves the SPA, JSON API, SSE
+//     stream, and /login. Every non-exempt request is gated by auth
+//     middleware when a password is configured.
+//   - the **hook** listener (Unix socket at s.hookSockPath, mode 0600)
+//     serves only /hook/{event}. Hook traffic from the local `usher hook`
+//     subprocess never touches the public TCP port, so it doesn't need
+//     auth and a leaky-netns container can't reach it (fs-isolated).
 package web
 
 import (
@@ -7,15 +17,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"usher/internal/agent/usheragent"
+	"usher/internal/auth"
 	"usher/internal/core"
 	"usher/internal/hook"
 	"usher/internal/jsonl"
@@ -26,19 +41,28 @@ import (
 //go:embed static
 var staticFS embed.FS
 
+//go:embed login.tmpl.html
+var loginTemplateRaw string
+
+var loginTmpl = template.Must(template.New("login").Parse(loginTemplateRaw))
+
 // Verify Router satisfies AgentAPI at compile time.
 var _ usheragent.AgentAPI = (*router.Router)(nil)
 
 type Server struct {
-	addr   string
-	router *router.Router
-	main   *mainchat.Store
-	agent  usheragent.Agent
-	logger *slog.Logger
+	addr         string
+	hookSockPath string
+	auth         *auth.Store
+	router       *router.Router
+	main         *mainchat.Store
+	agent        usheragent.Agent
+	logger       *slog.Logger
 }
 
 func NewServer(
 	addr string,
+	hookSockPath string,
+	authStore *auth.Store,
 	r *router.Router,
 	main *mainchat.Store,
 	agent usheragent.Agent,
@@ -47,62 +71,246 @@ func NewServer(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{addr: addr, router: r, main: main, agent: agent, logger: logger}
+	return &Server{
+		addr:         addr,
+		hookSockPath: hookSockPath,
+		auth:         authStore,
+		router:       r,
+		main:         main,
+		agent:        agent,
+		logger:       logger,
+	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	mux := http.NewServeMux()
+	webMux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	webMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
-	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
-	mux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
-	mux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
-	mux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
-	mux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
-	mux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
+	webMux.HandleFunc("GET /login", s.handleLogin)
+	webMux.HandleFunc("POST /login", s.handleLogin)
+	webMux.HandleFunc("GET /logout", s.handleLogout)
+	webMux.HandleFunc("POST /logout", s.handleLogout)
 
-	mux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
-	mux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
-	mux.HandleFunc("GET /api/mainchats/{id}/messages", s.handleListMainChatMessages)
-	mux.HandleFunc("POST /api/mainchats/{id}/send", s.handleMainChatSend)
+	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
+	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
+	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
+	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
+	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
+	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 
-	mux.HandleFunc("POST /hook/{event}", s.handleHook)
-	mux.HandleFunc("GET /api/interactions", s.handleListInteractions)
-	mux.HandleFunc("POST /api/interactions/{id}/respond", s.handleRespondInteraction)
+	webMux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
+	webMux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
+	webMux.HandleFunc("GET /api/mainchats/{id}/messages", s.handleListMainChatMessages)
+	webMux.HandleFunc("POST /api/mainchats/{id}/send", s.handleMainChatSend)
+
+	webMux.HandleFunc("GET /api/interactions", s.handleListInteractions)
+	webMux.HandleFunc("POST /api/interactions/{id}/respond", s.handleRespondInteraction)
 
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		return err
 	}
-	mux.Handle("GET /", http.FileServer(http.FS(sub)))
+	webMux.Handle("GET /", http.FileServer(http.FS(sub)))
 
-	srv := &http.Server{
+	hookMux := http.NewServeMux()
+	hookMux.HandleFunc("POST /hook/{event}", s.handleHook)
+
+	webSrv := &http.Server{
 		Addr:              s.addr,
-		Handler:           mux,
+		Handler:           s.authMiddleware(webMux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	hookSrv := &http.Server{
+		Handler:           hookMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	sockListener, err := listenUnixSocket(s.hookSockPath)
+	if err != nil {
+		return fmt.Errorf("hook socket: %w", err)
+	}
+
+	errCh := make(chan error, 2)
 	go func() {
-		s.logger.Info("usher listening", "addr", s.addr)
-		errCh <- srv.ListenAndServe()
+		s.logger.Info("usher web listening", "addr", s.addr)
+		errCh <- webSrv.ListenAndServe()
 	}()
+	go func() {
+		s.logger.Info("usher hook listening", "socket", s.hookSockPath)
+		errCh <- hookSrv.Serve(sockListener)
+	}()
+
+	shutdown := func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = webSrv.Shutdown(shutdownCtx)
+		_ = hookSrv.Shutdown(shutdownCtx)
+		_ = os.Remove(s.hookSockPath)
+	}
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		shutdown()
+		return nil
 	case err := <-errCh:
+		shutdown()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
+}
+
+// listenUnixSocket binds a Unix domain socket at path with mode 0600. A
+// stale socket file from a previous unclean shutdown is removed first.
+func listenUnixSocket(path string) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	// Remove stale socket from a prior unclean shutdown. We intentionally
+	// don't check whether an instance is currently bound — net.Listen will
+	// fail loudly below if another process holds the address.
+	if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(path)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return ln, nil
+}
+
+// --- auth middleware + handlers -----------------------------------------
+
+// authMiddleware gates every web route on a valid cookie when a password
+// is configured. When auth is not configured (loopback-only test mode) it
+// is a no-op pass-through. /healthz, /login, and /logout are always
+// exempt.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.auth == nil || !s.auth.IsConfigured() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isAuthExempt(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		c, err := r.Cookie(auth.CookieName)
+		if err == nil && s.auth.VerifyCookie(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// API/XHR clients get 401; full-page navigations get a redirect to
+		// /login so the user lands on the form instead of seeing JSON.
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		target := "/login"
+		if r.URL.Path != "/" && r.URL.Path != "" {
+			target = "/login?next=" + safeNextEscape(r.URL.RequestURI())
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
+	})
+}
+
+func isAuthExempt(p string) bool {
+	switch p {
+	case "/healthz", "/login", "/logout":
+		return true
+	}
+	return false
+}
+
+// safeNextEscape URL-encodes a path for use in ?next=. We don't accept
+// scheme/authority; callers should already have a relative path.
+func safeNextEscape(p string) string {
+	// http.Redirect and the browser will handle the rest; just keep the
+	// payload safe to embed in a query string.
+	r := strings.NewReplacer("&", "%26", "?", "%3F", "#", "%23", " ", "%20")
+	return r.Replace(p)
+}
+
+// validateNext rejects open redirects: anything other than a same-origin
+// absolute path collapses to "/".
+func validateNext(next string) string {
+	if next == "" || !strings.HasPrefix(next, "/") {
+		return "/"
+	}
+	if strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+		return "/"
+	}
+	return next
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil || !s.auth.IsConfigured() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method == http.MethodGet {
+		s.renderLogin(w, r, "", http.StatusOK, r.URL.Query().Get("next"))
+		return
+	}
+	// POST
+	ip := auth.ClientIP(r)
+	if delay, ok := s.auth.Limiter.Acquire(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(delay.Seconds())+1))
+		s.renderLogin(w, r,
+			fmt.Sprintf("too many attempts; try again in %ds", int(delay.Seconds())+1),
+			http.StatusTooManyRequests,
+			r.FormValue("next"))
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		s.renderLogin(w, r, "invalid form submission", http.StatusBadRequest, "")
+		return
+	}
+	pw := r.PostForm.Get("password")
+	next := r.PostForm.Get("next")
+	if !s.auth.Verify(pw) {
+		s.auth.Limiter.OnFailure(ip)
+		s.logger.Info("login failed", "ip", ip)
+		s.renderLogin(w, r, "invalid password", http.StatusUnauthorized, next)
+		return
+	}
+	s.auth.Limiter.OnSuccess(ip)
+	cookieVal, err := s.auth.IssueCookie()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.SetCookie(w, s.auth.NewSessionCookie(cookieVal))
+	http.Redirect(w, r, validateNext(next), http.StatusSeeOther)
+}
+
+func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg string, status int, next string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = loginTmpl.Execute(w, struct {
+		Error string
+		Next  string
+	}{
+		Error: errMsg,
+		Next:  validateNext(next),
+	})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil {
+		http.SetCookie(w, s.auth.ClearCookie())
+	}
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

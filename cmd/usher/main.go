@@ -6,12 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
 	"usher/internal/agent/usheragent"
+	"usher/internal/auth"
 	"usher/internal/broker"
 	"usher/internal/discovery"
 	"usher/internal/hook"
@@ -45,6 +47,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usher setup:", err)
 			os.Exit(1)
 		}
+	case "set-password":
+		if err := runSetPassword(args); err != nil {
+			fmt.Fprintln(os.Stderr, "usher set-password:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(Version)
 	case "-h", "--help", "help":
@@ -62,6 +69,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  serve              start the web server")
 	fmt.Fprintln(os.Stderr, "  setup              install/remove the PreToolUse hook in ~/.claude/settings.json")
+	fmt.Fprintln(os.Stderr, "  set-password       set/change the web UI password (required for non-loopback bind)")
 	fmt.Fprintln(os.Stderr, "  hook <event-name>  invoked by Claude Code; not for direct use")
 	fmt.Fprintln(os.Stderr, "  version            print version")
 }
@@ -96,6 +104,21 @@ func serve(args []string) error {
 	if _, err := os.Stat(*projectsDir); err != nil {
 		return fmt.Errorf("projects dir %q: %w", *projectsDir, err)
 	}
+	if *dataDir == "" {
+		return fmt.Errorf("could not resolve data dir; pass --data-dir")
+	}
+
+	authStore, err := auth.Load(*dataDir)
+	if err != nil {
+		return fmt.Errorf("load auth: %w", err)
+	}
+	if !authStore.IsConfigured() && !addrIsLoopback(*addr) {
+		return fmt.Errorf(
+			"refusing to bind non-loopback %q without a password.\n"+
+				"  run `usher set-password` first, or bind to 127.0.0.1 / localhost for local-only access.",
+			*addr,
+		)
+	}
 
 	d, err := discovery.New(*projectsDir, logger)
 	if err != nil {
@@ -129,9 +152,32 @@ func serve(args []string) error {
 		"base_url", *llmBaseURL,
 		"strict", *llmStrict,
 	)
+	logger.Info("auth",
+		"configured", authStore.IsConfigured(),
+		"loopback_bind", addrIsLoopback(*addr),
+	)
 
-	srv := web.NewServer(*addr, r, mainStore, agent, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, logger)
 	return srv.Run(ctx)
+}
+
+// addrIsLoopback reports whether the host part of addr binds only on loopback
+// interfaces. Empty host (e.g. ":7777") means all interfaces ⇒ not loopback.
+func addrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// hookSockPath returns the Unix socket path for the hook listener.
+func hookSockPath(dataDir string) string {
+	return filepath.Join(dataDir, "hook.sock")
 }
 
 func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string, strict bool) (usheragent.Agent, error) {

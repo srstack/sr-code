@@ -1,29 +1,33 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
 // runHook is the worker for `usher hook <event>`. It is invoked by Claude
 // Code per the entry installed by `usher setup`. It reads the hook payload
-// from stdin, POSTs it to the local usher server, and writes the server's
-// JSON response to stdout.
+// from stdin, POSTs it to the running usher server over its Unix domain
+// socket, and writes the server's JSON response to stdout.
 //
-// If usher is not running, the hook fails open: prints `{}` and exits 0,
-// letting Claude proceed with its default permission flow.
+// If usher is not running (socket missing or refusing connections), the
+// hook fails open: prints `{}` and exits 0, letting Claude proceed with
+// its default permission flow.
 func runHook(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: usher hook <event-name>")
 	}
 	event := args[0]
 
-	addr := os.Getenv("USHER_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:7777"
+	sockPath := os.Getenv("USHER_HOOK_SOCK")
+	if sockPath == "" {
+		sockPath = filepath.Join(defaultDataDir(), "hook.sock")
 	}
 
 	body, err := io.ReadAll(os.Stdin)
@@ -31,7 +35,16 @@ func runHook(args []string) error {
 		return fmt.Errorf("read stdin: %w", err)
 	}
 
-	url := "http://" + addr + "/hook/" + event
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+	// "http://hook" is a placeholder authority; the unix dialer ignores it.
+	url := "http://hook/hook/" + event
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
 	if err != nil {
 		return err
@@ -41,7 +54,7 @@ func runHook(args []string) error {
 	// No client-side timeout: the server holds the request until either the
 	// user responds via UI or Claude Code's own hook timeout fires (which
 	// will kill our process).
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// Server unreachable → fail open.
 		fmt.Println("{}")
