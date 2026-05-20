@@ -117,6 +117,30 @@ func TestDiscovery_WatchPicksUpNewFile(t *testing.T) {
 	t.Fatalf("watched session not discovered; current list=%v", d.List())
 }
 
+func TestDiscovery_SkipsNestedJSONL(t *testing.T) {
+	tmp := t.TempDir()
+	// Real session.
+	writeJSONL(t, filepath.Join(tmp, "-p", "real.jsonl"), "real", "/tmp/p", "hi")
+	// Subagent transcript Claude Code writes alongside.
+	writeJSONL(t, filepath.Join(tmp, "-p", "real", "subagents", "agent-deadbeef.jsonl"),
+		"real", "/tmp/p", "subagent work")
+	// Future-proof: a hypothetical jsonl in some other nested subdir.
+	writeJSONL(t, filepath.Join(tmp, "-p", "real", "tool-results", "boia1ypmh.jsonl"),
+		"real", "/tmp/p", "tool result")
+
+	d := newTestDiscovery(t, tmp)
+	if err := d.scan(); err != nil {
+		t.Fatal(err)
+	}
+	got := d.List()
+	if len(got) != 1 {
+		t.Fatalf("expected only the real session; got %d: %v", len(got), got)
+	}
+	if got[0].ID != "real" {
+		t.Errorf("got id %q, want %q", got[0].ID, "real")
+	}
+}
+
 func TestDiscovery_ListSorted(t *testing.T) {
 	tmp := t.TempDir()
 	older := filepath.Join(tmp, "-p", "older.jsonl")

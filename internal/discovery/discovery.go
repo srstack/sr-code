@@ -61,7 +61,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 	return nil
 }
 
-// scan walks the root once and upserts every jsonl file found.
+// scan walks the root once and upserts every session jsonl found.
 func (d *Discovery) scan() error {
 	return filepath.Walk(d.rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -71,11 +71,28 @@ func (d *Discovery) scan() error {
 		if info.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(info.Name(), ".jsonl") {
+		if d.isSessionJSONL(path) {
 			d.upsert(path)
 		}
 		return nil
 	})
+}
+
+// isSessionJSONL accepts only top-level project session files, i.e. paths
+// shaped like <root>/<sanitized-cwd>/<id>.jsonl. Subagent transcripts
+// (<root>/<cwd>/<session-id>/subagents/agent-<id>.jsonl), tool-results
+// .txt files, and Claude's auto-memory .md files all live deeper and are
+// filtered out so they don't show up as fake "sessions" — subagents in
+// particular have non-UUID ids that `claude -p --resume` refuses.
+func (d *Discovery) isSessionJSONL(path string) bool {
+	if !strings.HasSuffix(path, ".jsonl") {
+		return false
+	}
+	rel, err := filepath.Rel(d.rootDir, path)
+	if err != nil {
+		return false
+	}
+	return strings.Count(rel, string(os.PathSeparator)) == 1
 }
 
 // addWatches registers watches on the root dir and every existing subdir, so
@@ -187,15 +204,15 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 			}
 			return
 		}
-		if strings.HasSuffix(ev.Name, ".jsonl") {
+		if d.isSessionJSONL(ev.Name) {
 			d.upsert(ev.Name)
 		}
 	case ev.Op.Has(fsnotify.Write):
-		if strings.HasSuffix(ev.Name, ".jsonl") {
+		if d.isSessionJSONL(ev.Name) {
 			d.upsert(ev.Name)
 		}
 	case ev.Op.Has(fsnotify.Remove), ev.Op.Has(fsnotify.Rename):
-		if strings.HasSuffix(ev.Name, ".jsonl") {
+		if d.isSessionJSONL(ev.Name) {
 			d.remove(ev.Name)
 		}
 	}
