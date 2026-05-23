@@ -12,7 +12,7 @@
   --bg-canvas: #fafafa;
   --bg-chrome: #ffffff;       /* sidebar, header, modal, inputs */
   --bg-subtle: #f6f8fa;         /* table hover, render-mode hover, modal tool-input */
-  --bg-faint: #fcfcfc;          /* chat-scroll, response, events, raw-markdown */
+  --bg-faint: #fcfcfc;          /* raw-markdown container */
   --bg-hover: #eef0f3;          /* sidebar item hover, sidebar-new hover */
   --bg-mainchat-hover: #f0f3f6; /* sidebar-mainchat button hover */
   --bg-accent: #e3edf9;         /* sidebar mainchat/list/new active */
@@ -200,25 +200,30 @@ body {
 .main-wrap > main {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  /* main itself does NOT scroll; it's a flex column whose chat-area child
+   * takes flex:1 and scrolls internally (messenger layout). */
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  /* Horizontal padding grows on wide screens to keep the 960px column
-   * visually centered while letting main itself fill the available width —
-   * so the scrollbar lands on the viewport's right edge, not inside. */
   padding-block: 1rem;
+  box-sizing: border-box;
+}
+/* The 960px-column centering lives on chat-area + send-anchor (NOT main),
+ * so the scrollbar on chat-area lands at main's right edge = viewport's
+ * right edge, not inside a centered box. */
+.chat-area {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
   padding-inline: max(1.5rem, calc((100% - 960px) / 2));
   box-sizing: border-box;
 }
-/* Pinned send strip: `margin-top:auto` parks it at the bottom when content
- * is short; `position:sticky; bottom:0` keeps it glued there when scrolling. */
 .send-anchor {
-  margin-top: auto;
-  position: sticky;
-  bottom: 0;
   background: var(--bg-canvas);
   padding-top: 0.5rem;
-  z-index: 5;
+  padding-inline: max(1.5rem, calc((100% - 960px) / 2));
+  flex-shrink: 0;
+  box-sizing: border-box;
 }
 .mobile-toggle {
   display: none;
@@ -290,21 +295,6 @@ td.cwd { font-size: 0.82rem; }
 }
 .session-cwd { margin-right: 0.5rem; }
 
-section h3 { font-size: 0.9rem; color: var(--text-faint); margin: 1rem 0 0.5rem 0; font-weight: 500; }
-
-#response {
-  background: var(--bg-faint);
-  border: 1px solid var(--border-muted);
-  border-radius: 6px;
-  padding: 0.75rem;
-  min-height: 6rem;
-}
-#response:empty::before {
-  content: "(no response yet — type a prompt below)";
-  color: var(--text-empty-state);
-  font-style: italic;
-}
-
 /* Rendered markdown — used for transcripts, current-send response, and
    main-chat messages. marked emits the usual GFM HTML: <em>, <strong>,
    <code>, <a>, <pre><code>, <ul>/<ol>, <li>, <blockquote>, <h1..6>,
@@ -367,23 +357,6 @@ section h3 { font-size: 0.9rem; color: var(--text-faint); margin: 1rem 0 0.5rem 
 }
 .content th { background: var(--bg-subtle); font-weight: 600; }
 .content del { color: var(--text-faint); }
-
-#events {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 0.78rem;
-  max-height: 12rem;
-  overflow-y: auto;
-  background: var(--bg-faint);
-  border: 1px solid var(--border-muted);
-  border-radius: 6px;
-  padding: 0.5rem;
-}
-#events li { padding: 0.1rem 0; color: var(--text-muted); }
-#events li.error { color: var(--danger-text); }
-#events li.exit { color: var(--success); }
 
 .input-row { display: flex; gap: 0.5rem; align-items: stretch; margin-top: 0.5rem; }
 .input-row textarea {
@@ -465,16 +438,6 @@ pre.raw-markdown {
 .chat-focus a:hover { text-decoration: underline; }
 .chat-focus.empty { color: var(--text-empty-state); font-style: italic; }
 
-.chat-scroll {
-  background: var(--bg-faint);
-  border: 1px solid var(--border-muted);
-  border-radius: 6px;
-  padding: 0.5rem;
-  max-height: 65vh;
-  min-height: 12rem;
-  overflow-y: auto;
-  margin-bottom: 0.5rem;
-}
 .chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed var(--border-muted); }
 .chat-message:last-child { border-bottom: 0; }
 .chat-message .role {

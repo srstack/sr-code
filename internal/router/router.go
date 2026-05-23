@@ -114,8 +114,42 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 		return
 	}
 	for ev := range ch {
+		if ev.Type == "subprocess.exit" {
+			ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw)
+		}
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
 	}
+}
+
+// enrichExitWithTurnTimestamps reads the last two user/assistant turns from
+// the session jsonl and injects their timestamps into the exit event so
+// the web UI can replace its optimistically-stamped chat messages with the
+// canonical server timestamps. Best-effort: any read failure leaves the
+// payload untouched.
+func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMessage) json.RawMessage {
+	path, ok := r.discovery.Path(sessionID)
+	if !ok {
+		return raw
+	}
+	turns, err := jsonl.ReadTurns(path, 2)
+	if err != nil || len(turns) == 0 {
+		return raw
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {
+		payload = map[string]any{}
+	}
+	if len(turns) >= 2 && turns[len(turns)-2].Role == "user" {
+		payload["user_ts"] = turns[len(turns)-2].Time
+	}
+	if turns[len(turns)-1].Role == "assistant" {
+		payload["assistant_ts"] = turns[len(turns)-1].Time
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return raw
+	}
+	return b
 }
 
 func (r *Router) releaseSend(sessionID string, tok *sendToken) {

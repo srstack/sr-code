@@ -375,18 +375,7 @@ async function showDetail(id) {
     ` <span class="session-id">${esc(sess.id.slice(0, 8))}</span>`;
 
   root.innerHTML = `
-    <section>
-      <h3>transcript</h3>
-      <div id="transcript" class="chat-scroll"><div class="muted" style="padding:0.5rem">loading…</div></div>
-    </section>
-    <section>
-      <h3>response (current send)</h3>
-      <div id="response" class="content"></div>
-    </section>
-    <section>
-      <h3>events</h3>
-      <ul id="events"></ul>
-    </section>
+    <div id="chat-scroll" class="chat-area"><div class="muted" style="padding:0.5rem">loading…</div></div>
     <section class="send-anchor">
       <div class="input-row">
         <textarea id="prompt" placeholder="message…"></textarea>
@@ -405,8 +394,7 @@ async function showDetail(id) {
 
   await loadTranscript(id);
 
-  const responseEl = document.getElementById('response');
-  const eventsEl = document.getElementById('events');
+  const chatEl = document.getElementById('chat-scroll');
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cancelBtn = document.getElementById('cancel');
@@ -427,7 +415,7 @@ async function showDetail(id) {
         autoBtn.textContent = 'auto-approve: ' + (next ? 'on' : 'off');
         loadSidebar(); // refresh sidebar marker immediately
       } catch (e) {
-        addEvent(eventsEl, 'error', 'auto-approve toggle failed: ' + String(e));
+        appendChatMessage({ role: 'error', content: 'auto-approve toggle failed: ' + String(e), ts: new Date().toISOString() });
       } finally {
         autoBtn.disabled = false;
       }
@@ -439,19 +427,25 @@ async function showDetail(id) {
     try {
       await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', { method: 'DELETE' });
     } catch (e) {
-      addEvent(eventsEl, 'error', 'cancel failed: ' + String(e));
+      appendChatMessage({ role: 'error', content: 'cancel failed: ' + String(e), ts: new Date().toISOString() });
     } finally {
       cancelBtn.disabled = false;
     }
   });
 
-  openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn);
+  // Shared state between submit and the SSE handlers: lets the exit event
+  // canonicalize the optimistic user node's timestamp from server-side ts.
+  const turnState = { userNode: null };
+  openEventStream(id, chatEl, sendBtn, cancelBtn, turnState);
 
   const submit = async () => {
     const text = promptEl.value;
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
-    sendBtn.textContent = 'sending…';
+    promptEl.value = '';
+    // Optimistic: show user message immediately. Assistant placeholder is
+    // created by openEventStream on subprocess.started.
+    turnState.userNode = appendChatMessage({ role: 'user', content: text });
     try {
       const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
@@ -460,17 +454,14 @@ async function showDetail(id) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        addEvent(eventsEl, 'error', 'send failed: ' + (err.error || ('HTTP ' + res.status)));
+        appendChatMessage({ role: 'error', content: 'send failed: ' + (err.error || ('HTTP ' + res.status)), ts: new Date().toISOString() });
         sendBtn.disabled = false;
-        sendBtn.textContent = 'send';
         return;
       }
-      promptEl.value = '';
-      // button stays disabled until subprocess.exit
+      // button stays disabled until subprocess.exit handler re-enables
     } catch (e) {
-      addEvent(eventsEl, 'error', String(e));
+      appendChatMessage({ role: 'error', content: String(e), ts: new Date().toISOString() });
       sendBtn.disabled = false;
-      sendBtn.textContent = 'send';
     }
   };
 
@@ -484,15 +475,22 @@ async function showDetail(id) {
   promptEl.focus();
 }
 
-function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
+// openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
+// in-flight assistant turn renders inline at the bottom of the transcript:
+// subprocess.started appends a placeholder chat-message; stream_event text
+// deltas accumulate into it; subprocess.exit either finalizes it (success)
+// or converts it to an error message (non-zero exit). Diagnostic events
+// (subprocess.started/started details, system init/status, success result)
+// are intentionally dropped — only errors surface to the user.
+function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
 
-  let accum = ''; // raw markdown text accumulated from text_delta events
+  let placeholder = null;
+  let accum = '';
 
   const onIdle = () => {
     sendBtn.disabled = false;
-    sendBtn.textContent = 'send';
     if (cancelBtn) cancelBtn.hidden = true;
   };
   const onRunning = () => {
@@ -500,47 +498,78 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
     if (cancelBtn) cancelBtn.hidden = false;
   };
 
+  const setRoleText = (el, text) => {
+    const roleEl = el && el.querySelector('.role');
+    if (roleEl && roleEl.firstChild) roleEl.firstChild.textContent = text;
+  };
+  const setContent = (el, raw) => {
+    const contentEl = el && el.querySelector('.content');
+    if (!contentEl) return;
+    contentEl.dataset.raw = raw;
+    contentEl.innerHTML = renderMarkdown(raw);
+  };
+
   const handlers = {
-    'subprocess.started': (d) => {
+    'subprocess.started': () => {
       accum = '';
-      responseEl.innerHTML = '';
-      delete responseEl.dataset.raw;
-      addEvent(eventsEl, 'info', `subprocess started (pid ${d.pid})`);
+      placeholder = appendChatMessage({ role: 'assistant', content: '', _placeholder: true });
       onRunning();
-    },
-    'system': (d) => {
-      if (d.subtype === 'init') {
-        addEvent(eventsEl, 'info', `session init`);
-      } else if (d.subtype === 'status') {
-        addEvent(eventsEl, 'info', `status: ${d.status}`);
-      }
     },
     'stream_event': (d) => {
       const e = d.event;
+      if (!placeholder) return;
       if (e && e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
         accum += e.delta.text;
-        responseEl.dataset.raw = accum;
-        responseEl.innerHTML = renderMarkdown(accum);
+        setContent(placeholder, accum);
+        chatEl.scrollTop = chatEl.scrollHeight;
       }
     },
-    'assistant': () => {/* full message; we already streamed via deltas */},
-    'result': (d) => {
-      addEvent(eventsEl, d.is_error ? 'error' : 'info',
-        `result: ${d.is_error ? 'error' : 'success'}` +
-        (typeof d.duration_ms === 'number' ? ` · ${d.duration_ms} ms` : ''));
-    },
-    'rate_limit_event': () => {/* ignore */},
     'subprocess.exit': (d) => {
-      addEvent(eventsEl, d.exit_code === 0 ? 'exit' : 'error',
-        `subprocess exited (${d.exit_code})` + (d.error ? ` · ${d.error}` : ''));
+      // Canonicalize timestamps from server-persisted jsonl (set by
+      // router.enrichExitWithTurnTimestamps). Replaces the optimistic
+      // client-side "now" stamps we showed during the turn.
+      if (turnState && turnState.userNode) {
+        updateMessageTs(turnState.userNode, d.user_ts);
+        turnState.userNode = null;
+      }
+      if (placeholder) {
+        // Server ts when available; fall back to client time for crashed
+        // runs where jsonl may not have a final assistant turn.
+        updateMessageTs(placeholder, d.assistant_ts || new Date().toISOString());
+        if (d.exit_code !== 0) {
+          placeholder.className = 'chat-message error';
+          setRoleText(placeholder, 'error');
+          const msg = `subprocess exited (${d.exit_code})` + (d.error ? `: ${d.error}` : '');
+          setContent(placeholder, (accum ? accum + '\n\n' : '') + msg);
+        } else {
+          placeholder.classList.remove('placeholder');
+        }
+        placeholder = null;
+      }
       onIdle();
-      // Refresh transcript so the just-finished turn appears in history.
-      loadTranscript(id);
+    },
+    'result': (d) => {
+      if (d.is_error) {
+        appendChatMessage({ role: 'error',
+          content: 'result: error' + (typeof d.duration_ms === 'number' ? ` · ${d.duration_ms} ms` : ''),
+          ts: new Date().toISOString() });
+      }
     },
     'error': (d) => {
-      addEvent(eventsEl, 'error', d.message || JSON.stringify(d));
+      const msg = d.message || JSON.stringify(d);
+      if (placeholder) {
+        updateMessageTs(placeholder, new Date().toISOString());
+        placeholder.className = 'chat-message error';
+        setRoleText(placeholder, 'error');
+        setContent(placeholder, msg);
+        placeholder = null;
+      } else {
+        appendChatMessage({ role: 'error', content: msg, ts: new Date().toISOString() });
+      }
       onIdle();
     },
+    // Dropped (diagnostic noise): 'system' init/status, 'assistant' (we
+    // already stream deltas), 'rate_limit_event'.
   };
 
   Object.entries(handlers).forEach(([name, fn]) => {
@@ -551,17 +580,7 @@ function openEventStream(id, responseEl, eventsEl, sendBtn, cancelBtn) {
     });
   });
 
-  es.onerror = () => {
-    addEvent(eventsEl, 'error', 'event stream disconnected');
-  };
-}
-
-function addEvent(eventsEl, kind, text) {
-  const li = document.createElement('li');
-  li.className = kind;
-  li.textContent = `[${timeNow()}] ${text}`;
-  eventsEl.appendChild(li);
-  eventsEl.scrollTop = eventsEl.scrollHeight;
+  es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
 }
 
 // ---------- Main chat view ----------
@@ -573,7 +592,7 @@ async function showMainChat(id) {
 
   root.innerHTML = `
     <div id="chat-focus" class="chat-focus muted"></div>
-    <div id="chat-scroll" class="chat-scroll"></div>
+    <div id="chat-scroll" class="chat-area"></div>
     <section class="send-anchor">
       <div class="input-row">
         <textarea id="prompt" placeholder="message… (try /help)"></textarea>
@@ -595,7 +614,7 @@ async function showMainChat(id) {
     promptEl.value = '';
     // Optimistic: show the user's message immediately and a "thinking" placeholder
     // since LLM agents may take 5–30s before any response comes back.
-    appendChatMessage({ role: 'user', content: text });
+    const userNode = appendChatMessage({ role: 'user', content: text });
     const placeholder = appendChatMessage({ role: 'agent', content: 'thinking…', _placeholder: true });
     try {
       const res = await fetch('/api/mainchats/' + encodeURIComponent(id) + '/send', {
@@ -606,18 +625,21 @@ async function showMainChat(id) {
       const data = await res.json();
       if (placeholder) placeholder.remove();
       if (!res.ok) {
-        appendChatMessage({ role: 'error', content: data.error || 'send failed' });
+        appendChatMessage({ role: 'error', content: data.error || 'send failed', ts: new Date().toISOString() });
       } else {
-        // Server returns the persisted user+agent pair. We already showed user
-        // optimistically, so only render the agent reply (and any extras) here.
-        const msgs = (data.messages || []).filter(m => m.role !== 'user');
-        for (const m of msgs) appendChatMessage(m);
+        // Server returns the persisted user+agent pair. Canonicalize the
+        // optimistic user node's ts from the server, then render the agent
+        // reply (which already carries its server ts via appendChatMessage).
+        const msgs = data.messages || [];
+        const serverUser = msgs.find(m => m.role === 'user');
+        if (serverUser && serverUser.ts) updateMessageTs(userNode, serverUser.ts);
+        for (const m of msgs.filter(m => m.role !== 'user')) appendChatMessage(m);
         // Focus may have shifted this turn — update the header.
         renderFocus(data.focus);
       }
     } catch (e) {
       if (placeholder) placeholder.remove();
-      appendChatMessage({ role: 'error', content: String(e) });
+      appendChatMessage({ role: 'error', content: String(e), ts: new Date().toISOString() });
     } finally {
       sendBtn.disabled = false;
       promptEl.focus();
@@ -639,23 +661,14 @@ async function loadTranscript(id) {
     const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=100');
     if (!res.ok) return;
     const turns = (await res.json()) || [];
-    const el = document.getElementById('transcript');
+    const el = document.getElementById('chat-scroll');
     if (!el) return;
     if (!turns.length) {
       el.innerHTML = '<div class="muted" style="padding:0.5rem">no past turns yet</div>';
       return;
     }
     el.innerHTML = '';
-    for (const t of turns) {
-      const div = document.createElement('div');
-      div.className = 'chat-message ' + (t.role || 'assistant');
-      const ts = t.ts ? new Date(t.ts).toLocaleString() : '';
-      div.innerHTML =
-        `<div class="role">${esc(t.role)}<span class="ts">${esc(ts)}</span></div>` +
-        `<div class="content" data-raw="${esc(t.content || '')}">${renderMarkdown(t.content || '')}</div>`;
-      el.appendChild(div);
-    }
-    el.scrollTop = el.scrollHeight;
+    for (const t of turns) appendChatMessage(t);
   } catch {/* ignore */}
 }
 
@@ -698,14 +711,35 @@ function appendChatMessage(m) {
   const list = document.getElementById('chat-scroll');
   if (!list) return null;
   const div = document.createElement('div');
-  div.className = 'chat-message ' + (m.role || 'agent') + (m._placeholder ? ' placeholder' : '');
   const role = m.role || 'agent';
+  div.className = 'chat-message ' + role + (m._placeholder ? ' placeholder' : '');
+  // No client-side default: omitting ts shows no stamp. Callers that
+  // already have an authoritative time (server messages, client errors)
+  // pass it explicitly; the SSE/POST path later fills it in via
+  // updateMessageTs once the server confirms the persisted ts.
+  const ts = m.ts ? `<span class="ts">${esc(new Date(m.ts).toLocaleString())}</span>` : '';
   div.innerHTML =
-    `<div class="role">${esc(role)}</div>` +
+    `<div class="role">${esc(role)}${ts}</div>` +
     `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
   return div;
+}
+
+// updateMessageTs sets (or inserts) the timestamp span on an existing
+// chat-message node. Used to canonicalize optimistic messages once the
+// server returns the persisted ts.
+function updateMessageTs(node, ts) {
+  if (!node || !ts) return;
+  const roleEl = node.querySelector('.role');
+  if (!roleEl) return;
+  let span = roleEl.querySelector('.ts');
+  if (!span) {
+    span = document.createElement('span');
+    span.className = 'ts';
+    roleEl.appendChild(span);
+  }
+  span.textContent = new Date(ts).toLocaleString();
 }
 
 // ---------- Permission-request modal (global, runs in all views) ----------
