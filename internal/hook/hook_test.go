@@ -3,6 +3,7 @@ package hook
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -10,7 +11,7 @@ import (
 )
 
 func TestManager_SubmitAndRespond(t *testing.T) {
-	m := New()
+	m := New("")
 
 	var (
 		gotResp Response
@@ -47,7 +48,7 @@ func TestManager_SubmitAndRespond(t *testing.T) {
 }
 
 func TestManager_ContextCancelReleases(t *testing.T) {
-	m := New()
+	m := New("")
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
@@ -70,14 +71,14 @@ func TestManager_ContextCancelReleases(t *testing.T) {
 }
 
 func TestManager_RespondUnknown(t *testing.T) {
-	m := New()
+	m := New("")
 	if err := m.Respond("nope", Response{Behavior: "allow"}); err == nil {
 		t.Error("expected error")
 	}
 }
 
 func TestManager_RespondTwice(t *testing.T) {
-	m := New()
+	m := New("")
 	go func() { _, _ = m.Submit(context.Background(), Event{SessionID: "s"}) }()
 	id := waitForPending(t, m)
 	if err := m.Respond(id, Response{Behavior: "allow"}); err != nil {
@@ -92,7 +93,7 @@ func TestManager_RespondTwice(t *testing.T) {
 }
 
 func TestManager_RememberRule_Bash(t *testing.T) {
-	m := New()
+	m := New("")
 
 	// First call: user allows with session scope.
 	done := make(chan Response, 1)
@@ -140,7 +141,7 @@ func TestManager_RememberRule_Bash(t *testing.T) {
 }
 
 func TestManager_RememberRule_NonBash(t *testing.T) {
-	m := New()
+	m := New("")
 	done := make(chan struct{})
 	go func() {
 		_, _ = m.Submit(context.Background(), Event{
@@ -172,7 +173,7 @@ func TestManager_RememberRule_NonBash(t *testing.T) {
 }
 
 func TestManager_RememberRule_DoesNotLeakAcrossSessions(t *testing.T) {
-	m := New()
+	m := New("")
 	done := make(chan struct{})
 	go func() {
 		_, _ = m.Submit(context.Background(), Event{
@@ -200,7 +201,7 @@ func TestManager_RememberRule_DoesNotLeakAcrossSessions(t *testing.T) {
 }
 
 func TestManager_OnceScopeIsNotRemembered(t *testing.T) {
-	m := New()
+	m := New("")
 	done := make(chan struct{})
 	go func() {
 		_, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Read"})
@@ -215,7 +216,7 @@ func TestManager_OnceScopeIsNotRemembered(t *testing.T) {
 }
 
 func TestManager_ForgetSessionRules(t *testing.T) {
-	m := New()
+	m := New("")
 	go func() { _, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Read"}) }()
 	id := waitForPending(t, m)
 	_ = m.Respond(id, Response{Behavior: "allow", Scope: "session"})
@@ -274,7 +275,7 @@ func TestMatchRule(t *testing.T) {
 }
 
 func TestManager_ConcurrentSubmits(t *testing.T) {
-	m := New()
+	m := New("")
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
@@ -296,6 +297,69 @@ func TestManager_ConcurrentSubmits(t *testing.T) {
 	wg.Wait()
 	if n := len(m.List()); n != 0 {
 		t.Errorf("leaked %d pending entries", n)
+	}
+}
+
+func TestQuickDecide(t *testing.T) {
+	m := New("")
+
+	// Empty manager: no decision yet, caller must block on UI.
+	if resp, ok := m.QuickDecide(Event{SessionID: "s", ToolName: "Read"}); ok {
+		t.Errorf("expected (zero,false) on empty manager; got (%+v,%v)", resp, ok)
+	}
+
+	// Auto-approve settles instantly.
+	m.SetAutoApprove("s", true)
+	resp, ok := m.QuickDecide(Event{SessionID: "s", ToolName: "Bash"})
+	if !ok || resp.Behavior != "allow" || resp.Reason != "auto-approve" {
+		t.Errorf("auto-approve QuickDecide = (%+v,%v); want allow/auto-approve/true", resp, ok)
+	}
+	m.SetAutoApprove("s", false)
+
+	// Remembered rule (deny) wins over absent auto-approve.
+	go func() { _, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"rm -rf /"}`)}) }()
+	id := waitForPending(t, m)
+	_ = m.Respond(id, Response{Behavior: "deny", Scope: "session"})
+	time.Sleep(20 * time.Millisecond)
+
+	resp, ok = m.QuickDecide(Event{SessionID: "s", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"rm -rf /tmp"}`)})
+	if !ok || resp.Behavior != "deny" {
+		t.Errorf("remembered-deny QuickDecide = (%+v,%v); want deny/true", resp, ok)
+	}
+
+	// Remembered rule beats auto-approve (specific opt-outs survive a
+	// later blanket trust toggle).
+	m.SetAutoApprove("s", true)
+	resp, ok = m.QuickDecide(Event{SessionID: "s", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"rm -rf /tmp"}`)})
+	if !ok || resp.Behavior != "deny" {
+		t.Errorf("rule-vs-auto-approve QuickDecide = (%+v,%v); want deny/true", resp, ok)
+	}
+}
+
+func TestAutoApprovePersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auto-approve.json")
+
+	// Set two sessions in the first manager.
+	m1 := New(path)
+	m1.SetAutoApprove("session-a", true)
+	m1.SetAutoApprove("session-b", true)
+	m1.SetAutoApprove("session-a", false) // remove a; only b should persist
+
+	// A fresh manager pointed at the same file should rehydrate state.
+	m2 := New(path)
+	if m2.IsAutoApprove("session-a") {
+		t.Errorf("session-a should NOT be auto-approve after rehydrate")
+	}
+	if !m2.IsAutoApprove("session-b") {
+		t.Errorf("session-b should remain auto-approve after rehydrate")
+	}
+
+	// Toggling on m2 must round-trip via disk.
+	m2.SetAutoApprove("session-c", true)
+	m3 := New(path)
+	if !m3.IsAutoApprove("session-c") {
+		t.Errorf("session-c should survive a second rehydrate")
 	}
 }
 

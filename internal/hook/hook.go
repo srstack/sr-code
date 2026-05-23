@@ -17,6 +17,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -69,8 +72,9 @@ type Event struct {
 }
 
 // Manager owns the in-memory map of pending interactions, the per-session
-// remembered-rule list, and the per-session auto-approve flag. All are
-// process-lifetime only — a server restart re-arms the consent boundary.
+// remembered-rule list, and the per-session auto-approve flag. Pending
+// and remembered are process-lifetime only; autoApprove is persisted to
+// disk (autoPath) when set, so the trust boundary survives restarts.
 type Manager struct {
 	mu      sync.Mutex
 	pending map[string]*pendingEntry
@@ -80,37 +84,102 @@ type Manager struct {
 
 	autoMu      sync.Mutex
 	autoApprove map[string]bool // sessionID → true when blanket-allow is on
+	autoPath    string          // empty = no disk persistence (tests)
 }
 
-func New() *Manager {
-	return &Manager{
+// New constructs a Manager. autoPath is the file backing the auto-approve
+// flag map; pass "" to disable persistence (e.g. in tests). If the file
+// exists at construction time, its state is loaded; subsequent calls to
+// SetAutoApprove rewrite it atomically.
+func New(autoPath string) *Manager {
+	m := &Manager{
 		pending:     map[string]*pendingEntry{},
 		remembered:  map[string][]Rule{},
 		autoApprove: map[string]bool{},
+		autoPath:    autoPath,
+	}
+	if autoPath != "" {
+		m.loadAutoApprove()
+	}
+	return m
+}
+
+// loadAutoApprove reads autoPath into m.autoApprove. Best-effort: a missing
+// file is normal on first run; a corrupt file is logged and treated as empty.
+func (m *Manager) loadAutoApprove() {
+	data, err := os.ReadFile(m.autoPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("auto-approve: read", "path", m.autoPath, "err", err)
+		}
+		return
+	}
+	var loaded map[string]bool
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		slog.Warn("auto-approve: decode", "path", m.autoPath, "err", err)
+		return
+	}
+	m.autoMu.Lock()
+	defer m.autoMu.Unlock()
+	for k, v := range loaded {
+		if v {
+			m.autoApprove[k] = true
+		}
 	}
 }
 
-// Submit registers a pending interaction and blocks until either the user
-// responds via Respond or ctx is cancelled. If a remembered rule already
-// matches the incoming event, it returns that decision immediately without
-// touching the UI. If the user's response carries Scope="session", the
-// derived rule is stored before returning.
-func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
+// persistAutoApprove writes the current map to autoPath via temp-file +
+// rename so a partial write can't corrupt the on-disk state. Caller must
+// hold m.autoMu. Best-effort: failures are logged but don't surface.
+func (m *Manager) persistAutoApprove() {
+	if m.autoPath == "" {
+		return
+	}
+	data, err := json.Marshal(m.autoApprove)
+	if err != nil {
+		slog.Warn("auto-approve: encode", "err", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(m.autoPath), 0o700); err != nil {
+		slog.Warn("auto-approve: mkdir", "err", err)
+		return
+	}
+	tmp := m.autoPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		slog.Warn("auto-approve: write tmp", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, m.autoPath); err != nil {
+		slog.Warn("auto-approve: rename", "err", err)
+	}
+}
+
+// QuickDecide settles ev from per-session state (remembered rule or
+// auto-approve) without UI; returns (zero, false) when input is needed.
+// Remembered rules win over auto-approve so explicit deny-always opt-outs
+// survive later blanket trust toggles.
+func (m *Manager) QuickDecide(ev Event) (Response, bool) {
 	if rule := m.findMatchingRule(ev); rule != nil {
 		return Response{
 			Behavior: rule.Behavior,
 			Reason:   "remembered: " + rule.Matcher,
-		}, nil
+		}, true
 	}
-	// Per-session auto-approve runs *after* matchers — a deliberate
-	// "deny always X" rule still wins over the blanket flag, which keeps
-	// users' specific opt-outs intact when they later toggle auto-approve
-	// on globally for the session.
 	if m.IsAutoApprove(ev.SessionID) {
 		return Response{
 			Behavior: "allow",
 			Reason:   "auto-approve",
-		}, nil
+		}, true
+	}
+	return Response{}, false
+}
+
+// Submit blocks until the user responds via Respond or ctx is cancelled.
+// Short-circuits via QuickDecide first. A Scope="session" response is
+// stored as a rule before returning.
+func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
+	if resp, ok := m.QuickDecide(ev); ok {
+		return resp, nil
 	}
 
 	p := &pendingEntry{
@@ -201,7 +270,7 @@ func (m *Manager) ForgetSessionRules(sessionID string) {
 }
 
 // SetAutoApprove flips the blanket "allow every tool call" flag for a
-// session. Process-lifetime only.
+// session and persists the change to disk so it survives restarts.
 func (m *Manager) SetAutoApprove(sessionID string, enabled bool) {
 	m.autoMu.Lock()
 	defer m.autoMu.Unlock()
@@ -210,6 +279,7 @@ func (m *Manager) SetAutoApprove(sessionID string, enabled bool) {
 	} else {
 		delete(m.autoApprove, sessionID)
 	}
+	m.persistAutoApprove()
 }
 
 // IsAutoApprove reports whether sessionID is currently in blanket-allow mode.

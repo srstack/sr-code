@@ -126,7 +126,7 @@ func serve(args []string) error {
 	}
 	b := broker.New()
 	sd := sender.New(*claudeCmd, *permissionMode, logger)
-	h := hook.New()
+	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	r := router.New(d, sd, b, h)
 
 	mainStore, err := mainchat.NewStore(filepath.Join(*dataDir, "mainchats"))
