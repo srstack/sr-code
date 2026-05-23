@@ -95,6 +95,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /logout", s.handleLogout)
 
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
 	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
@@ -340,6 +341,25 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		out[i] = sessionDTO{Session: sess, AutoApprove: s.router.IsAutoApprove(sess.ID)}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+type createSessionRequest struct {
+	Cwd            string `json:"cwd"`
+	InitialMessage string `json:"initial_message"`
+}
+
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req createSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	id, err := s.router.StartSession(req.Cwd, req.InitialMessage)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"id": id})
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {

@@ -50,7 +50,26 @@ body {
   color: #6b7280;
   font-weight: 500;
   padding: 0 0.5rem 0.3rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
 }
+.sidebar-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  line-height: 1;
+  border-radius: 4px;
+  color: #6b7280;
+  text-decoration: none;
+  font-size: 1rem;
+  font-weight: 400;
+}
+.sidebar-new:hover { background: #eef0f3; color: #1f2328; }
+.sidebar-new.active { background: #e3edf9; color: #1f6feb; }
 .sidebar-list {
   list-style: none;
   padding: 0;
@@ -98,6 +117,7 @@ body {
   min-width: 0;
   display: flex;
   flex-direction: column;
+  height: 100vh;
 }
 .main-wrap > header {
   display: flex;
@@ -119,11 +139,26 @@ body {
 }
 .main-wrap > main {
   flex: 1;
-  padding: 1rem 1.5rem;
-  max-width: 960px;
-  width: 100%;
-  margin: 0 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  /* Horizontal padding grows on wide screens to keep the 960px column
+   * visually centered while letting main itself fill the available width —
+   * so the scrollbar lands on the viewport's right edge, not inside. */
+  padding-block: 1rem;
+  padding-inline: max(1.5rem, calc((100% - 960px) / 2));
   box-sizing: border-box;
+}
+/* Pinned send strip: `margin-top:auto` parks it at the bottom when content
+ * is short; `position:sticky; bottom:0` keeps it glued there when scrolling. */
+.send-anchor {
+  margin-top: auto;
+  position: sticky;
+  bottom: 0;
+  background: white;
+  padding-top: 0.5rem;
+  z-index: 5;
 }
 .mobile-toggle {
   display: none;
@@ -299,8 +334,6 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   border-color: #b1b6bd;
   cursor: not-allowed;
 }
-.kbd-hint { color: #6b7280; font-size: 0.78rem; margin-top: 0.25rem; }
-
 .render-mode {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.72rem;
@@ -487,3 +520,25 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   color: #cf222e;
 }
 .interaction button:hover { filter: brightness(0.95); }
+
+.new-cwd-field {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.new-cwd-field > span {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.new-cwd-field input {
+  width: 18rem;
+  max-width: 100%;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: white;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.new-cwd-field input:focus { outline: none; border-color: #1f6feb; }

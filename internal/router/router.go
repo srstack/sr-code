@@ -262,22 +262,62 @@ func extractErrorMessage(raw json.RawMessage) string {
 	return e.Message
 }
 
+// StartSession spawns a brand-new Claude Code session in cwd and returns
+// immediately with the generated session id. Stream events flow to broker
+// subscribers — callers that want the first response inline should use
+// CreateSession instead. Registered in activeSend so CancelSend works.
+func (r *Router) StartSession(cwd, initialMsg string) (string, error) {
+	if err := validateCreateInputs(cwd, initialMsg); err != nil {
+		return "", err
+	}
+	sessionID := newUUIDv4()
+	ctx, cancel := context.WithCancel(context.Background())
+	tok := &sendToken{cancel: cancel}
+
+	r.sendMu.Lock()
+	r.activeSend[sessionID] = tok
+	r.sendMu.Unlock()
+
+	go r.runStart(ctx, sessionID, initialMsg, cwd, tok)
+	return sessionID, nil
+}
+
+func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
+	defer r.releaseSend(sessionID, tok)
+	ch, err := r.sender.SendNew(ctx, sessionID, prompt, cwd)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
+		return
+	}
+	for ev := range ch {
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
+	}
+}
+
+func validateCreateInputs(cwd, initialMsg string) error {
+	if cwd == "" {
+		return errors.New("cwd is required")
+	}
+	if info, err := os.Stat(cwd); err != nil {
+		return fmt.Errorf("cwd %q: %w", cwd, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("cwd %q is not a directory", cwd)
+	}
+	if initialMsg == "" {
+		return errors.New("initial_message is required")
+	}
+	return nil
+}
+
 // CreateSession spawns a brand-new Claude Code session in cwd and waits for
 // the assistant's first response (subject to timeout). Returns the
 // generated session id and the accumulated assistant text. The session
 // will appear in discovery via fsnotify shortly after the subprocess
 // starts writing its jsonl.
 func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, timeout time.Duration) (string, string, error) {
-	if cwd == "" {
-		return "", "", errors.New("cwd is required")
-	}
-	if info, err := os.Stat(cwd); err != nil {
-		return "", "", fmt.Errorf("cwd %q: %w", cwd, err)
-	} else if !info.IsDir() {
-		return "", "", fmt.Errorf("cwd %q is not a directory", cwd)
-	}
-	if initialMsg == "" {
-		return "", "", errors.New("initial_message is required")
+	if err := validateCreateInputs(cwd, initialMsg); err != nil {
+		return "", "", err
 	}
 
 	sessionID := newUUIDv4()

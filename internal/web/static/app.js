@@ -136,6 +136,8 @@ function route() {
   const hash = location.hash || '#/';
   if (hash === '#/' || hash === '') {
     showList();
+  } else if (hash === '#/new') {
+    showNewSession();
   } else if (hash === '#/chat' || hash.startsWith('#/chat/')) {
     const id = hash === '#/chat' ? 'default' : decodeURIComponent(hash.slice('#/chat/'.length));
     showMainChat(id);
@@ -206,6 +208,9 @@ function updateSidebarActive() {
   document.querySelectorAll('.sidebar-mainchat').forEach(a => {
     a.classList.toggle('active', inMainChat);
   });
+  document.querySelectorAll('.sidebar-new').forEach(a => {
+    a.classList.toggle('active', hash === '#/new');
+  });
   let sessionKey = '';
   if (hash.startsWith('#/s/')) {
     sessionKey = 's:' + decodeURIComponent(hash.slice(4));
@@ -222,6 +227,94 @@ const sidebarEl = document.getElementById('sidebar');
 if (mobileToggle && sidebarEl) {
   mobileToggle.addEventListener('click', () => sidebarEl.classList.toggle('open'));
   window.addEventListener('hashchange', () => sidebarEl.classList.remove('open'));
+}
+
+// ---------- New session view ----------
+//
+// Mirrors the regular session detail layout so the page transition after
+// creation is purely additive (empty placeholders fill in). The only
+// pre-creation difference is the auto-approve toggle position — replaced
+// with a cwd picker, since auto-approve can't be set without a session id.
+// Submitting POSTs to /api/sessions (router.StartSession returns the new
+// id immediately and streams to broker subscribers), then hash-routes to
+// the freshly-created session's detail page.
+
+async function showNewSession() {
+  clearListInterval();
+  closeES();
+  subtitle.textContent = 'new session';
+
+  let cwds = [];
+  try {
+    const res = await fetch('/api/sessions');
+    if (res.ok) {
+      const data = (await res.json()) || [];
+      cwds = [...new Set(data.map(s => s.cwd).filter(Boolean))].sort();
+    }
+  } catch {/* offline → datalist just empty */}
+
+  const options = cwds.map(c => `<option value="${esc(c)}"></option>`).join('');
+  root.innerHTML = `
+    <section class="send-anchor">
+      <div class="input-row">
+        <textarea id="prompt" placeholder="message…"></textarea>
+        <button id="send">send</button>
+      </div>
+      <div class="send-controls">
+        <label class="new-cwd-field">
+          <span class="muted">cwd</span>
+          <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
+                 placeholder="/absolute/path/to/project">
+          <datalist id="new-cwd-list">${options}</datalist>
+        </label>
+      </div>
+      <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
+    </section>
+  `;
+
+  const promptEl = document.getElementById('prompt');
+  const sendBtn = document.getElementById('send');
+  const cwdEl = document.getElementById('new-cwd');
+  const errEl = document.getElementById('new-session-err');
+  cwdEl.focus();
+
+  const submit = async () => {
+    if (sendBtn.disabled) return; // re-entrancy guard during in-flight submit
+    errEl.style.display = 'none';
+    errEl.textContent = '';
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'creating…';
+    try {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          cwd: cwdEl.value.trim(),
+          initial_message: promptEl.value,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
+      // Refresh sidebar so the new session shows up while its first stream
+      // is still in flight; fsnotify normally surfaces it within ~1s but a
+      // proactive reload avoids the awkward "where did it go?" gap.
+      loadSidebar();
+      location.hash = '#/s/' + encodeURIComponent(body.id);
+    } catch (ex) {
+      errEl.textContent = String(ex.message || ex);
+      errEl.style.display = '';
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'send';
+    }
+  };
+
+  sendBtn.addEventListener('click', submit);
+  promptEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      submit();
+    }
+  });
 }
 
 // ---------- List view ----------
@@ -312,8 +405,7 @@ async function showDetail(id) {
       <h3>events</h3>
       <ul id="events"></ul>
     </section>
-    <section>
-      <h3>send</h3>
+    <section class="send-anchor">
       <div class="input-row">
         <textarea id="prompt" placeholder="message…"></textarea>
         <button id="send">send</button>
@@ -325,7 +417,6 @@ async function showDetail(id) {
           title="when on, every PreToolUse hook for this session is allowed without prompting">
           auto-approve: ${sess.auto_approve ? 'on' : 'off'}
         </button>
-        <span class="kbd-hint">Ctrl/Cmd + Enter to send</span>
       </div>
     </section>
   `;
@@ -403,7 +494,7 @@ async function showDetail(id) {
 
   sendBtn.addEventListener('click', submit);
   promptEl.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submit();
     }
@@ -501,12 +592,11 @@ async function showMainChat(id) {
   root.innerHTML = `
     <div id="chat-focus" class="chat-focus muted"></div>
     <div id="chat-scroll" class="chat-scroll"></div>
-    <section>
+    <section class="send-anchor">
       <div class="input-row">
         <textarea id="prompt" placeholder="message… (try /help)"></textarea>
         <button id="send">send</button>
       </div>
-      <div class="kbd-hint">Ctrl/Cmd + Enter to send · /help for commands</div>
     </section>
   `;
 
@@ -554,7 +644,7 @@ async function showMainChat(id) {
 
   sendBtn.addEventListener('click', submit);
   promptEl.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submit();
     }
