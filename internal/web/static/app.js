@@ -32,21 +32,22 @@ function esc(s) {
 }
 
 // renderMarkdown turns assistant/user content into safe HTML using the
-// vendored snarkdown. Two things keep this safe:
+// vendored marked (GFM: tables, task lists, nested lists, strikethrough,
+// autolinks). marked deliberately ships without HTML sanitization, so two
+// of our own layers keep things safe:
 //
-//   1. snarkdown does NOT escape ordinary text — any raw `<script>` in the
-//      input would otherwise pass through. We HTML-escape the input first,
-//      then re-allow `>` so blockquote `> ` still parses (a stray `>` can't
-//      form an opening tag because `<` stays escaped).
+//   1. We HTML-escape the input before parsing, then re-allow `>` so
+//      blockquotes still work. A stray `>` can't form an opening tag
+//      because `<` stays escaped, so any raw `<script>` in user content
+//      lands as literal text.
 //
-//   2. snarkdown happily emits `<a href="javascript:…">` from user-supplied
-//      markdown. We strip risky URL schemes from any anchor / image tag
-//      it emits before handing the HTML to the DOM.
+//   2. We strip risky URL schemes (javascript:/data:/vbscript:) from any
+//      <a>/<img> in marked's output before handing it to the DOM.
 //
-// Newlines follow Markdown convention: single \n = space, double \n+ =
-// soft line break. We tried preprocessing single \n → soft break for chat
-// ergonomics and it silently corrupted fenced code blocks and lists, so
-// we left it alone. Users who want a break in chat hit Enter twice.
+// Newlines follow CommonMark: single \n = space, blank line = paragraph
+// break. Users who want a visible break hit Enter twice.
+window.marked.setOptions({ gfm: true, breaks: false, silent: true });
+
 function renderMarkdown(md) {
   if (renderMode === 'raw') {
     return '<pre class="raw-markdown">' + esc(md || '') + '</pre>';
@@ -56,9 +57,7 @@ function renderMarkdown(md) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
   s = s.replace(/&gt;/g, '>');
-  s = wrapTablesAsCodeFence(s);
-  let html = window.snarkdown(s);
-  // Block javascript:/data:/vbscript: in href / src of snarkdown output.
+  let html = window.marked.parse(s);
   html = html.replace(
     /(<(?:a|img)\b[^>]*?\b(?:href|src)=")\s*(?:javascript|data|vbscript)\s*:[^"]*"/gi,
     '$1#unsafe"',
@@ -96,23 +95,6 @@ if (renderModeBtn) {
   updateRenderModeBtn();
 }
 
-// snarkdown intentionally does not support markdown tables. We don't want a
-// full table parser either — a chat-aligned compromise is to wrap any block
-// of consecutive pipe-rows in a fenced code block so the columns survive in
-// monospace. This matches how Telegram / Slack already render tables and
-// keeps our IM-alignment story consistent.
-//
-// Existing fenced blocks are split out first so we never nest fences.
-function wrapTablesAsCodeFence(s) {
-  const parts = s.split(/(```[\s\S]*?```)/);
-  return parts.map((part, i) => {
-    if (i % 2 === 1) return part; // already a fence
-    return part.replace(
-      /(^|\n)((?:\|[^\n]*(?:\n|$))+)/g,
-      (_, lead, tbl) => lead + '\n```\n' + tbl.replace(/\n$/, '') + '\n```\n',
-    );
-  }).join('');
-}
 function fmt(iso) {
   if (!iso) return '';
   const d = new Date(iso);

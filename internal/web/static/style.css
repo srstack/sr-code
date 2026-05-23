@@ -246,8 +246,9 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 }
 
 /* Rendered markdown — used for transcripts, current-send response, and
-   main-chat messages. snarkdown emits <em>, <strong>, <code>, <a>,
-   <pre class="code">, <ul>/<ol>, <blockquote>, <h1..6>, <hr>, <img>. */
+   main-chat messages. marked emits the usual GFM HTML: <em>, <strong>,
+   <code>, <a>, <pre><code>, <ul>/<ol>, <li>, <blockquote>, <h1..6>,
+   <hr>, <img>, <table>/<thead>/<tbody>/<tr>/<th>/<td>, <del>. */
 .content { font-size: 0.92rem; line-height: 1.45; }
 .content > *:first-child { margin-top: 0; }
 .content > *:last-child  { margin-bottom: 0; }
@@ -258,7 +259,7 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   font-size: 0.85em;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
-.content pre.code {
+.content pre {
   background: #1f2328;
   color: #e6edf3;
   padding: 0.6rem 0.75rem;
@@ -269,7 +270,7 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   font-size: 0.85rem;
   line-height: 1.4;
 }
-.content pre.code code {
+.content pre code {
   background: transparent;
   color: inherit;
   padding: 0;
@@ -291,6 +292,21 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 }
 .content hr { border: 0; border-top: 1px solid #e0e3e8; margin: 0.6rem 0; }
 .content img { max-width: 100%; height: auto; }
+.content table {
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  font-size: 0.88rem;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.content th, .content td {
+  border: 1px solid #d0d7de;
+  padding: 0.3rem 0.6rem;
+  text-align: left;
+}
+.content th { background: #f6f8fa; font-weight: 600; }
+.content del { color: #6b7280; }
 
 #events {
   list-style: none;
