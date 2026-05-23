@@ -1,8 +1,68 @@
+/* Color palette. Light defaults under :root; dark overrides in the
+ * prefers-color-scheme media query at the bottom of this file. The names
+ * describe the role, not the value, so dark mode can re-tone freely. */
+:root {
+  /* Tells the browser to use dark form controls / scrollbars when the
+   * media query below activates. */
+  color-scheme: light dark;
+
+  /* Surfaces. Inverted layering: --bg is the main canvas (slightly subdued),
+   * --bg-chrome is the "lifted chrome" (sidebar, header, modal, inputs).
+   * The page never has a pure-white expanse — content sits on canvas. */
+  --bg-canvas: #fafafa;
+  --bg-chrome: #ffffff;       /* sidebar, header, modal, inputs */
+  --bg-subtle: #f6f8fa;         /* table hover, render-mode hover, modal tool-input */
+  --bg-faint: #fcfcfc;          /* chat-scroll, response, events, raw-markdown */
+  --bg-hover: #eef0f3;          /* sidebar item hover, sidebar-new hover */
+  --bg-mainchat-hover: #f0f3f6; /* sidebar-mainchat button hover */
+  --bg-accent: #e3edf9;         /* sidebar mainchat/list/new active */
+
+  /* Text — three muted levels, plus a faint empty-state shade */
+  --text: #1f2328;
+  --text-muted: #4b5563;        /* secondary copy, toggle labels */
+  --text-faint: #6b7280;        /* headings, hints, muted */
+  --text-disabled: #9ca3af;     /* placeholders, empty-state listings */
+  --text-empty-state: #b1b6bd;  /* "(no response yet)" italic */
+
+  /* Borders */
+  --border: #d0d7de;            /* default visible border */
+  --border-muted: #eee;         /* subtle separators */
+  --border-strong: #b1b6bd;     /* disabled button surface */
+  --border-hr: #e0e3e8;
+
+  /* Accent (blue) */
+  --accent: #1f6feb;
+  --accent-bg: #e3edf9;
+  --accent-border: #9ec5fe;
+
+  /* Agent purple */
+  --purple: #6e40c9;
+
+  /* Code */
+  --inline-code-bg: #e4e7eb;
+  --code-block-bg: #1f2328;
+  --code-block-text: #e6edf3;
+
+  /* Semantic */
+  --danger: #cf222e;
+  --danger-text: #b42318;
+  --warning-bg: #fff8e1;
+  --warning-border: #b08800;
+  --warning-text: #8a6700;
+  --success: #1a7f37;
+
+  /* Overlays / shadows */
+  --shadow-sidebar: rgba(0, 0, 0, 0.15);
+  --shadow-modal: rgba(0, 0, 0, 0.25);
+  --modal-overlay: rgba(15, 23, 42, 0.45);
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   margin: 0;
   padding: 0;
-  color: #1f2328;
+  background: var(--bg-canvas);
+  color: var(--text);
   display: flex;
   min-height: 100vh;
 }
@@ -12,8 +72,8 @@ body {
 #sidebar {
   width: 240px;
   flex-shrink: 0;
-  border-right: 1px solid #eee;
-  background: #fafafa;
+  border-right: 1px solid var(--border-muted);
+  background: var(--bg-chrome);
   padding: 1rem 0.75rem;
   overflow-y: auto;
   height: 100vh;
@@ -32,22 +92,22 @@ body {
 .sidebar-mainchat {
   display: block;
   padding: 0.45rem 0.6rem;
-  border: 1px solid #d0d7de;
-  background: white;
+  border: 1px solid var(--border);
+  background: var(--bg-canvas);
   border-radius: 6px;
   font-size: 0.85rem;
   margin-bottom: 1rem;
-  color: #1f6feb;
+  color: var(--accent);
   text-decoration: none;
 }
-.sidebar-mainchat:hover { background: #f0f3f6; }
-.sidebar-mainchat.active { background: #e3edf9; border-color: #9ec5fe; font-weight: 500; }
+.sidebar-mainchat:hover { background: var(--bg-mainchat-hover); }
+.sidebar-mainchat.active { background: var(--bg-accent); border-color: var(--accent-border); font-weight: 500; }
 .sidebar-section { margin-bottom: 1rem; }
 .sidebar-heading {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: #6b7280;
+  color: var(--text-faint);
   font-weight: 500;
   padding: 0 0.5rem 0.3rem;
   display: flex;
@@ -63,13 +123,13 @@ body {
   height: 1.1rem;
   line-height: 1;
   border-radius: 4px;
-  color: #6b7280;
+  color: var(--text-faint);
   text-decoration: none;
   font-size: 1rem;
   font-weight: 400;
 }
-.sidebar-new:hover { background: #eef0f3; color: #1f2328; }
-.sidebar-new.active { background: #e3edf9; color: #1f6feb; }
+.sidebar-new:hover { background: var(--bg-hover); color: var(--text); }
+.sidebar-new.active { background: var(--bg-accent); color: var(--accent); }
 .sidebar-list {
   list-style: none;
   padding: 0;
@@ -79,23 +139,23 @@ body {
   display: block;
   padding: 0.32rem 0.5rem;
   border-radius: 4px;
-  color: #1f2328;
+  color: var(--text);
   text-decoration: none;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 0.85rem;
 }
-.sidebar-list li a:hover { background: #eef0f3; }
-.sidebar-list li a.active { background: #e3edf9; color: #1f6feb; font-weight: 500; }
+.sidebar-list li a:hover { background: var(--bg-hover); }
+.sidebar-list li a.active { background: var(--bg-accent); color: var(--accent); font-weight: 500; }
 .sidebar-list li a .running-dot {
   margin-right: 0.25rem;
-  color: #1a7f37;
+  color: var(--success);
   font-size: 0.7rem;
 }
 .sidebar-empty {
   padding: 0.4rem 0.5rem;
-  color: #9ca3af;
+  color: var(--text-disabled);
   font-size: 0.8rem;
   font-style: italic;
 }
@@ -103,7 +163,7 @@ body {
 .cwd-label {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.7rem;
-  color: #9ca3af;
+  color: var(--text-disabled);
   padding: 0.3rem 0.5rem 0.1rem;
   white-space: nowrap;
   overflow: hidden;
@@ -124,8 +184,8 @@ body {
   align-items: center;
   gap: 0.75rem;
   padding: 0.6rem 1.25rem;
-  border-bottom: 1px solid #eee;
-  background: white;
+  border-bottom: 1px solid var(--border-muted);
+  background: var(--bg-chrome);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -156,19 +216,19 @@ body {
   margin-top: auto;
   position: sticky;
   bottom: 0;
-  background: white;
+  background: var(--bg-canvas);
   padding-top: 0.5rem;
   z-index: 5;
 }
 .mobile-toggle {
   display: none;
   background: none;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.25rem 0.55rem;
   cursor: pointer;
   font-size: 0.95rem;
-  color: #4b5563;
+  color: var(--text-muted);
 }
 
 @media (max-width: 720px) {
@@ -182,37 +242,37 @@ body {
     transform: translateX(-100%);
     transition: transform 0.2s ease;
     z-index: 100;
-    box-shadow: 2px 0 8px rgba(0,0,0,0.15);
+    box-shadow: 2px 0 8px var(--shadow-sidebar);
   }
   #sidebar.open { transform: translateX(0); }
   .main-wrap { width: 100%; }
   .mobile-toggle { display: inline-flex; align-items: center; }
 }
-.muted { color: #6b7280; font-size: 0.85rem; }
-.empty { color: #6b7280; padding: 3rem 0; text-align: center; }
-.err { color: #b42318; padding: 1rem 0; }
+.muted { color: var(--text-faint); font-size: 0.85rem; }
+.empty { color: var(--text-faint); padding: 3rem 0; text-align: center; }
+.err { color: var(--danger-text); padding: 1rem 0; }
 
 table { width: 100%; border-collapse: collapse; }
 th, td {
   padding: 0.55rem 0.5rem;
   text-align: left;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border-muted);
   font-size: 0.9rem;
   vertical-align: top;
 }
-th { color: #6b7280; font-weight: 500; background: #fafafa; }
+th { color: var(--text-faint); font-weight: 500; background: var(--bg-chrome); }
 tbody tr { cursor: pointer; }
-tbody tr:hover { background: #f6f8fa; }
+tbody tr:hover { background: var(--bg-subtle); }
 td.title { font-weight: 500; }
 td.id, td.cwd {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.78rem;
 }
-td.id { color: #9ca3af; }
+td.id { color: var(--text-disabled); }
 td.cwd { font-size: 0.82rem; }
 
 .session-title {
-  color: #1f2328;
+  color: var(--text);
   font-weight: 600;
   font-size: 0.95rem;
   margin-right: 0.5rem;
@@ -225,23 +285,23 @@ td.cwd { font-size: 0.82rem; }
 }
 .session-cwd, .session-id {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  color: #6b7280;
+  color: var(--text-faint);
   font-size: 0.78rem;
 }
 .session-cwd { margin-right: 0.5rem; }
 
-section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-weight: 500; }
+section h3 { font-size: 0.9rem; color: var(--text-faint); margin: 1rem 0 0.5rem 0; font-weight: 500; }
 
 #response {
-  background: #fcfcfc;
-  border: 1px solid #eee;
+  background: var(--bg-faint);
+  border: 1px solid var(--border-muted);
   border-radius: 6px;
   padding: 0.75rem;
   min-height: 6rem;
 }
 #response:empty::before {
   content: "(no response yet — type a prompt below)";
-  color: #b1b6bd;
+  color: var(--text-empty-state);
   font-style: italic;
 }
 
@@ -253,15 +313,15 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 .content > *:first-child { margin-top: 0; }
 .content > *:last-child  { margin-bottom: 0; }
 .content code {
-  background: #eef0f3;
+  background: var(--inline-code-bg);
   padding: 0.1rem 0.3rem;
   border-radius: 3px;
   font-size: 0.85em;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 .content pre {
-  background: #1f2328;
-  color: #e6edf3;
+  background: var(--code-block-bg);
+  color: var(--code-block-text);
   padding: 0.6rem 0.75rem;
   border-radius: 5px;
   overflow-x: auto;
@@ -278,7 +338,7 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 }
 .content ul, .content ol { margin: 0.4rem 0; padding-left: 1.4rem; }
 .content li { margin: 0.15rem 0; }
-.content a { color: #1f6feb; text-decoration: underline; }
+.content a { color: var(--accent); text-decoration: underline; }
 .content h1, .content h2, .content h3, .content h4, .content h5, .content h6 {
   margin: 0.6rem 0 0.3rem;
   font-weight: 600;
@@ -287,10 +347,10 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 .content blockquote {
   margin: 0.4rem 0;
   padding: 0.1rem 0.6rem;
-  border-left: 3px solid #d0d7de;
-  color: #4b5563;
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
 }
-.content hr { border: 0; border-top: 1px solid #e0e3e8; margin: 0.6rem 0; }
+.content hr { border: 0; border-top: 1px solid var(--border-hr); margin: 0.6rem 0; }
 .content img { max-width: 100%; height: auto; }
 .content table {
   border-collapse: collapse;
@@ -301,12 +361,12 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   max-width: 100%;
 }
 .content th, .content td {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   padding: 0.3rem 0.6rem;
   text-align: left;
 }
-.content th { background: #f6f8fa; font-weight: 600; }
-.content del { color: #6b7280; }
+.content th { background: var(--bg-subtle); font-weight: 600; }
+.content del { color: var(--text-faint); }
 
 #events {
   list-style: none;
@@ -316,56 +376,58 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   font-size: 0.78rem;
   max-height: 12rem;
   overflow-y: auto;
-  background: #fcfcfc;
-  border: 1px solid #eee;
+  background: var(--bg-faint);
+  border: 1px solid var(--border-muted);
   border-radius: 6px;
   padding: 0.5rem;
 }
-#events li { padding: 0.1rem 0; color: #4b5563; }
-#events li.error { color: #b42318; }
-#events li.exit { color: #1a7f37; }
+#events li { padding: 0.1rem 0; color: var(--text-muted); }
+#events li.error { color: var(--danger-text); }
+#events li.exit { color: var(--success); }
 
 .input-row { display: flex; gap: 0.5rem; align-items: stretch; margin-top: 0.5rem; }
 .input-row textarea {
   flex: 1;
   padding: 0.5rem;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   border-radius: 6px;
   font: inherit;
   font-size: 0.9rem;
   resize: vertical;
   min-height: 4rem;
+  background: var(--bg-chrome);
+  color: var(--text);
 }
 .input-row button {
   padding: 0 1.25rem;
-  border: 1px solid #1f6feb;
-  background: #1f6feb;
+  border: 1px solid var(--accent);
+  background: var(--accent);
   color: white;
   border-radius: 6px;
   cursor: pointer;
   font: inherit;
 }
 .input-row button:disabled {
-  background: #b1b6bd;
-  border-color: #b1b6bd;
+  background: var(--border-strong);
+  border-color: var(--border-strong);
   cursor: not-allowed;
 }
 .render-mode {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.72rem;
   padding: 0.2rem 0.5rem;
-  border: 1px solid #d0d7de;
-  background: white;
+  border: 1px solid var(--border);
+  background: var(--bg-canvas);
   border-radius: 4px;
   cursor: pointer;
-  color: #4b5563;
+  color: var(--text-muted);
   margin-left: 0.25rem;
 }
-.render-mode:hover { background: #f6f8fa; }
+.render-mode:hover { background: var(--bg-subtle); }
 .render-mode[aria-pressed="true"] {
-  background: #f6f8fa;
-  border-color: #6e40c9;
-  color: #6e40c9;
+  background: var(--bg-subtle);
+  border-color: var(--purple);
+  color: var(--purple);
 }
 
 .header-logout {
@@ -375,9 +437,12 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 }
 .header-logout:hover { text-decoration: underline; }
 
-.raw-markdown {
-  background: #fcfcfc;
-  border: 1px solid #eee;
+/* `pre.raw-markdown` (not just `.raw-markdown`) — equal specificity to
+ * `.content pre`, so cascade order wins. Otherwise raw mode inherits the
+ * dark code-block background and the entire transcript looks like code. */
+pre.raw-markdown {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-muted);
   border-radius: 4px;
   padding: 0.5rem 0.6rem;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -385,7 +450,7 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
-  color: #4b5563;
+  color: var(--text);
 }
 
 .chat-focus {
@@ -393,16 +458,16 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   margin-bottom: 0.4rem;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   padding: 0.3rem 0.5rem;
-  background: #fafafa;
+  background: var(--bg-chrome);
   border-radius: 4px;
 }
-.chat-focus a { color: #6e40c9; text-decoration: none; }
+.chat-focus a { color: var(--purple); text-decoration: none; }
 .chat-focus a:hover { text-decoration: underline; }
-.chat-focus.empty { color: #b1b6bd; font-style: italic; }
+.chat-focus.empty { color: var(--text-empty-state); font-style: italic; }
 
 .chat-scroll {
-  background: #fcfcfc;
-  border: 1px solid #eee;
+  background: var(--bg-faint);
+  border: 1px solid var(--border-muted);
   border-radius: 6px;
   padding: 0.5rem;
   max-height: 65vh;
@@ -410,23 +475,23 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   overflow-y: auto;
   margin-bottom: 0.5rem;
 }
-.chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed #eee; }
+.chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed var(--border-muted); }
 .chat-message:last-child { border-bottom: 0; }
 .chat-message .role {
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #6b7280;
+  color: var(--text-faint);
   margin-bottom: 0.2rem;
 }
-.chat-message.user .role { color: #1f6feb; }
-.chat-message.agent .role { color: #6e40c9; }
-.chat-message.error .role { color: #cf222e; }
-.chat-message.placeholder .content { color: #9ca3af; font-style: italic; }
+.chat-message.user .role { color: var(--accent); }
+.chat-message.agent .role { color: var(--purple); }
+.chat-message.error .role { color: var(--danger); }
+.chat-message.placeholder .content { color: var(--text-disabled); font-style: italic; }
 .chat-message .content { margin: 0; }
 .chat-message .role .ts {
   font-size: 0.7rem;
-  color: #9ca3af;
+  color: var(--text-disabled);
   margin-left: 0.5rem;
   text-transform: none;
   letter-spacing: 0;
@@ -435,13 +500,13 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
 .running-dot {
   margin-left: 0.5rem;
   font-size: 0.75rem;
-  color: #1a7f37;
+  color: var(--success);
   font-weight: 500;
 }
 
 .auto-dot {
   margin-right: 0.25rem;
-  color: #b08800;
+  color: var(--warning-border);
   font-size: 0.75rem;
 }
 
@@ -451,54 +516,53 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   gap: 0.75rem;
   margin-top: 0.4rem;
 }
-.send-controls .kbd-hint { margin-top: 0; }
 .auto-approve-toggle {
   font-size: 0.78rem;
   padding: 0.25rem 0.6rem;
-  border: 1px solid #d0d7de;
-  background: white;
+  border: 1px solid var(--border);
+  background: var(--bg-chrome);
   border-radius: 4px;
   cursor: pointer;
-  color: #4b5563;
+  color: var(--text-muted);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
-.auto-approve-toggle:hover { background: #f6f8fa; }
+.auto-approve-toggle:hover { background: var(--bg-subtle); }
 .auto-approve-toggle[aria-pressed="true"] {
-  background: #fff8e1;
-  border-color: #b08800;
-  color: #8a6700;
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
 }
 .auto-approve-toggle:disabled { opacity: 0.6; cursor: progress; }
 
 .input-row button.cancel {
-  border-color: #cf222e;
-  background: #cf222e;
+  border-color: var(--danger);
+  background: var(--danger);
 }
 .input-row button.cancel:disabled {
-  background: #b1b6bd;
-  border-color: #b1b6bd;
+  background: var(--border-strong);
+  border-color: var(--border-strong);
 }
 
 #modal { position: fixed; inset: 0; z-index: 1000; }
-#modal .overlay { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.45); }
+#modal .overlay { position: absolute; inset: 0; background: var(--modal-overlay); }
 #modal .dialog {
   position: relative;
   max-width: 560px;
   margin: 4rem auto 0;
-  background: white;
+  background: var(--bg-chrome);
   border-radius: 8px;
   padding: 1rem 1.25rem 1.25rem;
-  box-shadow: 0 12px 32px rgba(0,0,0,0.25);
+  box-shadow: 0 12px 32px var(--shadow-modal);
   max-height: 80vh;
   overflow-y: auto;
 }
 #modal h3 { margin: 0 0 0.75rem 0; font-size: 1rem; }
-.interaction { padding: 0.75rem 0; border-top: 1px solid #eee; }
+.interaction { padding: 0.75rem 0; border-top: 1px solid var(--border-muted); }
 .interaction:first-of-type { border-top: 0; }
 .interaction .meta { margin-bottom: 0.4rem; font-size: 0.9rem; }
 .interaction .meta .muted { margin-left: 0.5rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem; }
 .interaction .tool-input {
-  background: #f6f8fa;
+  background: var(--bg-subtle);
   padding: 0.5rem;
   border-radius: 4px;
   font-size: 0.78rem;
@@ -516,24 +580,24 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   border: 1px solid transparent;
 }
 .interaction button.allow.primary {
-  background: #1f6feb;
-  border-color: #1f6feb;
+  background: var(--accent);
+  border-color: var(--accent);
   color: white;
 }
 .interaction button.deny.primary {
-  background: #cf222e;
-  border-color: #cf222e;
+  background: var(--danger);
+  border-color: var(--danger);
   color: white;
 }
 .interaction button.allow.secondary {
-  background: white;
-  border-color: #1f6feb;
-  color: #1f6feb;
+  background: var(--bg-canvas);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .interaction button.deny.secondary {
-  background: white;
-  border-color: #cf222e;
-  color: #cf222e;
+  background: var(--bg-canvas);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 .interaction button:hover { filter: brightness(0.95); }
 
@@ -552,9 +616,65 @@ section h3 { font-size: 0.9rem; color: #6b7280; margin: 1rem 0 0.5rem 0; font-we
   max-width: 100%;
   font-size: 0.78rem;
   padding: 0.25rem 0.5rem;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: white;
+  background: var(--bg-chrome);
+  color: var(--text);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
-.new-cwd-field input:focus { outline: none; border-color: #1f6feb; }
+.new-cwd-field input:focus { outline: none; border-color: var(--accent); }
+
+/* ----- Dark mode -------------------------------------------------------- */
+/* Palette is GitHub-Primer-inspired: warm-neutral surfaces (#0d1117 base,
+ * progressively elevated to #21262d), brighter accent blue (#58a6ff) and
+ * semantic colors with reduced saturation so they don't strobe on a dark
+ * background. Auto-approve "armed" state stays warm-amber but uses a
+ * translucent fill instead of solid #fff8e1 to blend with the page. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark inverts the relationship the same way light does: canvas (--bg)
+     * sits at a mid shade, chrome (--bg-chrome) goes to the extreme —
+     * in light that means brighter, in dark that means *darker*. So in
+     * dark mode --bg-chrome is actually less bright than --bg-canvas; the name
+     * tracks "chrome that stands apart from canvas", not "always lighter". */
+    --bg-canvas: #161b22;
+    --bg-chrome: #0d1117;
+    --bg-subtle: #21262d;
+    --bg-faint: #1c2128;
+    --bg-hover: #21262d;
+    --bg-mainchat-hover: #21262d;
+    --bg-accent: rgba(56, 139, 253, 0.15);
+
+    --text: #e6edf3;
+    --text-muted: #b1bac4;
+    --text-faint: #8b949e;
+    --text-disabled: #6e7681;
+    --text-empty-state: #484f58;
+
+    --border: #30363d;
+    --border-muted: #2d333b;
+    --border-strong: #3d444d;
+    --border-hr: #2d333b;
+
+    --accent: #58a6ff;
+    --accent-bg: rgba(56, 139, 253, 0.15);
+    --accent-border: rgba(56, 139, 253, 0.4);
+
+    --purple: #bc8cff;
+
+    --inline-code-bg: rgba(110, 118, 129, 0.3);
+    --code-block-bg: #0a0d12;
+    --code-block-text: #e6edf3;
+
+    --danger: #f85149;
+    --danger-text: #ff7b72;
+    --warning-bg: rgba(187, 128, 9, 0.2);
+    --warning-border: #d29922;
+    --warning-text: #d29922;
+    --success: #3fb950;
+
+    --shadow-sidebar: rgba(0, 0, 0, 0.5);
+    --shadow-modal: rgba(0, 0, 0, 0.6);
+    --modal-overlay: rgba(0, 0, 0, 0.65);
+  }
+}
