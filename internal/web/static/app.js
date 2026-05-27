@@ -84,7 +84,8 @@ function setRenderMode(mode) {
 
 function updateRenderModeBtn() {
   if (!renderModeBtn) return;
-  renderModeBtn.textContent = 'render: ' + renderMode;
+  const val = document.getElementById('render-mode-val');
+  if (val) val.textContent = renderMode;
   renderModeBtn.setAttribute('aria-pressed', renderMode === 'raw');
 }
 
@@ -210,6 +211,10 @@ if (mobileToggle && sidebarEl) {
   mobileToggle.addEventListener('click', () => sidebarEl.classList.toggle('open'));
   window.addEventListener('hashchange', () => sidebarEl.classList.remove('open'));
 }
+const sidebarBackdrop = document.getElementById('sidebar-backdrop');
+if (sidebarBackdrop && sidebarEl) {
+  sidebarBackdrop.addEventListener('click', () => sidebarEl.classList.remove('open'));
+}
 
 // ---------- New session view ----------
 //
@@ -237,21 +242,23 @@ async function showNewSession() {
 
   const options = cwds.map(c => `<option value="${esc(c)}"></option>`).join('');
   root.innerHTML = `
-    <section class="send-anchor">
-      <div class="input-row">
-        <textarea id="prompt" placeholder="message…"></textarea>
-        <button id="send">send</button>
-      </div>
-      <div class="send-controls">
-        <label class="new-cwd-field">
-          <span class="muted">cwd</span>
-          <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
-                 placeholder="/absolute/path/to/project">
-          <datalist id="new-cwd-list">${options}</datalist>
-        </label>
-      </div>
-      <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
-    </section>
+    <div id="chat-scroll" class="chat-area">
+      <section class="send-anchor">
+        <div class="input-row">
+          <textarea id="prompt" placeholder="message…"></textarea>
+          <button id="send">send</button>
+        </div>
+        <div class="send-controls">
+          <label class="new-cwd-field">
+            <span class="muted">cwd</span>
+            <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
+                   placeholder="/absolute/path/to/project">
+            <datalist id="new-cwd-list">${options}</datalist>
+          </label>
+        </div>
+        <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
+      </section>
+    </div>
   `;
 
   const promptEl = document.getElementById('prompt');
@@ -370,26 +377,30 @@ async function showDetail(id) {
   // chat surfaces its focus block — the page header is the only sticky
   // band, no fragile second-tier sticky element.
   subtitle.innerHTML =
-    `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
-    ` <span class="session-cwd">${esc(sess.cwd || '')}</span>` +
-    ` <span class="session-id">${esc(sess.id.slice(0, 8))}</span>`;
+    `<span class="subtitle-left">` +
+      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+    `</span>` +
+    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
+    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
 
   root.innerHTML = `
-    <div id="chat-scroll" class="chat-area"><div class="muted" style="padding:0.5rem">loading…</div></div>
-    <section class="send-anchor">
-      <div class="input-row">
-        <textarea id="prompt" placeholder="message…"></textarea>
-        <button id="send">send</button>
-        <button id="cancel" class="cancel" hidden>cancel</button>
-      </div>
-      <div class="send-controls">
-        <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
-          aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
-          title="when on, every PreToolUse hook for this session is allowed without prompting">
-          auto-approve: ${sess.auto_approve ? 'on' : 'off'}
-        </button>
-      </div>
-    </section>
+    <div id="chat-scroll" class="chat-area">
+      <div class="chat-loading muted" style="padding:0.5rem">loading…</div>
+      <section class="send-anchor">
+        <div class="input-row">
+          <textarea id="prompt" placeholder="message…"></textarea>
+          <button id="send">send</button>
+          <button id="cancel" class="cancel" hidden>cancel</button>
+        </div>
+        <div class="send-controls">
+          <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
+            aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
+            title="when on, every PreToolUse hook for this session is allowed without prompting">
+            auto-approve: ${sess.auto_approve ? 'on' : 'off'}
+          </button>
+        </div>
+      </section>
+    </div>
   `;
 
   await loadTranscript(id);
@@ -588,17 +599,17 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
 async function showMainChat(id) {
   clearListInterval();
   closeES();
-  subtitle.textContent = 'main chat · ' + id;
+  subtitle.innerHTML = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
 
   root.innerHTML = `
-    <div id="chat-focus" class="chat-focus muted"></div>
-    <div id="chat-scroll" class="chat-area"></div>
-    <section class="send-anchor">
-      <div class="input-row">
-        <textarea id="prompt" placeholder="message… (try /help)"></textarea>
-        <button id="send">send</button>
-      </div>
-    </section>
+    <div id="chat-scroll" class="chat-area">
+      <section class="send-anchor">
+        <div class="input-row">
+          <textarea id="prompt" placeholder="message… (try /help)"></textarea>
+          <button id="send">send</button>
+        </div>
+      </section>
+    </div>
   `;
 
   const promptEl = document.getElementById('prompt');
@@ -663,11 +674,19 @@ async function loadTranscript(id) {
     const turns = (await res.json()) || [];
     const el = document.getElementById('chat-scroll');
     if (!el) return;
+    // Wipe transient prior content (loading stub + any messages) but
+    // preserve the send-anchor child.
+    el.querySelectorAll(':scope > .chat-loading, :scope > .chat-message').forEach(n => n.remove());
     if (!turns.length) {
-      el.innerHTML = '<div class="muted" style="padding:0.5rem">no past turns yet</div>';
+      const empty = document.createElement('div');
+      empty.className = 'chat-loading muted';
+      empty.style.padding = '0.5rem';
+      empty.textContent = 'no past turns yet';
+      const sendAnchor = el.querySelector(':scope > .send-anchor');
+      if (sendAnchor) el.insertBefore(empty, sendAnchor);
+      else el.appendChild(empty);
       return;
     }
-    el.innerHTML = '';
     for (const t of turns) appendChatMessage(t);
   } catch {/* ignore */}
 }
@@ -678,7 +697,8 @@ async function loadChatMessages(id) {
     if (!res.ok) return;
     const data = (await res.json()) || [];
     const list = document.getElementById('chat-scroll');
-    list.innerHTML = '';
+    if (!list) return;
+    list.querySelectorAll(':scope > .chat-loading, :scope > .chat-message').forEach(n => n.remove());
     for (const m of data) appendChatMessage(m);
   } catch {}
 }
@@ -693,18 +713,15 @@ async function loadMainChatInfo(id) {
 }
 
 function renderFocus(focus) {
-  const el = document.getElementById('chat-focus');
-  if (!el) return;
+  const left = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
   if (!focus || !focus.session_id) {
-    el.textContent = 'no focus session yet';
-    el.classList.add('empty');
+    subtitle.innerHTML = left;
     return;
   }
-  el.classList.remove('empty');
-  const sid = (focus.session_id || '').slice(0, 8);
-  const cwd = focus.cwd ? ' · ' + focus.cwd : '';
-  const title = focus.title ? ' · ' + focus.title : '';
-  el.innerHTML = `<a href="#/s/${esc(focus.session_id)}">focus: ${esc(sid)}</a>${esc(cwd)}${esc(title)}`;
+  const sid = esc(focus.session_id.slice(0, 8));
+  subtitle.innerHTML =
+    left +
+    `<a href="#/s/${esc(focus.session_id)}" class="subtitle-focus">focus: ${sid}</a>`;
 }
 
 function appendChatMessage(m) {
@@ -721,7 +738,11 @@ function appendChatMessage(m) {
   div.innerHTML =
     `<div class="role">${esc(role)}${ts}</div>` +
     `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
-  list.appendChild(div);
+  // send-anchor lives inside chat-scroll (sticky at bottom). Insert
+  // new messages before it so it stays the last child.
+  const sendAnchor = list.querySelector(':scope > .send-anchor');
+  if (sendAnchor) list.insertBefore(div, sendAnchor);
+  else list.appendChild(div);
   list.scrollTop = list.scrollHeight;
   return div;
 }

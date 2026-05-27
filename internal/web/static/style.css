@@ -80,6 +80,8 @@ body {
   position: sticky;
   top: 0;
   font-size: 0.85rem;
+  display: flex;
+  flex-direction: column;
   box-sizing: border-box;
 }
 .sidebar-brand {
@@ -193,37 +195,56 @@ body {
 #subtitle {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  overflow: hidden;
+}
+/* subtitle-left absorbs all shrink and truncates its (inline) title with
+ * an ellipsis — the ellipsis lives here, not on session-title, since an
+ * inline <strong> can't be clipped directly. */
+.subtitle-left {
+  min-width: 0;
+  flex-shrink: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* margin-left:auto pushes these to the right edge; flex-shrink:0 keeps
+ * them intact so the title is what gets truncated, not the id/cwd. */
+.session-id, .session-cwd, .subtitle-focus { flex-shrink: 0; }
+.session-id, .subtitle-focus { margin-left: auto; }
 .main-wrap > main {
   flex: 1;
   min-height: 0;
-  /* main itself does NOT scroll; it's a flex column whose chat-area child
-   * takes flex:1 and scrolls internally (messenger layout). */
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding-block: 1rem;
+  /* No padding-block: chat-focus / chat-area sit flush against the
+   * header. chat-area's first message has its own internal padding so
+   * the transition isn't cramped. */
   box-sizing: border-box;
 }
-/* The 960px-column centering lives on chat-area + send-anchor (NOT main),
- * so the scrollbar on chat-area lands at main's right edge = viewport's
- * right edge, not inside a centered box. */
 .chat-area {
   flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
   padding-inline: max(1.5rem, calc((100% - 960px) / 2));
   box-sizing: border-box;
 }
+/* send-anchor is the last child of chat-area; sticky bottom pins it when
+ * the chat scrolls, margin-top:auto parks it at the bottom when content
+ * is short. Opaque bg lets messages scroll behind it invisibly. */
 .send-anchor {
+  margin-top: auto;
+  position: sticky;
+  bottom: 0;
   background: var(--bg-canvas);
   padding-top: 0.5rem;
-  padding-inline: max(1.5rem, calc((100% - 960px) / 2));
+  padding-bottom: 1rem;
   flex-shrink: 0;
-  box-sizing: border-box;
 }
 .mobile-toggle {
   display: none;
@@ -236,8 +257,24 @@ body {
   color: var(--text-muted);
 }
 
+#sidebar-backdrop { display: none; }
+
 @media (max-width: 720px) {
   body { display: block; }
+  #sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    z-index: 99;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+    display: block;
+  }
+  body:has(#sidebar.open) #sidebar-backdrop {
+    opacity: 1;
+    pointer-events: auto;
+  }
   #sidebar {
     position: fixed;
     left: 0;
@@ -280,26 +317,18 @@ td.cwd { font-size: 0.82rem; }
   color: var(--text);
   font-weight: 600;
   font-size: 0.95rem;
-  margin-right: 0.5rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 50%;
-  display: inline-block;
-  vertical-align: middle;
 }
 .session-cwd, .session-id {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   color: var(--text-faint);
   font-size: 0.78rem;
 }
-.session-cwd { margin-right: 0.5rem; }
 
 /* Rendered markdown — used for transcripts, current-send response, and
    main-chat messages. marked emits the usual GFM HTML: <em>, <strong>,
    <code>, <a>, <pre><code>, <ul>/<ol>, <li>, <blockquote>, <h1..6>,
    <hr>, <img>, <table>/<thead>/<tbody>/<tr>/<th>/<td>, <del>. */
-.content { font-size: 0.92rem; line-height: 1.45; }
+.content { font-size: 0.92rem; line-height: 1.45; overflow-wrap: anywhere; }
 .content > *:first-child { margin-top: 0; }
 .content > *:last-child  { margin-bottom: 0; }
 .content code {
@@ -396,19 +425,38 @@ td.cwd { font-size: 0.82rem; }
   color: var(--text-muted);
   margin-left: 0.25rem;
 }
+/* Fixed-width value slot (fits "raw") so toggling md ↔ raw never reflows
+ * the button. Right-aligned: the shorter "md" gets a leading space so its
+ * right edge lines up with "raw" — front and back read consistently. */
+#render-mode-val {
+  display: inline-block;
+  min-width: 3ch;
+  text-align: right;
+}
 .render-mode:hover { background: var(--bg-subtle); }
 .render-mode[aria-pressed="true"] {
   background: var(--bg-subtle);
   border-color: var(--purple);
   color: var(--purple);
 }
-
-.header-logout {
-  font-size: 0.78rem;
-  margin-left: 0.5rem;
-  text-decoration: none;
+@media (max-width: 720px) {
+  .render-mode-prefix { display: none; }
+  /* prefix gone — center the bare value in its fixed-width slot */
+  #render-mode-val { text-align: center; }
 }
-.header-logout:hover { text-decoration: underline; }
+
+.sidebar-logout {
+  margin-top: auto;
+  display: block;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  text-decoration: none;
+  text-align: center;
+}
+.sidebar-logout:hover { color: var(--text); background: var(--bg-hover); }
 
 /* `pre.raw-markdown` (not just `.raw-markdown`) — equal specificity to
  * `.content pre`, so cascade order wins. Otherwise raw mode inherits the
@@ -426,19 +474,16 @@ pre.raw-markdown {
   color: var(--text);
 }
 
-.chat-focus {
-  font-size: 0.78rem;
-  margin-bottom: 0.4rem;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  padding: 0.3rem 0.5rem;
-  background: var(--bg-chrome);
-  border-radius: 4px;
-}
-.chat-focus a { color: var(--purple); text-decoration: none; }
-.chat-focus a:hover { text-decoration: underline; }
-.chat-focus.empty { color: var(--text-empty-state); font-style: italic; }
+.subtitle-focus { color: var(--purple); text-decoration: none; }
+.subtitle-focus:hover { text-decoration: underline; }
 
-.chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed var(--border-muted); }
+@media (max-width: 720px) {
+  /* detail subtitle: drop cwd + id on cramped screens; title takes
+   * whatever's left */
+  .session-cwd, .session-id { display: none; }
+}
+
+.chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed var(--border-muted); min-width: 0; }
 .chat-message:last-child { border-bottom: 0; }
 .chat-message .role {
   font-size: 0.72rem;

@@ -2,10 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>usher</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<div id="sidebar-backdrop" aria-hidden="true"></div>
 <aside id="sidebar">
   <h1 class="sidebar-brand"><a href="#/">usher</a></h1>
   <a href="#/chat/default" class="sidebar-mainchat">main chat</a>
@@ -16,13 +18,13 @@
     </div>
     <div id="sidebar-sessions"></div>
   </div>
+  <a href="/logout" class="sidebar-logout" title="sign out">sign out</a>
 </aside>
 <div class="main-wrap">
   <header>
     <button id="mobile-toggle" class="mobile-toggle" aria-label="toggle sidebar" type="button">☰</button>
     <span id="subtitle" class="muted">discovered Claude Code sessions</span>
-    <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering">render: md</button>
-    <a href="/logout" class="header-logout muted" title="sign out">sign out</a>
+    <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering"><span class="render-mode-prefix">render:</span><span id="render-mode-val">md</span></button>
   </header>
   <main id="root"></main>
 </div>
