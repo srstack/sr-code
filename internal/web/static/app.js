@@ -868,3 +868,13 @@ setInterval(loadSidebar, 5000);
 loadSidebar();
 
 route();
+
+// PWA: register the service worker (installable + offline shell; caching
+// strategy and the /api + SSE bypass live in sw.js). Best-effort — a failed
+// registration just means no offline/install.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((err) =>
+      console.warn('service worker registration failed', err));
+  });
+}

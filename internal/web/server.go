@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -45,6 +46,13 @@ var staticFS embed.FS
 var loginTemplateRaw string
 
 var loginTmpl = template.Must(template.New("login").Parse(loginTemplateRaw))
+
+func init() {
+	// Go's default MIME table has no .webmanifest entry; without this the
+	// FileServer would serve the PWA manifest as application/octet-stream and
+	// browsers would reject it.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
+}
 
 // Verify Router satisfies AgentAPI at compile time.
 var _ usheragent.AgentAPI = (*router.Router)(nil)
@@ -226,10 +234,17 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 func isAuthExempt(p string) bool {
 	switch p {
-	case "/healthz", "/login", "/logout":
+	case "/healthz", "/login", "/logout",
+		// PWA install assets must be reachable without auth. Browsers fetch
+		// the manifest, service worker, and icons to evaluate installability
+		// (sometimes before or independent of the page's auth state); a 303
+		// to /login here gets followed and cached by the SW as if it were
+		// the manifest, permanently breaking install. None of these files
+		// contain user data.
+		"/manifest.webmanifest", "/sw.js":
 		return true
 	}
-	return false
+	return strings.HasPrefix(p, "/icons/")
 }
 
 // safeNextEscape URL-encodes a path for use in ?next=. We don't accept
