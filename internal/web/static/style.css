@@ -70,7 +70,7 @@ body {
 /* ----- Sidebar ---------------------------------------------------------- */
 
 #sidebar {
-  width: 240px;
+  width: 300px;
   flex-shrink: 0;
   border-right: 1px solid var(--border-muted);
   background: var(--bg-chrome);
@@ -85,7 +85,7 @@ body {
   box-sizing: border-box;
 }
 .sidebar-brand {
-  font-size: 1.2rem;
+  font-size: 1.5rem;
   font-weight: 600;
   margin: 0 0 1rem;
   padding: 0 0.5rem;
@@ -146,7 +146,7 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 0.85rem;
+  font-size: 0.9rem;
 }
 .sidebar-list li a:hover { background: var(--bg-hover); }
 .sidebar-list li a.active { background: var(--bg-accent); color: var(--accent); font-weight: 500; }
@@ -280,7 +280,7 @@ body {
     left: 0;
     top: 0;
     height: 100vh;
-    width: 280px;
+    width: 300px;
     transform: translateX(-100%);
     transition: transform 0.2s ease;
     z-index: 100;
@@ -393,8 +393,7 @@ td.cwd { font-size: 0.82rem; }
   padding: 0.5rem;
   border: 1px solid var(--border);
   border-radius: 6px;
-  font: inherit;
-  font-size: 0.9rem;
+  font: inherit;  font-size: 1rem;
   resize: vertical;
   min-height: 4rem;
   background: var(--bg-chrome);
@@ -615,14 +614,13 @@ pre.raw-markdown {
   gap: 0.4rem;
 }
 .new-cwd-field > span {
-  font-size: 0.72rem;
+  font-size: 0.85rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 .new-cwd-field input {
   width: 18rem;
-  max-width: 100%;
-  font-size: 0.78rem;
+  max-width: 100%;  font-size: 1rem;
   padding: 0.25rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 4px;
