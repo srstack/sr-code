@@ -64,7 +64,7 @@ body {
   background: var(--bg-canvas);
   color: var(--text);
   display: flex;
-  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* ----- Sidebar ---------------------------------------------------------- */
@@ -76,7 +76,7 @@ body {
   background: var(--bg-chrome);
   padding: 1rem 0.75rem;
   overflow-y: auto;
-  height: 100vh;
+  height: 100dvh;
   position: sticky;
   top: 0;
   font-size: 0.85rem;
@@ -179,7 +179,7 @@ body {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100dvh;
 }
 .main-wrap > header {
   display: flex;
@@ -279,7 +279,7 @@ body {
     position: fixed;
     left: 0;
     top: 0;
-    height: 100vh;
+    height: 100dvh;
     width: 300px;
     transform: translateX(-100%);
     transition: transform 0.2s ease;
