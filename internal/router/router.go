@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"usher/internal/archive"
 	"usher/internal/broker"
 	"usher/internal/core"
 	"usher/internal/discovery"
@@ -29,6 +30,7 @@ type Router struct {
 	sender    *sender.Sender
 	broker    *broker.Broker
 	hooks     *hook.Manager
+	archive   *archive.Store
 
 	sendMu     sync.Mutex
 	activeSend map[string]*sendToken // sessionID -> latest send's cancel handle
@@ -41,12 +43,13 @@ type sendToken struct {
 	cancel context.CancelFunc
 }
 
-func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Manager) *Router {
+func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Manager, archiveStore *archive.Store) *Router {
 	return &Router{
 		discovery:  d,
 		sender:     s,
 		broker:     b,
 		hooks:      h,
+		archive:    archiveStore,
 		activeSend: map[string]*sendToken{},
 	}
 }
@@ -81,6 +84,40 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 
 func (r *Router) SessionPath(id string) (string, bool) {
 	return r.discovery.Path(id)
+}
+
+// IsArchived reports whether sessionID is archived in the default
+// sidebar view. Wraps archive.Store.IsArchived with the session's
+// last_event_at from discovery; returns false for unknown ids.
+func (r *Router) IsArchived(sessionID string) bool {
+	if r.archive == nil {
+		return false
+	}
+	sess, ok := r.discovery.Get(sessionID)
+	if !ok {
+		return false
+	}
+	return r.archive.IsArchived(sessionID, sess.LastEventAt, time.Now())
+}
+
+// Archive marks sessionID as manually archived.
+func (r *Router) Archive(sessionID string) {
+	if r.archive != nil {
+		r.archive.Archive(sessionID)
+	}
+}
+
+// Unarchive removes the archive decision for sessionID. Looks up the
+// session's last_event_at from discovery so the store can pick between
+// "delete entry" (fresh — let auto-archive resume later) and "write DecisionShown"
+// (stale — would otherwise re-archive on next IsArchived call). A missing
+// session leaves lastEventAt zero, which the store treats as stale.
+func (r *Router) Unarchive(sessionID string) {
+	if r.archive == nil {
+		return
+	}
+	sess, _ := r.discovery.Get(sessionID)
+	r.archive.Unarchive(sessionID, sess.LastEventAt, time.Now())
 }
 
 // --- session writes ------------------------------------------------------

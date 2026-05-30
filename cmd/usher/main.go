@@ -11,10 +11,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"usher/internal/agent/usheragent"
 	"usher/internal/auth"
 	"usher/internal/broker"
+	"usher/internal/archive"
 	"usher/internal/discovery"
 	"usher/internal/hook"
 	"usher/internal/mainchat"
@@ -92,8 +94,13 @@ func serve(args []string) error {
 		"env var holding the API key (use empty value for backends without auth, e.g. local Ollama)")
 	llmStrict := fs.Bool("llm-strict", false,
 		"append a small-model enforcement block to the system prompt (recommended for haiku / mini / flash / 7B-class models)")
+	autoArchiveDays := fs.Int("auto-archive-days", 7,
+		"sessions whose jsonl mtime is older than this fall out of the sidebar's default view; 0 disables auto-archive (manual archive still works)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *autoArchiveDays < 0 {
+		return fmt.Errorf("--auto-archive-days must be ≥ 0 (got %d)", *autoArchiveDays)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -127,7 +134,11 @@ func serve(args []string) error {
 	b := broker.New()
 	sd := sender.New(*claudeCmd, *permissionMode, logger)
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
-	r := router.New(d, sd, b, h)
+	archiveStore := archive.New(
+		filepath.Join(*dataDir, "archived.json"),
+		time.Duration(*autoArchiveDays)*24*time.Hour,
+	)
+	r := router.New(d, sd, b, h, archiveStore)
 
 	mainStore, err := mainchat.NewStore(filepath.Join(*dataDir, "mainchats"))
 	if err != nil {

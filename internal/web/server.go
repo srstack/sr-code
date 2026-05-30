@@ -110,6 +110,8 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
+	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
+	webMux.HandleFunc("DELETE /api/sessions/{id}/archive", s.handleUnarchive)
 
 	webMux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
 	webMux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
@@ -341,19 +343,32 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 
 // --- sessions ------------------------------------------------------------
 
-// sessionDTO wraps core.Session with web-only fields (currently just the
-// auto-approve flag). We don't put auto_approve on core.Session because
-// hook state is process-local and shouldn't leak into the discovery model.
+// sessionDTO wraps core.Session with web-only fields (auto-approve flag
+// and archive visibility). We don't put these on core.Session because
+// the state is process-local and shouldn't leak into the discovery model.
 type sessionDTO struct {
 	core.Session
 	AutoApprove bool `json:"auto_approve"`
+	Archived    bool `json:"archived"`
 }
 
+// handleListSessions returns sessions visible by default, or the full
+// set when ?include_archived=1 is passed (used by the sidebar's per-cwd
+// "show archived" disclosure).
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	includeArchived := r.URL.Query().Get("include_archived") == "1"
 	sessions := s.router.ListSessions()
-	out := make([]sessionDTO, len(sessions))
-	for i, sess := range sessions {
-		out[i] = sessionDTO{Session: sess, AutoApprove: s.router.IsAutoApprove(sess.ID)}
+	out := make([]sessionDTO, 0, len(sessions))
+	for _, sess := range sessions {
+		archived := s.router.IsArchived(sess.ID)
+		if archived && !includeArchived {
+			continue
+		}
+		out = append(out, sessionDTO{
+			Session:     sess,
+			AutoApprove: s.router.IsAutoApprove(sess.ID),
+			Archived:    archived,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -384,7 +399,31 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionDTO{Session: sess, AutoApprove: s.router.IsAutoApprove(id)})
+	writeJSON(w, http.StatusOK, sessionDTO{
+		Session:     sess,
+		AutoApprove: s.router.IsAutoApprove(id),
+		Archived:    s.router.IsArchived(id),
+	})
+}
+
+func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	s.router.Archive(id)
+	writeJSON(w, http.StatusOK, map[string]bool{"archived": true})
+}
+
+func (s *Server) handleUnarchive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	s.router.Unarchive(id)
+	writeJSON(w, http.StatusOK, map[string]bool{"archived": false})
 }
 
 type autoApproveRequest struct {
