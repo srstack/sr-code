@@ -37,7 +37,7 @@ func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
 		t.Fatal(err)
 	}
 	s := &Sender{
-		pool:        newPool(runner, "claude", nil, 8, quietLogger()),
+		pool:        newPool(runner, "claude", nil, nil, 8, quietLogger()),
 		projectsDir: dir,
 		logger:      quietLogger(),
 		t: timing{

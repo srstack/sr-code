@@ -56,9 +56,11 @@ type Sender struct {
 // New builds a Sender. claudeCmd is the claude binary; permissionMode (if
 // non-empty) is passed through as --permission-mode; projectsDir is Claude
 // Code's projects root (used to locate session jsonl files by their globally
-// unique id); socket is the dedicated tmux server socket name; maxLive caps
-// concurrent live processes (LRU-evicted beyond it).
-func New(claudeCmd, permissionMode, projectsDir, socket string, maxLive int, logger *slog.Logger) *Sender {
+// unique id); socket is the dedicated tmux server socket name; hookSock, if
+// non-empty, is set as USHER_HOOK_SOCK on spawned claude processes so their
+// permission hooks route back to this instance; maxLive caps concurrent live
+// processes (LRU-evicted beyond it).
+func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -69,9 +71,13 @@ func New(claudeCmd, permissionMode, projectsDir, socket string, maxLive int, log
 	if permissionMode != "" {
 		extra = []string{"--permission-mode", permissionMode}
 	}
+	var env []string
+	if hookSock != "" {
+		env = []string{"USHER_HOOK_SOCK=" + hookSock}
+	}
 	runner := execRunner{bin: "tmux", socket: socket}
 	return &Sender{
-		pool:        newPool(runner, claudeCmd, extra, maxLive, logger),
+		pool:        newPool(runner, claudeCmd, extra, env, maxLive, logger),
 		projectsDir: projectsDir,
 		logger:      logger,
 		t: timing{

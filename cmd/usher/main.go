@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"usher/internal/agent/usheragent"
+	"usher/internal/archive"
 	"usher/internal/auth"
 	"usher/internal/broker"
-	"usher/internal/archive"
 	"usher/internal/discovery"
 	"usher/internal/hook"
 	"usher/internal/mainchat"
@@ -136,7 +136,7 @@ func serve(args []string) error {
 		return err
 	}
 	b := broker.New()
-	sd := sender.New(*claudeCmd, *permissionMode, *projectsDir, *tmuxSocket, *maxLiveSessions, logger)
+	sd := sender.New(*claudeCmd, *permissionMode, *projectsDir, *tmuxSocket, hookSockPath(*dataDir), *maxLiveSessions, logger)
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	archiveStore := archive.New(
 		filepath.Join(*dataDir, "archived.json"),

@@ -104,7 +104,7 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 
 func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", nil, 8, quietLogger())
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
 
 	if _, err := p.ensure("s1", "/tmp", true); err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 
 func TestPool_LRUEviction(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", nil, 2, quietLogger())
+	p := newPool(f, "claude", nil, nil, 2, quietLogger())
 
 	mustEnsure(t, p, "a")
 	mustEnsure(t, p, "b")
@@ -145,7 +145,7 @@ func TestPool_LRUEviction(t *testing.T) {
 
 func TestPool_AdoptExistingWindows(t *testing.T) {
 	f := &fakeTmux{exists: true, windows: []string{"old1", "old2"}}
-	p := newPool(f, "claude", nil, 8, quietLogger())
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
 	if !p.has("old1") || !p.has("old2") {
 		t.Fatal("adopt should pick up pre-existing windows")
 	}
@@ -156,7 +156,7 @@ func TestPool_AdoptExistingWindows(t *testing.T) {
 
 func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", nil, 8, quietLogger())
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
 	mustEnsure(t, p, "s1")
 	f.cmds = nil
 	if err := p.inject("s1", "hello\nworld"); err != nil {
@@ -173,6 +173,30 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 	}
 	if !sawPaste || !sawEnter {
 		t.Fatalf("inject should bracketed-paste then Enter; cmds=%v", f.cmds)
+	}
+}
+
+func TestPool_SpawnPropagatesEnv(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, []string{"USHER_HOOK_SOCK=/tmp/x.sock"}, 8, quietLogger())
+	mustEnsure(t, p, "s1")
+	// The new-session command must carry -e USHER_HOOK_SOCK=... so the
+	// spawned claude's permission hooks route back to this instance.
+	var ok bool
+	f.mu.Lock()
+	for _, c := range f.cmds {
+		if len(c) == 0 || c[0] != "new-session" {
+			continue
+		}
+		for i, a := range c {
+			if a == "-e" && i+1 < len(c) && c[i+1] == "USHER_HOOK_SOCK=/tmp/x.sock" {
+				ok = true
+			}
+		}
+	}
+	f.mu.Unlock()
+	if !ok {
+		t.Fatalf("spawn should pass -e USHER_HOOK_SOCK; cmds=%v", f.cmds)
 	}
 }
 

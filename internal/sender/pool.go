@@ -43,6 +43,7 @@ type pool struct {
 	runner    tmuxRunner
 	claudeCmd string
 	extraArgs []string // extra claude flags, e.g. ["--permission-mode","default"]
+	env       []string // KEY=VAL pairs set on the spawned window's process
 	max       int
 	logger    *slog.Logger
 
@@ -50,14 +51,14 @@ type pool struct {
 	lru []string // session ids, least-recently-used first
 }
 
-func newPool(runner tmuxRunner, claudeCmd string, extraArgs []string, max int, logger *slog.Logger) *pool {
+func newPool(runner tmuxRunner, claudeCmd string, extraArgs, env []string, max int, logger *slog.Logger) *pool {
 	if max <= 0 {
 		max = 8
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	p := &pool{runner: runner, claudeCmd: claudeCmd, extraArgs: extraArgs, max: max, logger: logger}
+	p := &pool{runner: runner, claudeCmd: claudeCmd, extraArgs: extraArgs, env: env, max: max, logger: logger}
 	p.adopt()
 	return p
 }
@@ -150,13 +151,24 @@ func (p *pool) spawn(sessionID, cwd string, resume bool) error {
 	}
 	cmd := strings.Join(parts, " ")
 
+	// -e propagates env (notably USHER_HOOK_SOCK) into the spawned claude, so
+	// its permission hooks route back to THIS usher instance rather than
+	// whatever owns the default-data-dir socket. The dedicated tmux server
+	// freezes its env at creation, so inheritance alone is not reliable.
+	envFlags := make([]string, 0, len(p.env)*2)
+	for _, kv := range p.env {
+		envFlags = append(envFlags, "-e", kv)
+	}
+
 	var err error
 	if !p.sessionExists() {
-		_, err = p.runner.run("new-session", "-d", "-s", tmuxSessionName,
-			"-n", sessionID, "-c", cwd, "-x", "200", "-y", "50", cmd)
+		args := append([]string{"new-session", "-d", "-s", tmuxSessionName,
+			"-n", sessionID, "-c", cwd, "-x", "200", "-y", "50"}, envFlags...)
+		_, err = p.runner.run(append(args, cmd)...)
 	} else {
-		_, err = p.runner.run("new-window", "-t", tmuxSessionName,
-			"-n", sessionID, "-c", cwd, cmd)
+		args := append([]string{"new-window", "-t", tmuxSessionName,
+			"-n", sessionID, "-c", cwd}, envFlags...)
+		_, err = p.runner.run(append(args, cmd)...)
 	}
 	if err != nil {
 		return fmt.Errorf("spawn window for %s: %w", sessionID, err)
