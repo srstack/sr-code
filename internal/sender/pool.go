@@ -78,13 +78,20 @@ func (p *pool) adopt() {
 	}
 }
 
-// has reports whether a live window exists for sessionID. Used by the hook
-// bridge to decide whether usher "owns" the session (now persists across
-// turns, unlike the old per-send activeSend check).
+// has reports whether a live window exists for sessionID.
 func (p *pool) has(sessionID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return contains(p.liveWindows(), sessionID)
+}
+
+// liveSessions returns the ids of all sessions with a live window, via a
+// single tmux query — cheaper than calling has() per session when decorating
+// a whole list.
+func (p *pool) liveSessions() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.liveWindows()
 }
 
 // ensure guarantees a live interactive claude window for sessionID, spawning

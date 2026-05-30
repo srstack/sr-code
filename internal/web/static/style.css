@@ -614,6 +614,10 @@ pre.raw-markdown {
   font-weight: 500;
 }
 
+/* A turn in flight blinks; a warm-but-idle process is solid. */
+.running-dot.executing { animation: dot-blink 1s steps(2, start) infinite; }
+@keyframes dot-blink { 50% { opacity: 0.25; } }
+
 .auto-dot {
   margin-right: 0.25rem;
   color: var(--warning-border);

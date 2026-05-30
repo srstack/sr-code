@@ -3,11 +3,15 @@ package core
 
 import "time"
 
-// Status describes whether a session has an active subprocess attached.
+// Status describes a session's relationship to usher's interactive process
+// pool. "live" means usher holds a warm claude process for it (idle, ready to
+// answer instantly); "running" means a turn is actively executing in that
+// process. A plain discovered session usher hasn't loaded is "idle".
 type Status string
 
 const (
 	StatusIdle               Status = "idle"
+	StatusLive               Status = "live"
 	StatusRunning            Status = "running"
 	StatusAwaitingPermission Status = "awaiting_permission"
 )

@@ -101,8 +101,12 @@ func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd string) (<-
 }
 
 // Has reports whether usher currently holds a live interactive process for
-// sessionID. Used by the hook bridge to decide ownership.
+// sessionID.
 func (s *Sender) Has(sessionID string) bool { return s.pool.has(sessionID) }
+
+// LiveSessions returns the ids of all sessions usher currently holds a live
+// interactive process for. One tmux query; use it to decorate session lists.
+func (s *Sender) LiveSessions() []string { return s.pool.liveSessions() }
 
 // Interrupt stops the in-flight turn for sessionID without killing the
 // process (Ctrl-C into the pane).

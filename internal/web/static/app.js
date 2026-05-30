@@ -197,9 +197,7 @@ function renderSidebarSessions(allSessions) {
 
   const renderItem = s => {
     const href = '#/s/' + encodeURIComponent(s.id);
-    const dot = s.status === 'running'
-      ? '<span class="running-dot" title="active subprocess">●</span>'
-      : '';
+    const dot = statusDot(s.status);
     const auto = s.auto_approve
       ? '<span class="auto-dot" title="auto-approve enabled">⚡</span>'
       : '';
@@ -472,8 +470,10 @@ async function loadList() {
     }
     const rows = data.map(s => {
       const status = s.status === 'running'
-        ? '<span class="running-dot" title="active subprocess">● running</span>'
-        : '';
+        ? '<span class="running-dot executing" title="executing">● running</span>'
+        : (s.status === 'live'
+          ? '<span class="running-dot" title="process live">● live</span>'
+          : '');
       return `
       <tr data-id="${esc(s.id)}">
         <td class="title">${esc(s.title || '(untitled)')} ${status}</td>
@@ -629,6 +629,15 @@ async function showDetail(id) {
     }
   });
   promptEl.focus();
+}
+
+// statusDot renders the sidebar run-state indicator: a solid green dot when
+// usher holds a warm process for the session ("live"), and a blinking one
+// while a turn is executing ("running"). Idle/undiscovered sessions get none.
+function statusDot(status) {
+  if (status === 'running') return '<span class="running-dot executing" title="executing">●</span>';
+  if (status === 'live') return '<span class="running-dot" title="process live">●</span>';
+  return '';
 }
 
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The

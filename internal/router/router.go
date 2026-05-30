@@ -57,13 +57,17 @@ func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Man
 
 // --- session reads -------------------------------------------------------
 
-// ListSessions returns sessions decorated with their current run state.
+// ListSessions returns sessions decorated with their current run state: a
+// turn in flight is "running"; otherwise a warm pooled process is "live".
 func (r *Router) ListSessions() []core.Session {
 	sessions := r.discovery.List()
+	live := sliceToSet(r.sender.LiveSessions())
 	r.sendMu.Lock()
 	for i := range sessions {
 		if _, running := r.activeSend[sessions[i].ID]; running {
 			sessions[i].Status = core.StatusRunning
+		} else if live[sessions[i].ID] {
+			sessions[i].Status = core.StatusLive
 		}
 	}
 	r.sendMu.Unlock()
@@ -76,11 +80,22 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 		return sess, false
 	}
 	r.sendMu.Lock()
-	if _, running := r.activeSend[id]; running {
-		sess.Status = core.StatusRunning
-	}
+	_, running := r.activeSend[id]
 	r.sendMu.Unlock()
+	if running {
+		sess.Status = core.StatusRunning
+	} else if r.sender.Has(id) {
+		sess.Status = core.StatusLive
+	}
 	return sess, true
+}
+
+func sliceToSet(xs []string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
 }
 
 func (r *Router) SessionPath(id string) (string, bool) {
