@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -198,15 +199,19 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 	tok.cancel()
 }
 
-// CancelSend cancels the most recent send for sessionID. Subprocesses claude
-// has already serialized into its own queue keep running; we only stop the
-// one currently driving stdout.
+// CancelSend stops the in-flight turn for sessionID. It both cancels usher's
+// tail goroutine (tok.cancel) and interrupts the live interactive claude with
+// Ctrl-C — the process is persistent now, so cancelling the listener alone
+// would leave claude generating into the void.
 func (r *Router) CancelSend(sessionID string) error {
 	r.sendMu.Lock()
 	tok, ok := r.activeSend[sessionID]
 	r.sendMu.Unlock()
 	if !ok {
 		return errors.New("no active send")
+	}
+	if err := r.sender.Interrupt(sessionID); err != nil {
+		slog.Warn("interrupt session turn", "session", sessionID, "err", err)
 	}
 	tok.cancel()
 	return nil
@@ -298,8 +303,14 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 				return buf.String(), nil
 			}
 			switch ev.Type {
-			case "stream_event":
-				if t := extractTextDelta(ev.Raw); t != "" {
+			case "assistant":
+				// Message granularity now (interactive claude emits no
+				// stream-json token deltas): each assistant event carries its
+				// full text blocks. Accumulate them across the turn.
+				if t := extractAssistantText(ev.Raw); t != "" {
+					if buf.Len() > 0 {
+						buf.WriteString("\n")
+					}
 					buf.WriteString(t)
 				}
 			case "subprocess.exit":
@@ -316,23 +327,28 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 	}
 }
 
-func extractTextDelta(raw json.RawMessage) string {
-	var d struct {
-		Event struct {
-			Type  string `json:"type"`
-			Delta struct {
+// extractAssistantText concatenates the text blocks of an "assistant" jsonl
+// line's message. Non-text blocks (thinking, tool_use) are skipped, so an
+// assistant turn that only calls a tool yields "".
+func extractAssistantText(raw json.RawMessage) string {
+	var o struct {
+		Message struct {
+			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
-			} `json:"delta"`
-		} `json:"event"`
+			} `json:"content"`
+		} `json:"message"`
 	}
-	if err := json.Unmarshal(raw, &d); err != nil {
+	if err := json.Unmarshal(raw, &o); err != nil {
 		return ""
 	}
-	if d.Event.Type == "content_block_delta" && d.Event.Delta.Type == "text_delta" {
-		return d.Event.Delta.Text
+	var b strings.Builder
+	for _, c := range o.Message.Content {
+		if c.Type == "text" {
+			b.WriteString(c.Text)
+		}
 	}
-	return ""
+	return b.String()
 }
 
 func extractErrorMessage(raw json.RawMessage) string {
@@ -419,8 +435,11 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 		// Forward to broker so any session-detail subscriber that opens
 		// the new tab sees the live stream too.
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
-		if ev.Type == "stream_event" {
-			if t := extractTextDelta(ev.Raw); t != "" {
+		if ev.Type == "assistant" {
+			if t := extractAssistantText(ev.Raw); t != "" {
+				if buf.Len() > 0 {
+					buf.WriteString("\n")
+				}
 				buf.WriteString(t)
 			}
 		}

@@ -633,11 +633,11 @@ async function showDetail(id) {
 
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
 // in-flight assistant turn renders inline at the bottom of the transcript:
-// subprocess.started appends a placeholder chat-message; stream_event text
-// deltas accumulate into it; subprocess.exit either finalizes it (success)
-// or converts it to an error message (non-zero exit). Diagnostic events
-// (subprocess.started/started details, system init/status, success result)
-// are intentionally dropped — only errors surface to the user.
+// subprocess.started appends a placeholder chat-message; each 'assistant'
+// event (message granularity — the session jsonl is tailed, not a stream-json
+// token feed) accumulates its text into the placeholder; subprocess.exit
+// finalizes it. Turn errors surface via the 'error' event. Other jsonl lines
+// ('user', 'system', bookkeeping) are dropped as diagnostic noise.
 function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
@@ -664,6 +664,13 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
     contentEl.dataset.raw = raw;
     contentEl.innerHTML = renderMarkdown(raw);
   };
+  // assistantText joins the text blocks of an 'assistant' jsonl event's
+  // message, skipping thinking / tool_use blocks.
+  const assistantText = (d) => {
+    const content = d && d.message && d.message.content;
+    if (!Array.isArray(content)) return '';
+    return content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
+  };
 
   const handlers = {
     'subprocess.started': () => {
@@ -671,45 +678,34 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       placeholder = appendChatMessage({ role: 'assistant', content: '', _placeholder: true });
       onRunning();
     },
-    'stream_event': (d) => {
-      const e = d.event;
+    'assistant': (d) => {
+      // Message granularity: each assistant turn carries its full text blocks
+      // (no token deltas). A turn may produce several assistant messages (text
+      // before a tool call, then more after); accumulate their text into the
+      // one placeholder. Tool-only messages have no text and are skipped.
       if (!placeholder) return;
-      if (e && e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
-        accum += e.delta.text;
-        setContent(placeholder, accum);
-        chatEl.scrollTop = chatEl.scrollHeight;
-      }
+      const text = assistantText(d);
+      if (!text) return;
+      accum += (accum ? '\n' : '') + text;
+      setContent(placeholder, accum);
+      chatEl.scrollTop = chatEl.scrollHeight;
     },
     'subprocess.exit': (d) => {
       // Canonicalize timestamps from server-persisted jsonl (set by
       // router.enrichExitWithTurnTimestamps). Replaces the optimistic
-      // client-side "now" stamps we showed during the turn.
+      // client-side "now" stamps we showed during the turn. The exit payload
+      // carries {stop_reason, user_ts, assistant_ts} — turn errors arrive via
+      // the separate 'error' event, so exit always means a clean finish here.
       if (turnState && turnState.userNode) {
         updateMessageTs(turnState.userNode, d.user_ts);
         turnState.userNode = null;
       }
       if (placeholder) {
-        // Server ts when available; fall back to client time for crashed
-        // runs where jsonl may not have a final assistant turn.
         updateMessageTs(placeholder, d.assistant_ts || new Date().toISOString());
-        if (d.exit_code !== 0) {
-          placeholder.className = 'chat-message error';
-          setRoleText(placeholder, 'error');
-          const msg = `subprocess exited (${d.exit_code})` + (d.error ? `: ${d.error}` : '');
-          setContent(placeholder, (accum ? accum + '\n\n' : '') + msg);
-        } else {
-          placeholder.classList.remove('placeholder');
-        }
+        placeholder.classList.remove('placeholder');
         placeholder = null;
       }
       onIdle();
-    },
-    'result': (d) => {
-      if (d.is_error) {
-        appendChatMessage({ role: 'error',
-          content: 'result: error' + (typeof d.duration_ms === 'number' ? ` · ${d.duration_ms} ms` : ''),
-          ts: new Date().toISOString() });
-      }
     },
     'error': (d) => {
       const msg = d.message || JSON.stringify(d);
@@ -724,8 +720,8 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       }
       onIdle();
     },
-    // Dropped (diagnostic noise): 'system' init/status, 'assistant' (we
-    // already stream deltas), 'rate_limit_event'.
+    // Dropped (diagnostic noise): 'user' (our own prompt / tool results),
+    // 'system' init/status, and other jsonl bookkeeping lines.
   };
 
   Object.entries(handlers).forEach(([name, fn]) => {
