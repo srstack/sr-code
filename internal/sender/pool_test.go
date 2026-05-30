@@ -5,19 +5,25 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // fakeTmux models just enough tmux server state for pool tests: an ordered
 // list of window names within the single "usher" session, plus a log of the
-// inject-path commands.
+// inject-path commands. Guarded by mu because the Sender drives the runner
+// from a goroutine while tests inspect cmds.
 type fakeTmux struct {
-	windows []string
-	exists  bool
-	cmds    [][]string
+	mu        sync.Mutex
+	windows   []string
+	exists    bool
+	cmds      [][]string
+	failSpawn bool // when set, new-session/new-window return an error
 }
 
 func (f *fakeTmux) run(args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.cmds = append(f.cmds, args)
 	switch args[0] {
 	case "has-session":
@@ -26,10 +32,16 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 		}
 		return "", errors.New("no session")
 	case "new-session":
+		if f.failSpawn {
+			return "", errors.New("spawn failed")
+		}
 		f.exists = true
 		f.addWindow(flagVal(args, "-n"))
 		return "", nil
 	case "new-window":
+		if f.failSpawn {
+			return "", errors.New("spawn failed")
+		}
 		f.addWindow(flagVal(args, "-n"))
 		return "", nil
 	case "list-windows":
@@ -60,6 +72,19 @@ func (f *fakeTmux) delWindow(name string) {
 	}
 }
 
+// countCmd returns how many recorded commands start with verb (thread-safe).
+func (f *fakeTmux) countCmd(verb string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.cmds {
+		if len(c) > 0 && c[0] == verb {
+			n++
+		}
+	}
+	return n
+}
+
 func flagVal(args []string, flag string) string {
 	for i, a := range args {
 		if a == flag && i+1 < len(args) {
@@ -79,16 +104,16 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 
 func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", 8, quietLogger())
+	p := newPool(f, "claude", nil, 8, quietLogger())
 
-	if err := p.ensure("s1", "/tmp", true); err != nil {
+	if _, err := p.ensure("s1", "/tmp", true); err != nil {
 		t.Fatal(err)
 	}
 	if !p.has("s1") {
 		t.Fatal("s1 should be live after ensure")
 	}
 	// Second ensure must not create a second window.
-	if err := p.ensure("s1", "/tmp", true); err != nil {
+	if _, err := p.ensure("s1", "/tmp", true); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.windows) != 1 {
@@ -98,7 +123,7 @@ func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 
 func TestPool_LRUEviction(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", 2, quietLogger())
+	p := newPool(f, "claude", nil, 2, quietLogger())
 
 	mustEnsure(t, p, "a")
 	mustEnsure(t, p, "b")
@@ -120,7 +145,7 @@ func TestPool_LRUEviction(t *testing.T) {
 
 func TestPool_AdoptExistingWindows(t *testing.T) {
 	f := &fakeTmux{exists: true, windows: []string{"old1", "old2"}}
-	p := newPool(f, "claude", 8, quietLogger())
+	p := newPool(f, "claude", nil, 8, quietLogger())
 	if !p.has("old1") || !p.has("old2") {
 		t.Fatal("adopt should pick up pre-existing windows")
 	}
@@ -131,7 +156,7 @@ func TestPool_AdoptExistingWindows(t *testing.T) {
 
 func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 	f := &fakeTmux{}
-	p := newPool(f, "claude", 8, quietLogger())
+	p := newPool(f, "claude", nil, 8, quietLogger())
 	mustEnsure(t, p, "s1")
 	f.cmds = nil
 	if err := p.inject("s1", "hello\nworld"); err != nil {
@@ -153,7 +178,7 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 
 func mustEnsure(t *testing.T, p *pool, id string) {
 	t.Helper()
-	if err := p.ensure(id, "/tmp", true); err != nil {
+	if _, err := p.ensure(id, "/tmp", true); err != nil {
 		t.Fatal(err)
 	}
 }

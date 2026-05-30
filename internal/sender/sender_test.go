@@ -2,26 +2,12 @@ package sender
 
 import (
 	"context"
-	"io"
-	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
-
-func absFake(t *testing.T, name string) string {
-	t.Helper()
-	p, err := filepath.Abs(filepath.Join("testdata", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func newTestSender(t *testing.T, fakeName string) *Sender {
-	t.Helper()
-	return New(absFake(t, fakeName), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
-}
 
 func collect(t *testing.T, ch <-chan StreamEvent, timeout time.Duration) []StreamEvent {
 	t.Helper()
@@ -35,119 +21,156 @@ func collect(t *testing.T, ch <-chan StreamEvent, timeout time.Duration) []Strea
 			}
 			got = append(got, ev)
 		case <-deadline:
-			t.Fatalf("timed out after %s collecting events; got %d so far", timeout, len(got))
+			t.Fatalf("timed out after %s; got %d events so far: %v", timeout, len(got), types(got))
 		}
 	}
 }
 
-func TestSender_StreamsAndExits(t *testing.T) {
-	s := newTestSender(t, "fake-claude")
-	ch, err := s.Send(context.Background(), "fake-session", "hi", t.TempDir())
-	if err != nil {
+// testSender wires a Sender to a fake tmux runner and a temp projects dir,
+// with timings shrunk to milliseconds. Returns the sender and the jsonl path
+// the session's file should live at.
+func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
+	t.Helper()
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	events := collect(t, ch, 5*time.Second)
-
-	wantTypes := []string{
-		"subprocess.started",
-		"system",
-		"stream_event",
-		"stream_event",
-		"assistant",
-		"result",
-		"subprocess.exit",
+	s := &Sender{
+		pool:        newPool(runner, "claude", nil, 8, quietLogger()),
+		projectsDir: dir,
+		logger:      quietLogger(),
+		t: timing{
+			spawnSettle:   10 * time.Millisecond,
+			trustToInject: 5 * time.Millisecond,
+			warmSettle:    5 * time.Millisecond,
+			confirm:       1 * time.Second,
+			poll:          10 * time.Millisecond,
+			attempts:      2,
+		},
+		tail: tailConfig{poll: 10 * time.Millisecond, appearWait: 2 * time.Second},
 	}
-	if len(events) != len(wantTypes) {
-		t.Fatalf("got %d events, want %d: %+v", len(events), len(wantTypes), eventTypes(events))
-	}
-	for i, want := range wantTypes {
-		if events[i].Type != want {
-			t.Errorf("event[%d] type = %q, want %q", i, events[i].Type, want)
-		}
-		if len(events[i].Raw) == 0 {
-			t.Errorf("event[%d] (%s) Raw is empty", i, events[i].Type)
-		}
-	}
+	return s, filepath.Join(sub, id+".jsonl")
 }
 
-func TestSender_BadCommandReturnsError(t *testing.T) {
-	s := New("/nonexistent/binary", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	_, err := s.Send(context.Background(), "x", "hi", t.TempDir())
-	if err == nil {
-		t.Fatal("expected error for missing binary")
-	}
+var turnLines = []string{
+	`{"type":"user","message":{"role":"user","content":"hi"}}`,
+	`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}`,
 }
 
-func TestSender_CancelInterruptsSubprocess(t *testing.T) {
-	s := newTestSender(t, "fake-claude-slow")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	ch, err := s.Send(ctx, "fake-slow", "hi", t.TempDir())
-	if err != nil {
+func TestSend_ResumeStreamsTurn(t *testing.T) {
+	f := &fakeTmux{}
+	s, path := testSender(t, f, "sess-1")
+	// Pre-existing history so this is a resume with a non-zero offset.
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait for the first real event so we know the subprocess is running.
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatal("no first event")
+	ch, err := s.Send(context.Background(), "sess-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatal("no second event")
+	go appendLines(path, 30*time.Millisecond, turnLines...)
+
+	got := collect(t, ch, 6*time.Second)
+	want := []string{"subprocess.started", "user", "assistant", "subprocess.exit"}
+	if !eq(types(got), want) {
+		t.Fatalf("got %v, want %v", types(got), want)
+	}
+	// The pre-existing "mode" line must not leak (offset respected).
+	for _, e := range got {
+		if strings.Contains(string(e.Raw), `"mode"`) {
+			t.Fatalf("history leaked: %s", e.Raw)
+		}
+	}
+}
+
+func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
+	f := &fakeTmux{}
+	s, path := testSender(t, f, "new-1")
+
+	ch, err := s.SendNew(context.Background(), "new-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// jsonl is created lazily, only after the prompt is submitted.
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			panic(err)
+		}
+		appendLines(path, 20*time.Millisecond, turnLines...)
+	}()
+
+	got := collect(t, ch, 6*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "user", "assistant", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
+	}
+	// A fresh window spawns via new-session, runs claude with --session-id,
+	// and receives a trust-accept Enter.
+	if f.countCmd("new-session") != 1 {
+		t.Fatalf("expected one new-session, got %d", f.countCmd("new-session"))
+	}
+	if !cmdMatches(f, "new-session", "--session-id") {
+		t.Fatal("new session should launch claude with --session-id")
+	}
+	if !cmdMatches(f, "send-keys", "Enter") {
+		t.Fatal("fresh window should receive a trust-accept Enter")
+	}
+}
+
+func TestSend_RetriesWhenPromptMissed(t *testing.T) {
+	f := &fakeTmux{}
+	s, path := testSender(t, f, "retry-1")
+	s.t.confirm = 200 * time.Millisecond // make the first attempt time out fast
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	cancel()
+	ch, err := s.Send(context.Background(), "retry-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only write the turn after the SECOND inject (second paste-buffer),
+	// forcing the retry path.
+	go func() {
+		for f.countCmd("paste-buffer") < 2 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		appendLines(path, 10*time.Millisecond, turnLines...)
+	}()
 
-	// The subprocess sleeps 30s; with SIGINT + WaitDelay, it should exit
-	// quickly. Allow some margin.
-	deadline := time.After(8 * time.Second)
-	var sawExit bool
-	for {
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				if !sawExit {
-					t.Fatal("channel closed without subprocess.exit event")
-				}
-				return
+	got := collect(t, ch, 6*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "user", "assistant", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
+	}
+	if n := f.countCmd("paste-buffer"); n != 2 {
+		t.Fatalf("expected 2 inject attempts, got %d", n)
+	}
+}
+
+func TestSend_SpawnErrorPropagates(t *testing.T) {
+	f := &fakeTmux{failSpawn: true}
+	s, _ := testSender(t, f, "boom")
+	if _, err := s.Send(context.Background(), "boom", "hi", "/work"); err == nil {
+		t.Fatal("expected error when window spawn fails")
+	}
+}
+
+// cmdMatches reports whether some recorded command starting with verb has an
+// argument containing sub.
+func cmdMatches(f *fakeTmux, verb, sub string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.cmds {
+		if len(c) == 0 || c[0] != verb {
+			continue
+		}
+		for _, a := range c {
+			if strings.Contains(a, sub) {
+				return true
 			}
-			if ev.Type == "subprocess.exit" {
-				sawExit = true
-			}
-		case <-deadline:
-			t.Fatal("timed out waiting for cancel to take effect")
 		}
 	}
-}
-
-func TestParseStreamLine(t *testing.T) {
-	ev, err := parseStreamLine([]byte(`{"type":"system","subtype":"init"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ev.Type != "system" {
-		t.Errorf("Type = %q", ev.Type)
-	}
-	if string(ev.Raw) != `{"type":"system","subtype":"init"}` {
-		t.Errorf("Raw = %s", ev.Raw)
-	}
-}
-
-func TestParseStreamLine_BadJSON(t *testing.T) {
-	if _, err := parseStreamLine([]byte("not json")); err == nil {
-		t.Error("expected error")
-	}
-}
-
-func eventTypes(evs []StreamEvent) []string {
-	out := make([]string, len(evs))
-	for i, e := range evs {
-		out[i] = e.Type
-	}
-	return out
+	return false
 }

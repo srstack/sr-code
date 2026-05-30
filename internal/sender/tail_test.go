@@ -30,18 +30,18 @@ func eq(a, b []string) bool {
 }
 
 // appendLines appends each line (a '\n' is added) to path with a small delay
-// between them, simulating claude writing the turn out over time.
-func appendLines(t *testing.T, path string, gap time.Duration, lines ...string) {
-	t.Helper()
+// between them, simulating claude writing the turn out over time. Runs in a
+// goroutine, so it panics rather than calling t.Fatal on error.
+func appendLines(path string, gap time.Duration, lines ...string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	defer f.Close()
 	for _, ln := range lines {
 		time.Sleep(gap)
 		if _, err := f.WriteString(ln + "\n"); err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}
 }
@@ -57,7 +57,7 @@ func TestTailTurn_SimpleTurn(t *testing.T) {
 	}
 	off, _ := os.Stat(path)
 
-	go appendLines(t, path, 20*time.Millisecond,
+	go appendLines(path, 20*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"hi"}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}`,
 	)
@@ -77,7 +77,7 @@ func TestTailTurn_ToolUseDoesNotEndEarly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go appendLines(t, path, 15*time.Millisecond,
+	go appendLines(path, 15*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"make a file"}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Write"}]}}`,
 		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}`,
@@ -106,7 +106,7 @@ func TestTailTurn_ByteOffsetSkipsHistory(t *testing.T) {
 	}
 	off, _ := os.Stat(path)
 
-	go appendLines(t, path, 15*time.Millisecond,
+	go appendLines(path, 15*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"new"}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"NEW"}]}}`,
 	)

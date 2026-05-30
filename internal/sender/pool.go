@@ -42,6 +42,7 @@ func (e execRunner) run(args ...string) (string, error) {
 type pool struct {
 	runner    tmuxRunner
 	claudeCmd string
+	extraArgs []string // extra claude flags, e.g. ["--permission-mode","default"]
 	max       int
 	logger    *slog.Logger
 
@@ -49,14 +50,14 @@ type pool struct {
 	lru []string // session ids, least-recently-used first
 }
 
-func newPool(runner tmuxRunner, claudeCmd string, max int, logger *slog.Logger) *pool {
+func newPool(runner tmuxRunner, claudeCmd string, extraArgs []string, max int, logger *slog.Logger) *pool {
 	if max <= 0 {
 		max = 8
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	p := &pool{runner: runner, claudeCmd: claudeCmd, max: max, logger: logger}
+	p := &pool{runner: runner, claudeCmd: claudeCmd, extraArgs: extraArgs, max: max, logger: logger}
 	p.adopt()
 	return p
 }
@@ -89,14 +90,17 @@ func (p *pool) has(sessionID string) bool {
 // ensure guarantees a live interactive claude window for sessionID, spawning
 // (and LRU-evicting if at capacity) if necessary, and marks it most-recently
 // used. resume selects `--resume <id>` (existing) vs `--session-id <id>`
-// (brand new). It is safe to call before every send.
-func (p *pool) ensure(sessionID, cwd string, resume bool) error {
+// (brand new). fresh reports whether a new window was spawned this call (vs a
+// warm window reused) — callers use it to decide whether to dismiss the
+// first-launch trust prompt and how long to let the TUI settle. Safe to call
+// before every send.
+func (p *pool) ensure(sessionID, cwd string, resume bool) (fresh bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if contains(p.liveWindows(), sessionID) {
 		p.touch(sessionID)
-		return nil
+		return false, nil
 	}
 
 	// Evict until there is room (recompute live set each round in case an
@@ -118,10 +122,10 @@ func (p *pool) ensure(sessionID, cwd string, resume bool) error {
 	}
 
 	if err := p.spawn(sessionID, cwd, resume); err != nil {
-		return err
+		return false, err
 	}
 	p.touch(sessionID)
-	return nil
+	return true, nil
 }
 
 // spawn creates the window running interactive claude and dismisses the
@@ -133,7 +137,11 @@ func (p *pool) spawn(sessionID, cwd string, resume bool) error {
 	if resume {
 		idFlag = "--resume"
 	}
-	cmd := fmt.Sprintf("%s %s %s", shellQuote(p.claudeCmd), idFlag, shellQuote(sessionID))
+	parts := []string{shellQuote(p.claudeCmd), idFlag, shellQuote(sessionID)}
+	for _, a := range p.extraArgs {
+		parts = append(parts, shellQuote(a))
+	}
+	cmd := strings.Join(parts, " ")
 
 	var err error
 	if !p.sessionExists() {
