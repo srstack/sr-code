@@ -244,18 +244,19 @@ func (r *Router) RespondInteraction(id string, resp hook.Response) error {
 	return r.hooks.Respond(id, resp)
 }
 
-// HandleHook applies per-session trust first (works for all callers),
-// then only blocks for the web UI when usher owns the subprocess —
-// terminal claude has its own permission path, so an error here makes
-// Claude Code fall back to it.
+// HandleHook applies a remembered per-session decision first, then blocks for
+// the web UI when usher owns the session. Ownership = the session has a live
+// window in usher's process pool (sender.Has) — a simple membership test, NOT
+// whether a turn is currently executing. The old activeSend (turn-in-flight)
+// gate raced the send/inject/turn lifecycle and bounced mid-turn tool prompts
+// back to the pane; pool membership is the stable signal. It also keeps usher
+// from intercepting the user's own terminal/IDE claude (not in our pool), which
+// on a shared default socket would otherwise reach this same hook server.
 func (r *Router) HandleHook(ctx context.Context, ev hook.Event) (hook.Response, error) {
 	if resp, ok := r.hooks.QuickDecide(ev); ok {
 		return resp, nil
 	}
-	r.sendMu.Lock()
-	_, owned := r.activeSend[ev.SessionID]
-	r.sendMu.Unlock()
-	if !owned {
+	if !r.sender.Has(ev.SessionID) {
 		return hook.Response{}, errors.New("session not owned by usher")
 	}
 	return r.hooks.Submit(ctx, ev)
