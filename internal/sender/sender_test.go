@@ -56,6 +56,7 @@ func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
 var turnLines = []string{
 	`{"type":"user","message":{"role":"user","content":"hi"}}`,
 	`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}`,
+	`{"type":"system","subtype":"turn_duration","durationMs":42}`,
 }
 
 func TestSend_ResumeStreamsTurn(t *testing.T) {

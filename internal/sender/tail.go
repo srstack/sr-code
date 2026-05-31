@@ -34,11 +34,9 @@ func (c tailConfig) withDefaults() tailConfig {
 // only this turn's new lines.
 //
 // Output: each complete jsonl line becomes a StreamEvent{Type, Raw} (Type is
-// the line's "type" field). When an assistant message ends the turn
-// (stop_reason other than "tool_use" — verified: intermediate tool steps are
-// "tool_use", the final answer is "end_turn"), the tailer emits that assistant
-// event, then a synthesized "subprocess.exit" carrying the stop_reason, then
-// closes the channel.
+// the line's "type" field). When Claude Code logs its end-of-turn marker (a
+// "system/turn_duration" event — see isTurnComplete), the tailer emits a
+// synthesized "subprocess.exit" and closes the channel.
 //
 // The channel also closes on ctx cancellation, or if the file never appears
 // within cfg.appearWait (brand-new sessions create their jsonl lazily). Unlike
@@ -89,15 +87,18 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				if len(line) == 0 {
 					continue
 				}
-				ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
-				if !sendEvent(ctx, out, ev) {
+				// The turn is done when Claude Code logs its end-of-turn
+				// "system/turn_duration" event — NOT when an assistant message
+				// carries stop_reason "end_turn" (interactive claude stamps
+				// end_turn on intermediate thinking/tool_use messages too, so
+				// trusting it ends the turn before the tool even runs — which
+				// released ownership and sent permission prompts to the pane).
+				if isTurnComplete(line) {
+					sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
 					return
 				}
-				if reason, terminal := terminalStopReason(line); terminal {
-					exit, _ := json.Marshal(struct {
-						StopReason string `json:"stop_reason"`
-					}{reason})
-					sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: exit})
+				ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
+				if !sendEvent(ctx, out, ev) {
 					return
 				}
 			}
@@ -194,19 +195,18 @@ func lineType(line []byte) string {
 	return head.Type
 }
 
-// terminalStopReason reports whether line is an assistant message that ends a
-// turn. Intermediate tool-call steps carry stop_reason "tool_use" and are not
-// terminal; the final answer is "end_turn" (also "max_tokens"/"stop_sequence").
-func terminalStopReason(line []byte) (string, bool) {
+// isTurnComplete reports whether line is Claude Code's end-of-turn marker: a
+// "system" event with subtype "turn_duration" (carries durationMs/messageCount).
+// It is written once, after the final assistant message, only when the turn has
+// truly finished — so unlike assistant stop_reason it does not fire mid-turn
+// (during thinking or a pending tool call).
+func isTurnComplete(line []byte) bool {
 	var o struct {
 		Type    string `json:"type"`
-		Message struct {
-			StopReason string `json:"stop_reason"`
-		} `json:"message"`
+		Subtype string `json:"subtype"`
 	}
-	if err := json.Unmarshal(line, &o); err != nil || o.Type != "assistant" {
-		return "", false
+	if err := json.Unmarshal(line, &o); err != nil {
+		return false
 	}
-	r := o.Message.StopReason
-	return r, r != "" && r != "tool_use"
+	return o.Type == "system" && o.Subtype == "turn_duration"
 }

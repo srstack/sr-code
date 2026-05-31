@@ -60,6 +60,7 @@ func TestTailTurn_SimpleTurn(t *testing.T) {
 	go appendLines(path, 20*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"hi"}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}`,
+		`{"type":"system","subtype":"turn_duration","durationMs":42}`,
 	)
 
 	ch := tailTurn(context.Background(), path, off.Size(), nil, fastCfg())
@@ -71,30 +72,31 @@ func TestTailTurn_SimpleTurn(t *testing.T) {
 	}
 }
 
-func TestTailTurn_ToolUseDoesNotEndEarly(t *testing.T) {
+func TestTailTurn_EndTurnStopReasonDoesNotEndEarly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.jsonl")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	// Interactive claude stamps stop_reason "end_turn" on the intermediate
+	// thinking/tool_use messages too. The turn must NOT end there — only at the
+	// system/turn_duration marker after the tool ran and the final answer.
 	go appendLines(path, 15*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"make a file"}}`,
-		`{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Write"}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"tool_use","name":"Write"}]}}`,
 		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`,
+		`{"type":"system","subtype":"turn_duration","durationMs":42}`,
 	)
 
 	ch := tailTurn(context.Background(), path, 0, nil, fastCfg())
 	got := collect(t, ch, 5*time.Second)
 
+	// All four turn events flow before the exit — the early end_turn messages
+	// did not cut it short.
 	want := []string{"user", "assistant", "user", "assistant", "subprocess.exit"}
 	if !eq(types(got), want) {
 		t.Fatalf("got %v, want %v", types(got), want)
-	}
-	// The exit must carry the terminal stop_reason, not the tool_use one.
-	last := got[len(got)-1]
-	if string(last.Raw) == "" || !strings.Contains(string(last.Raw), "end_turn") {
-		t.Fatalf("exit event missing end_turn stop_reason: %s", last.Raw)
 	}
 }
 
@@ -109,6 +111,7 @@ func TestTailTurn_ByteOffsetSkipsHistory(t *testing.T) {
 	go appendLines(path, 15*time.Millisecond,
 		`{"type":"user","message":{"role":"user","content":"new"}}`,
 		`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"NEW"}]}}`,
+		`{"type":"system","subtype":"turn_duration","durationMs":42}`,
 	)
 
 	ch := tailTurn(context.Background(), path, off.Size(), nil, fastCfg())
