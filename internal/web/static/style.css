@@ -50,6 +50,7 @@
   --warning-border: #b08800;
   --warning-text: #8a6700;
   --success: #1a7f37;
+  --live-dot: #4aa86a; /* softer green for the session status dot */
 
   /* Overlays / shadows */
   --shadow-sidebar: rgba(0, 0, 0, 0.15);
@@ -162,8 +163,8 @@ body {
 }
 .sidebar-list li.sidebar-item a.active { background: var(--bg-accent); color: var(--accent); font-weight: 500; }
 .sidebar-list li.sidebar-item a .running-dot {
+  margin-left: 0;
   margin-right: 0.25rem;
-  color: var(--success);
   font-size: 0.7rem;
 }
 .kebab-btn {
@@ -607,16 +608,30 @@ pre.raw-markdown {
   letter-spacing: 0;
 }
 
+/* Session status dot. "live" (warm process, idle) is a DIM solid green dot —
+   present but quiet, so a row of idle sessions doesn't shout and full
+   brightness is reserved for actual activity. */
 .running-dot {
   margin-left: 0.5rem;
   font-size: 0.75rem;
-  color: var(--success);
+  color: var(--live-dot);
   font-weight: 500;
+  opacity: 0.5;
 }
 
-/* A turn in flight blinks; a warm-but-idle process is solid. */
-.running-dot.executing { animation: dot-blink 1s steps(2, start) infinite; }
-@keyframes dot-blink { 50% { opacity: 0.25; } }
+/* "running" (executing) is brighter and throbs — a quick dip then slow
+   recovery (asymmetric ~0.2s/0.8s over 1s). The animation drives opacity, so
+   it overrides the dim base and peaks at full brightness. */
+.running-dot.executing { animation: throb 1s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+@keyframes throb {
+  0%   { opacity: 1; }
+  20%  { opacity: 0; }  /* quick dip to fully transparent — the beat */
+  100% { opacity: 1; }  /* slow recovery */
+}
+@media (prefers-reduced-motion: reduce) {
+  /* No motion: keep running at full brightness so it still outranks dim live. */
+  .running-dot.executing { animation: none; opacity: 1; }
+}
 
 .auto-dot {
   margin-right: 0.25rem;
@@ -785,6 +800,7 @@ pre.raw-markdown {
     --warning-border: #d29922;
     --warning-text: #d29922;
     --success: #3fb950;
+    --live-dot: #5fc78a; /* softer green for the session status dot */
 
     --shadow-sidebar: rgba(0, 0, 0, 0.5);
     --shadow-modal: rgba(0, 0, 0, 0.6);

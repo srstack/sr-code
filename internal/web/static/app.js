@@ -470,9 +470,9 @@ async function loadList() {
     }
     const rows = data.map(s => {
       const status = s.status === 'running'
-        ? '<span class="running-dot executing" title="executing">● running</span>'
+        ? '<span class="running-dot executing" title="executing">●</span> running'
         : (s.status === 'live'
-          ? '<span class="running-dot" title="process live">● live</span>'
+          ? '<span class="running-dot" title="process live">●</span> live'
           : '');
       return `
       <tr data-id="${esc(s.id)}">
@@ -631,8 +631,8 @@ async function showDetail(id) {
   promptEl.focus();
 }
 
-// statusDot renders the sidebar run-state indicator: a solid green dot when
-// usher holds a warm process for the session ("live"), and a blinking one
+// statusDot renders the sidebar run-state indicator: a dim green dot when
+// usher holds a warm-but-idle process ("live"), and a brighter pulsing dot
 // while a turn is executing ("running"). Idle/undiscovered sessions get none.
 function statusDot(status) {
   if (status === 'running') return '<span class="running-dot executing" title="executing">●</span>';
