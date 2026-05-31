@@ -23,6 +23,10 @@ const renderModeBtn = document.getElementById('render-mode-btn');
 
 let listInterval = null;
 let currentES = null;
+// Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
+// the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
+// from restarting (jumping back to its bright peak) on every poll.
+let lastSidebarHtml = '';
 let renderMode = localStorage.getItem('usher.renderMode') === 'raw' ? 'raw' : 'md';
 // Per-cwd archived-disclosure expansion state. Session-only — refresh
 // collapses everything, matching the assumption that browsing archived
@@ -165,6 +169,7 @@ function renderSidebarSessions(allSessions) {
   if (!wrap) return;
   if (!allSessions.length) {
     wrap.innerHTML = '<div class="sidebar-empty">no sessions found</div>';
+    lastSidebarHtml = '';
     return;
   }
   // Group ALL sessions by cwd (incl. archived) so each group's tail can
@@ -183,6 +188,7 @@ function renderSidebarSessions(allSessions) {
     .filter(cwd => groups.get(cwd).some(s => !s.archived));
   if (!cwds.length) {
     wrap.innerHTML = '<div class="sidebar-empty">no sessions found</div>';
+    lastSidebarHtml = '';
     return;
   }
   const recencyOf = arr => Math.max(...arr.map(s => Date.parse(s.last_event_at) || 0));
@@ -211,7 +217,7 @@ function renderSidebarSessions(allSessions) {
     </li>`;
   };
 
-  wrap.innerHTML = cwds.map(cwd => {
+  const html = cwds.map(cwd => {
     const all = groups.get(cwd);
     const visibleItems = all.filter(s => !s.archived).sort(byRecent);
     const archivedItems = all.filter(s => s.archived).sort(byRecent);
@@ -229,6 +235,11 @@ function renderSidebarSessions(allSessions) {
       ${toggleRow}
     </div>`;
   }).join('');
+  // Only touch the DOM when the rendered markup actually changed, so a steady
+  // session's status-dot animation keeps running smoothly across polls.
+  if (html === lastSidebarHtml) return;
+  lastSidebarHtml = html;
+  wrap.innerHTML = html;
 }
 
 function updateSidebarActive() {
