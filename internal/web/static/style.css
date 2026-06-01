@@ -729,6 +729,81 @@ pre.raw-markdown {
 }
 .interaction button:hover { filter: brightness(0.95); }
 
+/* AskUserQuestion picker (interaction.ask) */
+.interaction.ask .question { margin-bottom: 0.75rem; }
+.interaction.ask .question + .question {
+  border-top: 1px solid var(--border-muted);
+  padding-top: 0.75rem;
+}
+.interaction.ask .q-header {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
+}
+.interaction.ask .q-text { font-size: 0.92rem; margin-bottom: 0.5rem; }
+.interaction.ask .q-multi { color: var(--text-muted); font-size: 0.78rem; }
+.interaction.ask .q-options { display: flex; flex-direction: column; gap: 0.35rem; }
+.interaction.ask .qopt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+}
+.interaction.ask .qopt.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.interaction.ask .qopt-label { font-size: 0.88rem; }
+.interaction.ask .qopt-desc { font-size: 0.78rem; color: var(--text-muted); }
+.interaction.ask .qopt-preview {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.3rem;
+  padding: 0.3rem 0.45rem;
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre;
+  background: var(--bg-subtle);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+.interaction.ask .qother {
+  margin-top: 0.4rem;
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 1rem; /* >=16px: avoid iOS focus zoom */
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-chrome);
+  color: var(--text);
+}
+.interaction.ask .qother:focus { outline: none; border-color: var(--accent); }
+.interaction.ask .actions { justify-content: flex-end; }
+.interaction.ask .qignore {
+  background: var(--bg-canvas);
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+}
+.interaction.ask .qsubmit {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+.interaction.ask .qsubmit:disabled { opacity: 0.5; cursor: default; }
+
 .new-cwd-field {
   display: flex;
   align-items: center;
