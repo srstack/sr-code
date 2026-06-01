@@ -809,13 +809,24 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	if decision == "" {
 		decision = "allow"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"hookSpecificOutput": map[string]any{
-			"hookEventName":            eventName,
-			"permissionDecision":       decision,
-			"permissionDecisionReason": resp.Reason,
-		},
-	})
+	hookOut := map[string]any{
+		"hookEventName":            eventName,
+		"permissionDecision":       decision,
+		"permissionDecisionReason": resp.Reason,
+	}
+	// An AskUserQuestion answer comes back as Answers (question → chosen
+	// label). Claude resolves the tool from the hook's updatedInput, so we
+	// echo the original tool input with the answers merged in — the tool then
+	// completes without ever rendering its pane TUI selector.
+	if len(resp.Answers) > 0 {
+		var ti map[string]any
+		if err := json.Unmarshal(ev.ToolInput, &ti); err != nil || ti == nil {
+			ti = map[string]any{}
+		}
+		ti["answers"] = resp.Answers
+		hookOut["updatedInput"] = ti
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hookSpecificOutput": hookOut})
 }
 
 func (s *Server) handleListInteractions(w http.ResponseWriter, r *http.Request) {
@@ -830,6 +841,10 @@ type respondReq struct {
 	Behavior string `json:"behavior"`
 	Reason   string `json:"reason"`
 	Scope    string `json:"scope"` // "" or "once" or "session"
+	// Answers carries an AskUserQuestion choice (question → chosen label).
+	// Sent with Behavior "allow"; the server forwards it into the hook
+	// response's updatedInput.
+	Answers map[string]string `json:"answers,omitempty"`
 }
 
 func (s *Server) handleRespondInteraction(w http.ResponseWriter, r *http.Request) {
@@ -851,6 +866,7 @@ func (s *Server) handleRespondInteraction(w http.ResponseWriter, r *http.Request
 		Behavior: req.Behavior,
 		Reason:   req.Reason,
 		Scope:    req.Scope,
+		Answers:  req.Answers,
 	}); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
