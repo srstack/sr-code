@@ -549,12 +549,7 @@ async function showDetail(id) {
   // visible while transcript / response sections scroll. Mirrors how main
   // chat surfaces its focus block — the page header is the only sticky
   // band, no fragile second-tier sticky element.
-  subtitle.innerHTML =
-    `<span class="subtitle-left">` +
-      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
-    `</span>` +
-    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
-    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
+  renderSessionSubtitle(sess);
 
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
@@ -755,6 +750,9 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       // assistant text, so this pulls in tool calls/results and any turn the
       // SSE didn't witness from the start.
       loadTranscript(id);
+      // A just-created session opened as "(untitled)"; by now the server has
+      // its real title/cwd, so refresh the header too.
+      refreshSubtitle(id);
     },
     'error': (d) => {
       const msg = d.message || JSON.stringify(d);
@@ -856,6 +854,29 @@ async function showMainChat(id) {
     }
   });
   promptEl.focus();
+}
+
+function renderSessionSubtitle(sess) {
+  subtitle.innerHTML =
+    `<span class="subtitle-left">` +
+      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+    `</span>` +
+    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
+    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
+}
+
+// refreshSubtitle re-reads the session so the header picks up a title/cwd that
+// filled in after the view opened (a brand-new session opens as "(untitled)";
+// the server has the real values once the first turn lands). Guarded by
+// currentDetailId so a late fetch can't write into a view already left.
+async function refreshSubtitle(id) {
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+    if (!res.ok) return;
+    const sess = await res.json();
+    if (id !== currentDetailId) return;
+    renderSessionSubtitle(sess);
+  } catch {/* ignore */}
 }
 
 async function loadTranscript(id) {
