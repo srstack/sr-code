@@ -695,7 +695,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   const handlers = {
     'subprocess.started': () => {
       accum = '';
-      placeholder = appendChatMessage({ role: 'assistant', content: '', _placeholder: true });
+      placeholder = appendChatMessage({ role: 'assistant', content: '' });
       onRunning();
     },
     'assistant': (d) => {
@@ -722,7 +722,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       }
       if (placeholder) {
         updateMessageTs(placeholder, d.assistant_ts || new Date().toISOString());
-        placeholder.classList.remove('placeholder');
         placeholder = null;
       }
       onIdle();
