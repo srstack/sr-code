@@ -1,178 +1,231 @@
-// Package sender launches headless `claude -p --resume` subprocesses and
-// streams their output as parsed events.
+// Package sender drives one long-lived interactive `claude` process per
+// session — spawned in a window of a dedicated tmux server socket — and
+// reports each turn's output by tailing the session's jsonl file.
 //
-// Each Send call runs an independent subprocess in the session's original cwd
-// and pipes prompt input via stdin. Concurrent sends to the same session are
-// safe: Claude Code internally serializes them via filesystem queue events
-// (see /home/dev/.claude/projects/<dir>/<id>.jsonl `queue-operation` rows),
-// so usher does no locking of its own.
+// This replaces the original headless `claude -p --resume` design: `-p` is
+// moving to metered billing, whereas interactive claude runs under the user's
+// Claude subscription. Discovery and transcript reads stay jsonl-based; only
+// the send path changed. See the pool (process lifecycle) and tailTurn (turn
+// streaming + end-of-turn detection) for the two halves.
+//
+// Concurrency note: usher keeps ONE process per session and serializes sends
+// at the router. If the user also has the same session open elsewhere (their
+// IDE), interactive resume forks the jsonl into a tree — a known corner case
+// usher does not handle in v0.x (linear tail only).
 package sender
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
 	"log/slog"
-	"os/exec"
-	"strings"
-	"syscall"
+	"os"
+	"path/filepath"
 	"time"
 )
 
-// StreamEvent is one event from the subprocess. Type is the top-level "type"
-// field of a stream-json line, or one of the synthesized values
-// "subprocess.started" / "subprocess.exit" / "subprocess.error".
+// StreamEvent is one event for a turn. Type is the jsonl line's "type"
+// (e.g. "user", "assistant", "system"), or one of the synthesized values
+// "subprocess.started" / "subprocess.exit" / "error". The names are kept from
+// the headless era so the broker/web layer needs minimal change; the payloads
+// are now whole jsonl lines (message granularity), not stream-json token
+// deltas.
 type StreamEvent struct {
 	Type string
 	Raw  json.RawMessage
 }
 
-type Sender struct {
-	claudeCmd      string
-	permissionMode string
-	logger         *slog.Logger
+// timing groups the tunable delays for driving the TUI. Defaults are set in
+// New; tests override them for speed.
+type timing struct {
+	spawnSettle   time.Duration // after spawning a fresh window, before first keystroke (claude boot)
+	trustToInject time.Duration // after the trust-accept Enter, before pasting the prompt
+	warmSettle    time.Duration // before pasting into an already-running window
+	confirm       time.Duration // how long to wait for the injected user turn to land
+	poll          time.Duration // file poll interval for confirm + tail
+	attempts      int           // inject attempts before giving up
 }
 
-func New(claudeCmd, permissionMode string, logger *slog.Logger) *Sender {
+type Sender struct {
+	pool        *pool
+	projectsDir string
+	logger      *slog.Logger
+	t           timing
+	tail        tailConfig
+}
+
+// New builds a Sender. claudeCmd is the claude binary; permissionMode (if
+// non-empty) is passed through as --permission-mode; projectsDir is Claude
+// Code's projects root (used to locate session jsonl files by their globally
+// unique id); socket is the dedicated tmux server socket name; hookSock, if
+// non-empty, is set as USHER_HOOK_SOCK on spawned claude processes so their
+// permission hooks route back to this instance; maxLive caps concurrent live
+// processes (LRU-evicted beyond it).
+func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if socket == "" {
+		socket = tmuxSessionName
+	}
+	var extra []string
+	if permissionMode != "" {
+		extra = []string{"--permission-mode", permissionMode}
+	}
+	var env []string
+	if hookSock != "" {
+		env = []string{"USHER_HOOK_SOCK=" + hookSock}
+	}
+	runner := execRunner{bin: "tmux", socket: socket}
 	return &Sender{
-		claudeCmd:      claudeCmd,
-		permissionMode: permissionMode,
-		logger:         logger,
+		pool:        newPool(runner, claudeCmd, extra, env, maxLive, logger),
+		projectsDir: projectsDir,
+		logger:      logger,
+		t: timing{
+			spawnSettle:   5 * time.Second,
+			trustToInject: 1500 * time.Millisecond,
+			warmSettle:    400 * time.Millisecond,
+			confirm:       8 * time.Second,
+			poll:          150 * time.Millisecond,
+			attempts:      2,
+		},
+		tail: tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second},
 	}
 }
 
-// Send runs `claude -p --resume <sessionID>` from cwd, feeding prompt on
-// stdin. Events stream on the returned channel; the channel is closed once
-// the subprocess exits or ctx is cancelled. Cancelling ctx sends SIGINT and,
-// after a 5s grace period, SIGKILL via exec.WaitDelay.
+// Send injects prompt into the session's live interactive claude (resuming /
+// spawning it as needed) and streams the resulting turn's events. The channel
+// closes when the turn ends or ctx is cancelled.
 func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
-	return s.run(ctx, sessionID, prompt, cwd, false)
-}
-
-// SendNew is like Send but creates a brand-new session with the given UUID.
-// It uses `--session-id <uuid>` instead of `--resume <id>`. Claude Code
-// initializes the jsonl at ~/.claude/projects/<sanitized-cwd>/<uuid>.jsonl
-// the first time the subprocess writes anything; usher's discovery picks
-// it up via fsnotify.
-func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
 	return s.run(ctx, sessionID, prompt, cwd, true)
 }
 
-func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd string, isNew bool) (<-chan StreamEvent, error) {
-	idFlag := "--resume"
-	if isNew {
-		idFlag = "--session-id"
-	}
-	args := []string{
-		"-p",
-		idFlag, sessionID,
-		"--output-format", "stream-json",
-		"--include-partial-messages",
-		"--verbose",
-	}
-	if s.permissionMode != "" {
-		args = append(args, "--permission-mode", s.permissionMode)
-	}
+// SendNew is like Send but starts a brand-new session with the given id
+// (`--session-id`). The jsonl is created lazily once claude writes the first
+// turn; the tailer waits for it to appear.
+func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
+	return s.run(ctx, sessionID, prompt, cwd, false)
+}
 
-	cmd := exec.CommandContext(ctx, s.claudeCmd, args...)
-	cmd.Dir = cwd
-	cmd.Stdin = strings.NewReader(prompt)
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return cmd.Process.Signal(syscall.SIGINT)
-	}
+// Has reports whether usher currently holds a live interactive process for
+// sessionID.
+func (s *Sender) Has(sessionID string) bool { return s.pool.has(sessionID) }
 
-	stdout, err := cmd.StdoutPipe()
+// LiveSessions returns the ids of all sessions usher currently holds a live
+// interactive process for. One tmux query; use it to decorate session lists.
+func (s *Sender) LiveSessions() []string { return s.pool.liveSessions() }
+
+// Interrupt stops the in-flight turn for sessionID without killing the
+// process (Ctrl-C into the pane).
+func (s *Sender) Interrupt(sessionID string) error { return s.pool.interrupt(sessionID) }
+
+// Shutdown tears down usher's tmux server (all live windows). Call on exit if
+// you do NOT want processes to survive for the next usher run.
+func (s *Sender) Shutdown() { s.pool.shutdown() }
+
+func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd string, resume bool) (<-chan StreamEvent, error) {
+	fresh, err := s.pool.ensure(sessionID, cwd, resume)
 	if err != nil {
 		return nil, err
 	}
-	var stderrBuf strings.Builder
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start claude: %w", err)
-	}
-
-	pid := cmd.Process.Pid
-	s.logger.Info("send started", "session", sessionID, "cwd", cwd, "pid", pid)
 
 	out := make(chan StreamEvent, 64)
-
 	go func() {
 		defer close(out)
 
 		started, _ := json.Marshal(struct {
-			PID int    `json:"pid"`
-			Cwd string `json:"cwd"`
-		}{pid, cwd})
-		sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started})
+			Cwd   string `json:"cwd"`
+			Fresh bool   `json:"fresh"`
+		}{cwd, fresh})
+		if !sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started}) {
+			return
+		}
 
-		sc := bufio.NewScanner(stdout)
-		// Some events (assistant message with full usage stats, large
-		// attachments) easily exceed bufio's default 64K line limit.
-		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
-		for sc.Scan() {
-			line := sc.Bytes()
-			ev, err := parseStreamLine(line)
-			if err != nil {
-				s.logger.Warn("parse stream line", "err", err)
-				continue
+		// Let a freshly-spawned window boot and dismiss the trust prompt; a
+		// warm window only needs a brief beat.
+		if fresh {
+			if !sleepCtx(ctx, s.t.spawnSettle) {
+				return
 			}
-			if !sendEvent(ctx, out, ev) {
+			_ = s.pool.acceptTrust(sessionID)
+			if !sleepCtx(ctx, s.t.trustToInject) {
+				return
+			}
+		} else if !sleepCtx(ctx, s.t.warmSettle) {
+			return
+		}
+
+		// Resolve the jsonl path and capture the pre-inject size so the tailer
+		// reports only this turn. For a brand-new session the file may not
+		// exist yet (created on first write); offset stays 0 and we resolve
+		// the path after injecting.
+		path := s.locate(sessionID)
+		var offset int64
+		if path != "" {
+			if fi, statErr := os.Stat(path); statErr == nil {
+				offset = fi.Size()
+			}
+		}
+
+		// Inject, confirming the prompt landed (re-inject on a missed paste).
+		landed := false
+		for attempt := 0; attempt < s.t.attempts; attempt++ {
+			if err := s.pool.inject(sessionID, prompt); err != nil {
+				emitError(ctx, out, "inject prompt: "+err.Error())
+				return
+			}
+			if path == "" {
+				path = s.locateWait(ctx, sessionID, s.t.confirm)
+			}
+			if path != "" && waitForUserTurn(ctx, path, offset, s.t.confirm, s.t.poll) {
+				landed = true
 				break
 			}
+			s.logger.Warn("injected prompt did not land; retrying", "session", sessionID, "attempt", attempt+1)
 		}
-		if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-			s.logger.Warn("stream scanner error", "err", err)
+		if !landed {
+			emitError(ctx, out, "prompt did not register in session (TUI not ready?)")
+			return
 		}
 
-		waitErr := cmd.Wait()
-		exitCode := 0
-		var waitMsg string
-		if waitErr != nil {
-			var exitErr *exec.ExitError
-			if errors.As(waitErr, &exitErr) {
-				exitCode = exitErr.ExitCode()
-			} else {
-				waitMsg = waitErr.Error()
+		for ev := range tailTurn(ctx, path, offset, s.logger, s.tail) {
+			if !sendEvent(ctx, out, ev) {
+				return
 			}
 		}
-		stderr := stderrBuf.String()
-		if exitCode != 0 || waitMsg != "" {
-			s.logger.Warn("send subprocess ended non-zero",
-				"session", sessionID, "exit_code", exitCode, "stderr", truncate(stderr, 500))
-		}
-
-		exit, _ := json.Marshal(struct {
-			ExitCode int    `json:"exit_code"`
-			Stderr   string `json:"stderr,omitempty"`
-			Error    string `json:"error,omitempty"`
-		}{exitCode, truncate(stderr, 1000), waitMsg})
-		sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: exit})
 	}()
 
 	return out, nil
 }
 
-func parseStreamLine(line []byte) (StreamEvent, error) {
-	var head struct {
-		Type string `json:"type"`
+// locate finds the session jsonl by its globally unique id, sidestepping the
+// ambiguous cwd<->dir mapping (a cwd may legitimately contain '-'). Returns ""
+// if not found.
+func (s *Sender) locate(sessionID string) string {
+	matches, err := filepath.Glob(filepath.Join(s.projectsDir, "*", sessionID+".jsonl"))
+	if err != nil || len(matches) == 0 {
+		return ""
 	}
-	if err := json.Unmarshal(line, &head); err != nil {
-		return StreamEvent{}, err
+	return matches[0]
+}
+
+// locateWait polls locate until the file appears or timeout/ctx fires.
+func (s *Sender) locateWait(ctx context.Context, sessionID string, timeout time.Duration) string {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(s.t.poll)
+	defer ticker.Stop()
+	for {
+		if p := s.locate(sessionID); p != "" {
+			return p
+		}
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-deadline.C:
+			return ""
+		case <-ticker.C:
+		}
 	}
-	raw := append(json.RawMessage(nil), line...)
-	return StreamEvent{Type: head.Type, Raw: raw}, nil
 }
 
 // sendEvent delivers ev unless ctx is cancelled. Returns true if delivered.
@@ -185,9 +238,19 @@ func sendEvent(ctx context.Context, ch chan<- StreamEvent, ev StreamEvent) bool 
 	}
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func emitError(ctx context.Context, out chan<- StreamEvent, msg string) {
+	raw, _ := json.Marshal(map[string]string{"message": msg})
+	sendEvent(ctx, out, StreamEvent{Type: "error", Raw: raw})
+}
+
+// sleepCtx sleeps for d, returning false if ctx is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	return s[:n] + "…"
 }

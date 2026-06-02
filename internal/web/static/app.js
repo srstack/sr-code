@@ -23,6 +23,10 @@ const renderModeBtn = document.getElementById('render-mode-btn');
 
 let listInterval = null;
 let currentES = null;
+// Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
+// the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
+// from restarting (jumping back to its bright peak) on every poll.
+let lastSidebarHtml = '';
 let renderMode = localStorage.getItem('usher.renderMode') === 'raw' ? 'raw' : 'md';
 // Per-cwd archived-disclosure expansion state. Session-only — refresh
 // collapses everything, matching the assumption that browsing archived
@@ -165,6 +169,7 @@ function renderSidebarSessions(allSessions) {
   if (!wrap) return;
   if (!allSessions.length) {
     wrap.innerHTML = '<div class="sidebar-empty">no sessions found</div>';
+    lastSidebarHtml = '';
     return;
   }
   // Group ALL sessions by cwd (incl. archived) so each group's tail can
@@ -183,6 +188,7 @@ function renderSidebarSessions(allSessions) {
     .filter(cwd => groups.get(cwd).some(s => !s.archived));
   if (!cwds.length) {
     wrap.innerHTML = '<div class="sidebar-empty">no sessions found</div>';
+    lastSidebarHtml = '';
     return;
   }
   const recencyOf = arr => Math.max(...arr.map(s => Date.parse(s.last_event_at) || 0));
@@ -197,9 +203,7 @@ function renderSidebarSessions(allSessions) {
 
   const renderItem = s => {
     const href = '#/s/' + encodeURIComponent(s.id);
-    const dot = s.status === 'running'
-      ? '<span class="running-dot" title="active subprocess">●</span>'
-      : '';
+    const dot = statusDot(s.status);
     const auto = s.auto_approve
       ? '<span class="auto-dot" title="auto-approve enabled">⚡</span>'
       : '';
@@ -213,7 +217,7 @@ function renderSidebarSessions(allSessions) {
     </li>`;
   };
 
-  wrap.innerHTML = cwds.map(cwd => {
+  const html = cwds.map(cwd => {
     const all = groups.get(cwd);
     const visibleItems = all.filter(s => !s.archived).sort(byRecent);
     const archivedItems = all.filter(s => s.archived).sort(byRecent);
@@ -231,6 +235,11 @@ function renderSidebarSessions(allSessions) {
       ${toggleRow}
     </div>`;
   }).join('');
+  // Only touch the DOM when the rendered markup actually changed, so a steady
+  // session's status-dot animation keeps running smoothly across polls.
+  if (html === lastSidebarHtml) return;
+  lastSidebarHtml = html;
+  wrap.innerHTML = html;
 }
 
 function updateSidebarActive() {
@@ -472,8 +481,10 @@ async function loadList() {
     }
     const rows = data.map(s => {
       const status = s.status === 'running'
-        ? '<span class="running-dot" title="active subprocess">● running</span>'
-        : '';
+        ? '<span class="running-dot executing" title="executing">●</span> running'
+        : (s.status === 'live'
+          ? '<span class="running-dot" title="process live">●</span> live'
+          : '');
       return `
       <tr data-id="${esc(s.id)}">
         <td class="title">${esc(s.title || '(untitled)')} ${status}</td>
@@ -631,13 +642,22 @@ async function showDetail(id) {
   promptEl.focus();
 }
 
+// statusDot renders the sidebar run-state indicator: a dim green dot when
+// usher holds a warm-but-idle process ("live"), and a brighter pulsing dot
+// while a turn is executing ("running"). Idle/undiscovered sessions get none.
+function statusDot(status) {
+  if (status === 'running') return '<span class="running-dot executing" title="executing">●</span>';
+  if (status === 'live') return '<span class="running-dot" title="process live">●</span>';
+  return '';
+}
+
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
 // in-flight assistant turn renders inline at the bottom of the transcript:
-// subprocess.started appends a placeholder chat-message; stream_event text
-// deltas accumulate into it; subprocess.exit either finalizes it (success)
-// or converts it to an error message (non-zero exit). Diagnostic events
-// (subprocess.started/started details, system init/status, success result)
-// are intentionally dropped — only errors surface to the user.
+// subprocess.started appends a placeholder chat-message; each 'assistant'
+// event (message granularity — the session jsonl is tailed, not a stream-json
+// token feed) accumulates its text into the placeholder; subprocess.exit
+// finalizes it. Turn errors surface via the 'error' event. Other jsonl lines
+// ('user', 'system', bookkeeping) are dropped as diagnostic noise.
 function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
@@ -664,52 +684,47 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
     contentEl.dataset.raw = raw;
     contentEl.innerHTML = renderMarkdown(raw);
   };
+  // assistantText joins the text blocks of an 'assistant' jsonl event's
+  // message, skipping thinking / tool_use blocks.
+  const assistantText = (d) => {
+    const content = d && d.message && d.message.content;
+    if (!Array.isArray(content)) return '';
+    return content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
+  };
 
   const handlers = {
     'subprocess.started': () => {
       accum = '';
-      placeholder = appendChatMessage({ role: 'assistant', content: '', _placeholder: true });
+      placeholder = appendChatMessage({ role: 'assistant', content: '' });
       onRunning();
     },
-    'stream_event': (d) => {
-      const e = d.event;
+    'assistant': (d) => {
+      // Message granularity: each assistant turn carries its full text blocks
+      // (no token deltas). A turn may produce several assistant messages (text
+      // before a tool call, then more after); accumulate their text into the
+      // one placeholder. Tool-only messages have no text and are skipped.
       if (!placeholder) return;
-      if (e && e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
-        accum += e.delta.text;
-        setContent(placeholder, accum);
-        chatEl.scrollTop = chatEl.scrollHeight;
-      }
+      const text = assistantText(d);
+      if (!text) return;
+      accum += (accum ? '\n' : '') + text;
+      setContent(placeholder, accum);
+      chatEl.scrollTop = chatEl.scrollHeight;
     },
     'subprocess.exit': (d) => {
       // Canonicalize timestamps from server-persisted jsonl (set by
       // router.enrichExitWithTurnTimestamps). Replaces the optimistic
-      // client-side "now" stamps we showed during the turn.
+      // client-side "now" stamps we showed during the turn. The exit payload
+      // carries {stop_reason, user_ts, assistant_ts} — turn errors arrive via
+      // the separate 'error' event, so exit always means a clean finish here.
       if (turnState && turnState.userNode) {
         updateMessageTs(turnState.userNode, d.user_ts);
         turnState.userNode = null;
       }
       if (placeholder) {
-        // Server ts when available; fall back to client time for crashed
-        // runs where jsonl may not have a final assistant turn.
         updateMessageTs(placeholder, d.assistant_ts || new Date().toISOString());
-        if (d.exit_code !== 0) {
-          placeholder.className = 'chat-message error';
-          setRoleText(placeholder, 'error');
-          const msg = `subprocess exited (${d.exit_code})` + (d.error ? `: ${d.error}` : '');
-          setContent(placeholder, (accum ? accum + '\n\n' : '') + msg);
-        } else {
-          placeholder.classList.remove('placeholder');
-        }
         placeholder = null;
       }
       onIdle();
-    },
-    'result': (d) => {
-      if (d.is_error) {
-        appendChatMessage({ role: 'error',
-          content: 'result: error' + (typeof d.duration_ms === 'number' ? ` · ${d.duration_ms} ms` : ''),
-          ts: new Date().toISOString() });
-      }
     },
     'error': (d) => {
       const msg = d.message || JSON.stringify(d);
@@ -724,8 +739,8 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       }
       onIdle();
     },
-    // Dropped (diagnostic noise): 'system' init/status, 'assistant' (we
-    // already stream deltas), 'rate_limit_event'.
+    // Dropped (diagnostic noise): 'user' (our own prompt / tool results),
+    // 'system' init/status, and other jsonl bookkeeping lines.
   };
 
   Object.entries(handlers).forEach(([name, fn]) => {
@@ -930,6 +945,126 @@ function sameInteractions(a, b) {
   return true;
 }
 
+// AskUserQuestion surfaces as a pending interaction whose tool_input carries
+// the questions + options. We render it as a choice picker (single-select per
+// question) instead of allow/deny; the picked labels go back as `answers`,
+// which the server feeds into the tool's updatedInput so claude resolves it
+// without ever rendering its pane TUI selector. (multiSelect / free-text are
+// not handled yet — only the listed options.)
+function isAskQuestion(p) {
+  return p.tool_name === 'AskUserQuestion'
+    && p.tool_input && Array.isArray(p.tool_input.questions) && p.tool_input.questions.length > 0;
+}
+
+// previewBlock renders an option's optional `preview` as raw monospace text;
+// a tall preview just scrolls inside its box. Deliberately tiny — `preview` is
+// a rare field and not worth more than this.
+function previewBlock(preview) {
+  return preview ? `<span class="qopt-preview">${esc(preview)}</span>` : '';
+}
+
+function renderAskQuestion(p, sid) {
+  const blocks = p.tool_input.questions.map((q, qi) => {
+    const opts = (q.options || []).map((o, oi) => `
+      <button class="qopt" data-qi="${qi}" data-oi="${oi}">
+        <span class="qopt-label">${esc(o.label || '')}</span>
+        ${o.description ? `<span class="qopt-desc">${esc(o.description)}</span>` : ''}
+        ${previewBlock(o.preview)}
+      </button>`).join('');
+    return `
+      <div class="question">
+        ${q.header ? `<div class="q-header">${esc(q.header)}</div>` : ''}
+        <div class="q-text">${esc(q.question || '')}${q.multiSelect ? ' <span class="q-multi">(select all that apply)</span>' : ''}</div>
+        <div class="q-options">${opts}</div>
+        <input class="qother" data-qi="${qi}" type="text" placeholder="or type your own answer…">
+      </div>`;
+  }).join('');
+  return `
+    <div class="interaction ask" data-id="${esc(p.id)}">
+      <div class="meta"><strong>question</strong><span class="muted">session ${esc(sid)}</span></div>
+      ${blocks}
+      <div class="actions">
+        <button class="qignore">ignore</button>
+        <button class="qsubmit" disabled>answer</button>
+      </div>
+    </div>`;
+}
+
+function renderPermission(p, sid) {
+  let inputJSON = '';
+  try { inputJSON = JSON.stringify(p.tool_input || {}, null, 2); }
+  catch { inputJSON = String(p.tool_input || ''); }
+  const matcher = deriveMatcherPreview(p.tool_name, p.tool_input);
+  return `
+    <div class="interaction" data-id="${esc(p.id)}">
+      <div class="meta">
+        <strong>${esc(p.tool_name || p.event)}</strong>
+        <span class="muted">session ${esc(sid)}</span>
+      </div>
+      <pre class="tool-input">${esc(inputJSON)}</pre>
+      <div class="actions">
+        <button class="allow primary" data-scope="once">allow</button>
+        <button class="allow secondary" data-scope="session" title="auto-allow ${esc(matcher)} for this session">allow always</button>
+        <button class="deny secondary" data-scope="session" title="auto-deny ${esc(matcher)} for this session">deny always</button>
+        <button class="deny primary" data-scope="once">deny</button>
+      </div>
+    </div>`;
+}
+
+// wireAskQuestion drives the choice picker. Each question takes an answer that
+// is one of: a listed option, several options (when multiSelect), or free text
+// (the always-available "Other", matching the native tool) — picking options
+// clears the free text and vice-versa. multiSelect picks are joined with ", "
+// (the format the native tool emits). The answer button enables once every
+// question has an answer; "ignore" denies the tool, which claude treats as
+// "skip the question, continue in chat". Answers go back as question -> string
+// in one response.
+function wireAskQuestion(node, id) {
+  const p = pendingInteractions.find(x => x.id === id);
+  if (!p) return;
+  const qs = p.tool_input.questions;
+  const submit = node.querySelector('.qsubmit');
+  const otherOf = qi => node.querySelector(`.qother[data-qi="${qi}"]`);
+  const answerOf = qi => {
+    const typed = otherOf(qi).value.trim();
+    if (typed) return typed;
+    // Join all selected labels — a single-select question has at most one.
+    return [...node.querySelectorAll(`.qopt.selected[data-qi="${qi}"]`)]
+      .map(s => (qs[+qi].options[+s.dataset.oi] || {}).label || '').join(', ');
+  };
+  const recompute = () => {
+    submit.disabled = qs.some((_, qi) => !answerOf(qi));
+  };
+  node.querySelectorAll('.qopt').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const qi = btn.dataset.qi;
+      if (qs[+qi].multiSelect) {
+        btn.classList.toggle('selected'); // multi: toggle, leave others
+      } else {
+        node.querySelectorAll(`.qopt[data-qi="${qi}"]`).forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected'); // single: radio
+      }
+      otherOf(qi).value = ''; // picking an option clears its free-text
+      recompute();
+    });
+  });
+  node.querySelectorAll('.qother').forEach(inp => {
+    inp.addEventListener('input', () => {
+      if (inp.value.trim()) { // typing clears the radio selection for that question
+        node.querySelectorAll(`.qopt[data-qi="${inp.dataset.qi}"]`).forEach(b => b.classList.remove('selected'));
+      }
+      recompute();
+    });
+  });
+  node.querySelector('.qignore').addEventListener('click',
+    () => respond(id, 'deny', 'once', 'The user declined to answer; continue in the conversation.'));
+  submit.addEventListener('click', () => {
+    const answers = {};
+    qs.forEach((q, qi) => { answers[q.question] = answerOf(qi); });
+    respondAnswers(id, answers);
+  });
+}
+
 function renderInteractions() {
   let modal = document.getElementById('modal');
   if (!pendingInteractions.length) {
@@ -943,35 +1078,21 @@ function renderInteractions() {
   }
   const items = pendingInteractions.map(p => {
     const sid = (p.session_id || '').slice(0, 8) || '(unknown)';
-    let inputJSON = '';
-    try { inputJSON = JSON.stringify(p.tool_input || {}, null, 2); }
-    catch { inputJSON = String(p.tool_input || ''); }
-    const matcher = deriveMatcherPreview(p.tool_name, p.tool_input);
-    return `
-      <div class="interaction" data-id="${esc(p.id)}">
-        <div class="meta">
-          <strong>${esc(p.tool_name || p.event)}</strong>
-          <span class="muted">session ${esc(sid)}</span>
-        </div>
-        <pre class="tool-input">${esc(inputJSON)}</pre>
-        <div class="actions">
-          <button class="allow primary" data-scope="once">allow</button>
-          <button class="allow secondary" data-scope="session" title="auto-allow ${esc(matcher)} for this session">allow always</button>
-          <button class="deny secondary" data-scope="session" title="auto-deny ${esc(matcher)} for this session">deny always</button>
-          <button class="deny primary" data-scope="once">deny</button>
-        </div>
-      </div>
-    `;
+    return isAskQuestion(p) ? renderAskQuestion(p, sid) : renderPermission(p, sid);
   }).join('');
   modal.innerHTML = `
     <div class="overlay"></div>
     <div class="dialog">
-      <h3>permission requests (${pendingInteractions.length})</h3>
+      <h3>pending requests (${pendingInteractions.length})</h3>
       ${items}
     </div>
   `;
   modal.querySelectorAll('.interaction').forEach(node => {
     const id = node.dataset.id;
+    if (node.classList.contains('ask')) {
+      wireAskQuestion(node, id);
+      return;
+    }
     node.querySelectorAll('button.allow,button.deny').forEach(btn => {
       btn.addEventListener('click', () => {
         const behavior = btn.classList.contains('allow') ? 'allow' : 'deny';
@@ -982,15 +1103,31 @@ function renderInteractions() {
   });
 }
 
-async function respond(id, behavior, scope) {
+async function respond(id, behavior, scope, reason) {
   try {
     await fetch('/api/interactions/' + encodeURIComponent(id) + '/respond', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ behavior, scope: scope || 'once', reason: 'via usher web UI' }),
+      body: JSON.stringify({ behavior, scope: scope || 'once', reason: reason || 'via usher web UI' }),
     });
   } catch (e) {
     console.error('respond', e);
+  }
+  pollInteractions();
+}
+
+// respondAnswers resolves an AskUserQuestion interaction: behavior "allow"
+// plus the chosen labels (question → label), which the server merges into the
+// tool's updatedInput.
+async function respondAnswers(id, answers) {
+  try {
+    await fetch('/api/interactions/' + encodeURIComponent(id) + '/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ behavior: 'allow', answers, reason: 'via usher web UI' }),
+    });
+  } catch (e) {
+    console.error('respond answers', e);
   }
   pollInteractions();
 }

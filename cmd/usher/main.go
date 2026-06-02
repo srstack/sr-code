@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"usher/internal/agent/usheragent"
+	"usher/internal/archive"
 	"usher/internal/auth"
 	"usher/internal/broker"
-	"usher/internal/archive"
 	"usher/internal/discovery"
 	"usher/internal/hook"
 	"usher/internal/mainchat"
@@ -84,6 +84,10 @@ func serve(args []string) error {
 	claudeCmd := fs.String("claude", "claude", "path to the claude binary")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
+	tmuxSocket := fs.String("tmux-socket", "usher",
+		"dedicated tmux server socket name (tmux -L <name>) holding usher's interactive claude windows")
+	maxLiveSessions := fs.Int("max-live-sessions", 8,
+		"max concurrent live interactive claude processes; least-recently-used sessions are evicted beyond this")
 	agentMode := fs.String("agent-mode", "rule",
 		"main-chat agent backend: rule | llm")
 	llmBaseURL := fs.String("llm-base-url", "https://api.openai.com/v1",
@@ -132,7 +136,7 @@ func serve(args []string) error {
 		return err
 	}
 	b := broker.New()
-	sd := sender.New(*claudeCmd, *permissionMode, logger)
+	sd := sender.New(*claudeCmd, *permissionMode, *projectsDir, *tmuxSocket, hookSockPath(*dataDir), *maxLiveSessions, logger)
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	archiveStore := archive.New(
 		filepath.Join(*dataDir, "archived.json"),

@@ -44,12 +44,18 @@ type pendingEntry struct {
 
 // Response is the user's decision on a pending interaction.
 type Response struct {
-	Behavior string `json:"behavior"`        // allow | deny
+	Behavior string `json:"behavior"` // allow | deny
 	Reason   string `json:"reason,omitempty"`
 	// Scope is "once" (default) or "session". A "session"-scope decision is
 	// remembered for the originating session and reapplied to matching
 	// future hook events without prompting the UI again.
 	Scope string `json:"scope,omitempty"`
+	// Answers resolves an AskUserQuestion tool call: each entry maps a
+	// question (verbatim from the tool input) to the option label the user
+	// chose in the web UI. When set, the server merges it into the tool's
+	// updatedInput so claude proceeds with the answer instead of blocking on
+	// the pane TUI selector. Behavior is "allow" in this case.
+	Answers map[string]string `json:"answers,omitempty"`
 }
 
 // Rule is a remembered allow/deny decision derived from a Response with
@@ -159,6 +165,13 @@ func (m *Manager) persistAutoApprove() {
 // Remembered rules win over auto-approve so explicit deny-always opt-outs
 // survive later blanket trust toggles.
 func (m *Manager) QuickDecide(ev Event) (Response, bool) {
+	// AskUserQuestion can't be settled without a chosen answer: a bare "allow"
+	// (from a remembered rule or blanket auto-approve) just lets the tool run
+	// and block on the pane TUI selector — the very thing usher routes around.
+	// Always defer it to the web UI for an explicit per-call choice.
+	if ev.ToolName == "AskUserQuestion" {
+		return Response{}, false
+	}
 	if rule := m.findMatchingRule(ev); rule != nil {
 		return Response{
 			Behavior: rule.Behavior,

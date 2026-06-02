@@ -50,6 +50,7 @@
   --warning-border: #b08800;
   --warning-text: #8a6700;
   --success: #1a7f37;
+  --live-dot: #1f9e53; /* green for the session status dot */
 
   /* Overlays / shadows */
   --shadow-sidebar: rgba(0, 0, 0, 0.15);
@@ -162,8 +163,8 @@ body {
 }
 .sidebar-list li.sidebar-item a.active { background: var(--bg-accent); color: var(--accent); font-weight: 500; }
 .sidebar-list li.sidebar-item a .running-dot {
+  margin-left: 0;
   margin-right: 0.25rem;
-  color: var(--success);
   font-size: 0.7rem;
 }
 .kebab-btn {
@@ -607,11 +608,28 @@ pre.raw-markdown {
   letter-spacing: 0;
 }
 
+/* Session status dot. "live" (warm process, idle) is a DIM solid green dot —
+   present but quiet, so a row of idle sessions doesn't shout and full
+   brightness is reserved for actual activity. */
 .running-dot {
   margin-left: 0.5rem;
   font-size: 0.75rem;
-  color: var(--success);
+  color: var(--live-dot);
   font-weight: 500;
+  opacity: 0.5;
+}
+
+/* "running" (executing) is brighter and breathes — a symmetric 4s cycle
+   between full brightness and a dim trough. The animation drives opacity, so
+   it overrides the dim live base (0.5) and peaks at full brightness. */
+.running-dot.executing { animation: breathe 4s ease-in-out infinite; }
+@keyframes breathe {
+  0%, 100% { opacity: 1; }   /* peak */
+  50%      { opacity: 0.3; } /* trough */
+}
+@media (prefers-reduced-motion: reduce) {
+  /* No motion: keep running at full brightness so it still outranks dim live. */
+  .running-dot.executing { animation: none; opacity: 1; }
 }
 
 .auto-dot {
@@ -711,6 +729,83 @@ pre.raw-markdown {
 }
 .interaction button:hover { filter: brightness(0.95); }
 
+/* AskUserQuestion picker (interaction.ask) */
+/* A divider above every question — including the first, to set it off from
+   the meta header — and between subsequent ones. */
+.interaction.ask .question {
+  margin-bottom: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-muted);
+}
+.interaction.ask .q-header {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
+}
+.interaction.ask .q-text { font-size: 0.92rem; margin-bottom: 0.5rem; }
+.interaction.ask .q-multi { color: var(--text-muted); font-size: 0.78rem; }
+.interaction.ask .q-options { display: flex; flex-direction: column; gap: 0.35rem; }
+.interaction.ask .qopt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+}
+.interaction.ask .qopt.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.interaction.ask .qopt-label { font-size: 0.88rem; }
+.interaction.ask .qopt-desc { font-size: 0.78rem; color: var(--text-muted); }
+.interaction.ask .qopt-preview {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.3rem;
+  padding: 0.3rem 0.45rem;
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre;
+  background: var(--bg-subtle);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+.interaction.ask .qother {
+  margin-top: 0.4rem;
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 1rem; /* >=16px: avoid iOS focus zoom */
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-chrome);
+  color: var(--text);
+}
+.interaction.ask .qother:focus { outline: none; border-color: var(--accent); }
+.interaction.ask .actions { justify-content: flex-end; }
+.interaction.ask .qignore {
+  background: var(--bg-canvas);
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+}
+.interaction.ask .qsubmit {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+.interaction.ask .qsubmit:disabled { opacity: 0.5; cursor: default; }
+
 .new-cwd-field {
   display: flex;
   align-items: center;
@@ -781,6 +876,7 @@ pre.raw-markdown {
     --warning-border: #d29922;
     --warning-text: #d29922;
     --success: #3fb950;
+    --live-dot: #56d98e; /* green for the session status dot */
 
     --shadow-sidebar: rgba(0, 0, 0, 0.5);
     --shadow-modal: rgba(0, 0, 0, 0.6);

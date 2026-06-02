@@ -336,6 +336,21 @@ func TestQuickDecide(t *testing.T) {
 	}
 }
 
+// AskUserQuestion must never be settled by QuickDecide: a bare "allow" from
+// auto-approve or a remembered rule would let the tool block on the pane TUI
+// selector instead of being answered through the web UI.
+func TestQuickDecideSkipsAskUserQuestion(t *testing.T) {
+	m := New("")
+	m.SetAutoApprove("s", true)
+	if resp, ok := m.QuickDecide(Event{SessionID: "s", ToolName: "AskUserQuestion"}); ok {
+		t.Errorf("AskUserQuestion under auto-approve = (%+v,%v); want (zero,false)", resp, ok)
+	}
+	// Sanity: a different tool in the same session is still auto-approved.
+	if _, ok := m.QuickDecide(Event{SessionID: "s", ToolName: "Read"}); !ok {
+		t.Errorf("Read under auto-approve should still settle")
+	}
+}
+
 func TestAutoApprovePersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "auto-approve.json")

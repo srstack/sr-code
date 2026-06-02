@@ -66,11 +66,15 @@ func runSetup(args []string) error {
 				map[string]any{
 					"type":    "command",
 					"command": cmd,
-					// 60s gives the user enough time to react in the modal
-					// without leaving Claude blocked indefinitely. If the
-					// hook times out it returns no decision and Claude
-					// proceeds with its default permission flow.
-					"timeout": 60,
+					// Effectively unbounded (7 days). The permission request is
+					// resolved by a human via usher's web UI, who may take a
+					// while (checking from a phone, away from the desk). If this
+					// hook times out, interactive claude falls back to the TUI
+					// permission prompt INSIDE its tmux pane — which usher's web
+					// UI can no longer answer, stranding the turn. So we never
+					// want it to time out in practice. (Can't be truly infinite:
+					// Claude's setTimeout caps near ~24.8 days; 7d stays safe.)
+					"timeout": 604800,
 				},
 			},
 		})
@@ -97,7 +101,7 @@ func runSetup(args []string) error {
 		fmt.Printf("installed usher hook in %s\n", settingsPath)
 		fmt.Printf("  matcher: (all tools)\n")
 		fmt.Printf("  command: %s\n", cmd)
-		fmt.Printf("  timeout: 60s\n")
+		fmt.Printf("  timeout: 604800s (7d — effectively unbounded; web UI resolves permissions)\n")
 		fmt.Println()
 		fmt.Println("Re-run with --remove to uninstall.")
 	}

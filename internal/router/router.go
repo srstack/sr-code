@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -56,13 +57,17 @@ func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Man
 
 // --- session reads -------------------------------------------------------
 
-// ListSessions returns sessions decorated with their current run state.
+// ListSessions returns sessions decorated with their current run state: a
+// turn in flight is "running"; otherwise a warm pooled process is "live".
 func (r *Router) ListSessions() []core.Session {
 	sessions := r.discovery.List()
+	live := sliceToSet(r.sender.LiveSessions())
 	r.sendMu.Lock()
 	for i := range sessions {
 		if _, running := r.activeSend[sessions[i].ID]; running {
 			sessions[i].Status = core.StatusRunning
+		} else if live[sessions[i].ID] {
+			sessions[i].Status = core.StatusLive
 		}
 	}
 	r.sendMu.Unlock()
@@ -75,11 +80,22 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 		return sess, false
 	}
 	r.sendMu.Lock()
-	if _, running := r.activeSend[id]; running {
-		sess.Status = core.StatusRunning
-	}
+	_, running := r.activeSend[id]
 	r.sendMu.Unlock()
+	if running {
+		sess.Status = core.StatusRunning
+	} else if r.sender.Has(id) {
+		sess.Status = core.StatusLive
+	}
 	return sess, true
+}
+
+func sliceToSet(xs []string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
 }
 
 func (r *Router) SessionPath(id string) (string, bool) {
@@ -198,15 +214,19 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 	tok.cancel()
 }
 
-// CancelSend cancels the most recent send for sessionID. Subprocesses claude
-// has already serialized into its own queue keep running; we only stop the
-// one currently driving stdout.
+// CancelSend stops the in-flight turn for sessionID. It both cancels usher's
+// tail goroutine (tok.cancel) and interrupts the live interactive claude with
+// Ctrl-C — the process is persistent now, so cancelling the listener alone
+// would leave claude generating into the void.
 func (r *Router) CancelSend(sessionID string) error {
 	r.sendMu.Lock()
 	tok, ok := r.activeSend[sessionID]
 	r.sendMu.Unlock()
 	if !ok {
 		return errors.New("no active send")
+	}
+	if err := r.sender.Interrupt(sessionID); err != nil {
+		slog.Warn("interrupt session turn", "session", sessionID, "err", err)
 	}
 	tok.cancel()
 	return nil
@@ -224,18 +244,19 @@ func (r *Router) RespondInteraction(id string, resp hook.Response) error {
 	return r.hooks.Respond(id, resp)
 }
 
-// HandleHook applies per-session trust first (works for all callers),
-// then only blocks for the web UI when usher owns the subprocess —
-// terminal claude has its own permission path, so an error here makes
-// Claude Code fall back to it.
+// HandleHook applies a remembered per-session decision first, then blocks for
+// the web UI when usher owns the session. Ownership = the session has a live
+// window in usher's process pool (sender.Has) — a simple membership test, NOT
+// whether a turn is currently executing. The old activeSend (turn-in-flight)
+// gate raced the send/inject/turn lifecycle and bounced mid-turn tool prompts
+// back to the pane; pool membership is the stable signal. It also keeps usher
+// from intercepting the user's own terminal/IDE claude (not in our pool), which
+// on a shared default socket would otherwise reach this same hook server.
 func (r *Router) HandleHook(ctx context.Context, ev hook.Event) (hook.Response, error) {
 	if resp, ok := r.hooks.QuickDecide(ev); ok {
 		return resp, nil
 	}
-	r.sendMu.Lock()
-	_, owned := r.activeSend[ev.SessionID]
-	r.sendMu.Unlock()
-	if !owned {
+	if !r.sender.Has(ev.SessionID) {
 		return hook.Response{}, errors.New("session not owned by usher")
 	}
 	return r.hooks.Submit(ctx, ev)
@@ -298,8 +319,14 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 				return buf.String(), nil
 			}
 			switch ev.Type {
-			case "stream_event":
-				if t := extractTextDelta(ev.Raw); t != "" {
+			case "assistant":
+				// Message granularity now (interactive claude emits no
+				// stream-json token deltas): each assistant event carries its
+				// full text blocks. Accumulate them across the turn.
+				if t := extractAssistantText(ev.Raw); t != "" {
+					if buf.Len() > 0 {
+						buf.WriteString("\n")
+					}
 					buf.WriteString(t)
 				}
 			case "subprocess.exit":
@@ -316,23 +343,28 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 	}
 }
 
-func extractTextDelta(raw json.RawMessage) string {
-	var d struct {
-		Event struct {
-			Type  string `json:"type"`
-			Delta struct {
+// extractAssistantText concatenates the text blocks of an "assistant" jsonl
+// line's message. Non-text blocks (thinking, tool_use) are skipped, so an
+// assistant turn that only calls a tool yields "".
+func extractAssistantText(raw json.RawMessage) string {
+	var o struct {
+		Message struct {
+			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
-			} `json:"delta"`
-		} `json:"event"`
+			} `json:"content"`
+		} `json:"message"`
 	}
-	if err := json.Unmarshal(raw, &d); err != nil {
+	if err := json.Unmarshal(raw, &o); err != nil {
 		return ""
 	}
-	if d.Event.Type == "content_block_delta" && d.Event.Delta.Type == "text_delta" {
-		return d.Event.Delta.Text
+	var b strings.Builder
+	for _, c := range o.Message.Content {
+		if c.Type == "text" {
+			b.WriteString(c.Text)
+		}
 	}
-	return ""
+	return b.String()
 }
 
 func extractErrorMessage(raw json.RawMessage) string {
@@ -419,8 +451,11 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 		// Forward to broker so any session-detail subscriber that opens
 		// the new tab sees the live stream too.
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
-		if ev.Type == "stream_event" {
-			if t := extractTextDelta(ev.Raw); t != "" {
+		if ev.Type == "assistant" {
+			if t := extractAssistantText(ev.Raw); t != "" {
+				if buf.Len() > 0 {
+					buf.WriteString("\n")
+				}
 				buf.WriteString(t)
 			}
 		}
