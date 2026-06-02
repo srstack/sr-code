@@ -730,10 +730,12 @@ pre.raw-markdown {
 .interaction button:hover { filter: brightness(0.95); }
 
 /* AskUserQuestion picker (interaction.ask) */
-.interaction.ask .question { margin-bottom: 0.75rem; }
-.interaction.ask .question + .question {
-  border-top: 1px solid var(--border-muted);
+/* A divider above every question — including the first, to set it off from
+   the meta header — and between subsequent ones. */
+.interaction.ask .question {
+  margin-bottom: 0.75rem;
   padding-top: 0.75rem;
+  border-top: 1px solid var(--border-muted);
 }
 .interaction.ask .q-header {
   font-size: 0.72rem;
