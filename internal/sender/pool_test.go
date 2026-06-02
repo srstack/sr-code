@@ -18,7 +18,15 @@ type fakeTmux struct {
 	windows   []string
 	exists    bool
 	cmds      [][]string
-	failSpawn bool // when set, new-session/new-window return an error
+	stdins    []string // stdin passed to each runStdin call
+	failSpawn bool     // when set, new-session/new-window return an error
+}
+
+func (f *fakeTmux) runStdin(in string, args ...string) (string, error) {
+	f.mu.Lock()
+	f.stdins = append(f.stdins, in)
+	f.mu.Unlock()
+	return f.run(args...)
 }
 
 func (f *fakeTmux) run(args ...string) (string, error) {
@@ -162,8 +170,16 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 	if err := p.inject("s1", "hello\nworld"); err != nil {
 		t.Fatal(err)
 	}
-	var sawPaste, sawEnter bool
+	var sawLoad, sawPaste, sawEnter bool
 	for _, c := range f.cmds {
+		// The prompt must be loaded via stdin (load-buffer -), never as a
+		// set-buffer argument — a long paste there is "command too long".
+		if c[0] == "set-buffer" {
+			t.Fatalf("inject must not pass the prompt as a set-buffer arg; cmds=%v", f.cmds)
+		}
+		if c[0] == "load-buffer" && contains(c, "-") {
+			sawLoad = true
+		}
 		if c[0] == "paste-buffer" && contains(c, "-p") {
 			sawPaste = true
 		}
@@ -171,8 +187,11 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 			sawEnter = true
 		}
 	}
-	if !sawPaste || !sawEnter {
-		t.Fatalf("inject should bracketed-paste then Enter; cmds=%v", f.cmds)
+	if !sawLoad || !sawPaste || !sawEnter {
+		t.Fatalf("inject should load-buffer (stdin), bracketed-paste, then Enter; cmds=%v", f.cmds)
+	}
+	if !contains(f.stdins, "hello\nworld") {
+		t.Fatalf("inject should feed the prompt via stdin; stdins=%v", f.stdins)
 	}
 }
 

@@ -23,6 +23,10 @@ const tmuxSessionName = "usher"
 type tmuxRunner interface {
 	// run executes `tmux -L <socket> <args...>` and returns combined output.
 	run(args ...string) (string, error)
+	// runStdin is run with in fed to the command's stdin. Used by load-buffer
+	// to ship a large paste without putting it on the command line, where tmux
+	// rejects it as "command too long".
+	runStdin(in string, args ...string) (string, error)
 }
 
 type execRunner struct {
@@ -31,8 +35,16 @@ type execRunner struct {
 }
 
 func (e execRunner) run(args ...string) (string, error) {
+	return e.runStdin("", args...)
+}
+
+func (e execRunner) runStdin(in string, args ...string) (string, error) {
 	full := append([]string{"-L", e.socket}, args...)
-	out, err := exec.Command(e.bin, full...).CombinedOutput()
+	cmd := exec.Command(e.bin, full...)
+	if in != "" {
+		cmd.Stdin = strings.NewReader(in)
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("tmux %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
@@ -182,10 +194,14 @@ func (p *pool) spawn(sessionID, cwd string, resume bool) error {
 // (paste-buffer -p), then submits with Enter. Bracketed paste keeps embedded
 // newlines literal and stops a leading '/' or '@' from being read as a slash
 // command or mention.
+//
+// The buffer is loaded via stdin (load-buffer -), not set-buffer -- <prompt>:
+// a long paste passed as a command argument overflows tmux's command parser
+// ("command too long"). Stdin has no such limit.
 func (p *pool) inject(sessionID, prompt string) error {
 	buf := "usher-" + sessionID
-	if _, err := p.runner.run("set-buffer", "-b", buf, "--", prompt); err != nil {
-		return fmt.Errorf("set-buffer: %w", err)
+	if _, err := p.runner.runStdin(prompt, "load-buffer", "-b", buf, "-"); err != nil {
+		return fmt.Errorf("load-buffer: %w", err)
 	}
 	if _, err := p.runner.run("paste-buffer", "-p", "-d", "-b", buf, "-t", target(sessionID)); err != nil {
 		return fmt.Errorf("paste-buffer: %w", err)
