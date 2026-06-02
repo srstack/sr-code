@@ -141,6 +141,40 @@ func TestDiscovery_SkipsNestedJSONL(t *testing.T) {
 	}
 }
 
+func TestDiscovery_RereadsMetaWhenInitiallyEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "-tmp-late", "late.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The jsonl is created empty first (claude makes the file before writing
+	// the turn) — the initial read can't find cwd/title.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDiscovery(t, tmp)
+	d.upsert(path)
+	if s, _ := d.Get("late"); s.Cwd != "" || s.Title != "" {
+		t.Fatalf("expected empty meta on first read; got cwd=%q title=%q", s.Cwd, s.Title)
+	}
+
+	// claude writes the turn; a Write event re-upserts. cwd/title must now fill
+	// in without waiting for a restart.
+	writeJSONL(t, path, "late", "/tmp/late", "hello late")
+	d.upsert(path)
+
+	s, ok := d.Get("late")
+	if !ok {
+		t.Fatal("session late missing")
+	}
+	if s.Cwd != "/tmp/late" {
+		t.Errorf("Cwd = %q, want /tmp/late after re-read", s.Cwd)
+	}
+	if s.Title == "" {
+		t.Error("Title still empty after re-read; want first-prompt fallback")
+	}
+}
+
 func TestDiscovery_ListSorted(t *testing.T) {
 	tmp := t.TempDir()
 	older := filepath.Join(tmp, "-p", "older.jsonl")

@@ -134,6 +134,24 @@ func (d *Discovery) upsert(path string) {
 
 	if known {
 		existing.LastEventAt = info.ModTime()
+		// cwd/title come from the jsonl *content*, which often isn't written
+		// yet when the file is first created — so the initial read leaves them
+		// empty. Re-read while still incomplete (Write events keep arriving as
+		// claude writes the turn) and fill them in; self-limiting once both are
+		// populated, so growing transcripts don't get re-parsed on every write.
+		if existing.Cwd == "" || existing.Title == "" {
+			if meta, err := jsonl.ReadSessionMeta(path); err == nil {
+				if existing.Cwd == "" {
+					existing.Cwd = meta.Cwd
+				}
+				if existing.Title == "" {
+					existing.Title = meta.Title
+				}
+				if existing.StartedAt.IsZero() {
+					existing.StartedAt = meta.StartedAt
+				}
+			}
+		}
 		d.mu.Lock()
 		d.sessions[id] = existing
 		d.mu.Unlock()
