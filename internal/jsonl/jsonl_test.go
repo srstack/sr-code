@@ -1,6 +1,8 @@
 package jsonl
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -126,6 +128,33 @@ func TestReadTurns(t *testing.T) {
 	}
 	if turns[2].Role != "user" || turns[2].Content != "second prompt" {
 		t.Errorf("turns[2] = %+v", turns[2])
+	}
+}
+
+func TestReadTurns_ToolResultRole(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lines := []string{
+		`{"type":"user","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"user","content":"run ls"}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"file1.txt"}]}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"user", "assistant", "tool", "assistant"}
+	if len(turns) != len(want) {
+		t.Fatalf("got %d turns, want %d: %+v", len(turns), len(want), turns)
+	}
+	for i, w := range want {
+		if turns[i].Role != w {
+			t.Errorf("turns[%d].Role = %q, want %q (content=%q)", i, turns[i].Role, w, turns[i].Content)
+		}
 	}
 }
 
