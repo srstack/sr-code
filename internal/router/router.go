@@ -34,7 +34,8 @@ type Router struct {
 	archive   *archive.Store
 
 	sendMu     sync.Mutex
-	activeSend map[string]*sendToken // sessionID -> latest send's cancel handle
+	activeSend map[string]*sendToken   // sessionID -> latest send's cancel handle
+	creating   map[string]core.Session // sessions usher is spawning, not yet on disk
 }
 
 // sendToken pairs a cancel function with a unique pointer identity so that a
@@ -52,6 +53,7 @@ func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Man
 		hooks:      h,
 		archive:    archiveStore,
 		activeSend: map[string]*sendToken{},
+		creating:   map[string]core.Session{},
 	}
 }
 
@@ -63,21 +65,36 @@ func (r *Router) ListSessions() []core.Session {
 	sessions := r.discovery.List()
 	live := sliceToSet(r.sender.LiveSessions())
 	r.sendMu.Lock()
+	known := make(map[string]bool, len(sessions))
 	for i := range sessions {
+		known[sessions[i].ID] = true
 		if _, running := r.activeSend[sessions[i].ID]; running {
 			sessions[i].Status = core.StatusRunning
 		} else if live[sessions[i].ID] {
 			sessions[i].Status = core.StatusLive
 		}
 	}
+	// Prepend sessions still being created (newest, not yet on disk) so a
+	// just-created session shows in the list before its first jsonl write.
+	var pending []core.Session
+	for id, s := range r.creating {
+		if !known[id] {
+			pending = append(pending, s)
+		}
+	}
 	r.sendMu.Unlock()
-	return sessions
+	return append(pending, sessions...)
 }
 
 func (r *Router) GetSession(id string) (core.Session, bool) {
 	sess, ok := r.discovery.Get(id)
 	if !ok {
-		return sess, false
+		// Not on disk yet — fall back to the creating-overlay so a just-spawned
+		// session's detail view opens instead of 404ing.
+		r.sendMu.Lock()
+		sess, ok = r.creating[id]
+		r.sendMu.Unlock()
+		return sess, ok
 	}
 	r.sendMu.Lock()
 	_, running := r.activeSend[id]
@@ -210,6 +227,9 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 	if cur, ok := r.activeSend[sessionID]; ok && cur == tok {
 		delete(r.activeSend, sessionID)
 	}
+	// By now the turn has written to the jsonl, so discovery owns the session;
+	// drop any creating-overlay entry (harmless no-op for ordinary sends).
+	delete(r.creating, sessionID)
 	r.sendMu.Unlock()
 	tok.cancel()
 }
@@ -390,8 +410,19 @@ func (r *Router) StartSession(cwd, initialMsg string) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tok := &sendToken{cancel: cancel}
 
+	now := time.Now()
 	r.sendMu.Lock()
 	r.activeSend[sessionID] = tok
+	// Surface the session immediately: it won't hit discovery until claude
+	// writes its first jsonl line, so without this the detail view 404s right
+	// after creation. Dropped in releaseSend, by when discovery owns it.
+	r.creating[sessionID] = core.Session{
+		ID:          sessionID,
+		Cwd:         cwd,
+		Status:      core.StatusRunning,
+		StartedAt:   now,
+		LastEventAt: now,
+	}
 	r.sendMu.Unlock()
 
 	go r.runStart(ctx, sessionID, initialMsg, cwd, tok)
