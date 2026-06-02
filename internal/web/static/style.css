@@ -616,16 +616,16 @@ pre.raw-markdown {
   font-size: 0.75rem;
   color: var(--live-dot);
   font-weight: 500;
-  opacity: 0.6;
+  opacity: 0.5;
 }
 
-/* "running" (executing) is brighter and throbs — a quick dip then slow
-   recovery (asymmetric ~0.2s/0.8s over 1s). The animation drives opacity, so
-   it overrides the dim base and peaks at full brightness. */
+/* "running" (executing) is brighter and breathes — a symmetric 4s cycle
+   between full brightness and a dim trough. The animation drives opacity, so
+   it overrides the dim live base (0.5) and peaks at full brightness. */
 .running-dot.executing { animation: breathe 4s ease-in-out infinite; }
 @keyframes breathe {
-  0%, 100% { opacity: 1; }   /* inhale peak */
-  50%      { opacity: 0.3; } /* exhale trough — symmetric, ~15/min */
+  0%, 100% { opacity: 1; }   /* peak */
+  50%      { opacity: 0.3; } /* trough */
 }
 @media (prefers-reduced-motion: reduce) {
   /* No motion: keep running at full brightness so it still outranks dim live. */
