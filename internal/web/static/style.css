@@ -398,6 +398,81 @@ body {
 .empty { color: var(--text-faint); padding: 3rem 0; text-align: center; }
 .err { color: var(--danger-text); padding: 1rem 0; }
 
+/* Session list (#/): a pinned filter box over a scrollable table. .list-scroll
+   is the scroll container — <main> is overflow:hidden, so without it a long
+   list clips with no way to scroll. */
+.list-controls {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.6rem max(1.5rem, calc((100% - 960px) / 2));
+}
+#list-cwd {
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 1rem; /* >=16px: avoid iOS focus zoom */
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-chrome);
+  color: var(--text);
+  flex: 1 1 12rem; /* fill the row; "show archived" sits at the right edge */
+}
+#list-cwd:focus { outline: none; border-color: var(--accent); }
+.archived-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.list-scroll tr.archived td { opacity: 0.6; }
+.list-scroll {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding-inline: max(1.5rem, calc((100% - 960px) / 2));
+  box-sizing: border-box;
+}
+/* Fixed layout + ellipsis: every row is one line of uniform height, long
+   titles/cwds truncate instead of wrapping. */
+.list-scroll table { table-layout: fixed; }
+.list-scroll td, .list-scroll th {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+.list-scroll col.col-cwd { width: 30%; }
+.list-scroll col.col-when { width: 12.5rem; }
+.list-scroll col.col-act { width: 2.4rem; }
+.list-scroll td.act { overflow: visible; text-align: right; padding: 0; }
+.list-scroll thead th { position: sticky; top: 0; z-index: 1; }
+/* Always-visible row action — the list is wide enough (unlike the sidebar). */
+.list-scroll .kebab-btn {
+  position: static;
+  transform: none;
+  background: transparent;
+  opacity: 1;
+  pointer-events: auto;
+  color: var(--text-faint);
+}
+.list-scroll .kebab-btn:hover { color: var(--text); }
+/* Phone: title + actions only. Collapse the cwd/last-activity tracks to 0 and
+   zero their cells — NOT display:none, which under table-layout:fixed re-maps
+   the remaining cells left and drops the action button onto a zeroed column. */
+@media (max-width: 720px) {
+  .list-scroll col.col-cwd, .list-scroll col.col-when { width: 0; }
+  .list-scroll thead th:nth-child(2), .list-scroll tbody td:nth-child(2),
+  .list-scroll thead th:nth-child(3), .list-scroll tbody td:nth-child(3) {
+    padding: 0;
+    border: 0;
+  }
+}
+
 table { width: 100%; border-collapse: collapse; }
 th, td {
   padding: 0.55rem 0.5rem;
@@ -616,7 +691,6 @@ pre.raw-markdown {
    present but quiet, so a row of idle sessions doesn't shout and full
    brightness is reserved for actual activity. */
 .running-dot {
-  margin-left: 0.5rem;
   font-size: 0.75rem;
   color: var(--live-dot);
   font-weight: 500;
