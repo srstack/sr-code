@@ -23,6 +23,14 @@ const renderModeBtn = document.getElementById('render-mode-btn');
 
 let listInterval = null;
 let currentES = null;
+// Detail-view transcript sync: the SSE renders only turns seen from
+// subprocess.started, so we re-fetch on turn-end and on reconnect to catch the
+// rest. Flags: detailStreaming (gate the reconnect re-fetch off a live turn),
+// lastTranscriptSig (skip an unchanged rebuild), currentDetailId (ignore a
+// re-fetch that resolves after the user navigated away).
+let detailStreaming = false;
+let lastTranscriptSig = '';
+let currentDetailId = null;
 // Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
@@ -382,6 +390,7 @@ async function handleKebabAction(action, id) {
 
 async function showNewSession() {
   clearListInterval();
+  currentDetailId = null;
   closeES();
   subtitle.textContent = 'new session';
 
@@ -464,6 +473,7 @@ async function showNewSession() {
 
 async function showList() {
   closeES();
+  currentDetailId = null;
   subtitle.textContent = 'discovered Claude Code sessions';
   if (!listInterval) listInterval = setInterval(loadList, 5000);
   await loadList();
@@ -513,6 +523,11 @@ async function loadList() {
 async function showDetail(id) {
   clearListInterval();
   closeES();
+  // Fresh view: reset sync state so a prior session's signature/stream flag
+  // can't suppress this one's first render.
+  currentDetailId = id;
+  lastTranscriptSig = '';
+  detailStreaming = false;
   subtitle.textContent = 'session detail';
 
   let sess;
@@ -532,12 +547,7 @@ async function showDetail(id) {
   // visible while transcript / response sections scroll. Mirrors how main
   // chat surfaces its focus block — the page header is the only sticky
   // band, no fragile second-tier sticky element.
-  subtitle.innerHTML =
-    `<span class="subtitle-left">` +
-      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
-    `</span>` +
-    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
-    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
+  renderSessionSubtitle(sess);
 
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
@@ -664,12 +674,21 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
 
   let placeholder = null;
   let accum = '';
+  let opened = false;
+  // On reconnect (not the first connect) re-fetch to fill any gap — but never
+  // mid-turn, where the live stream owns the bubble.
+  es.onopen = () => {
+    if (opened && !detailStreaming) loadTranscript(id);
+    opened = true;
+  };
 
   const onIdle = () => {
+    detailStreaming = false;
     sendBtn.disabled = false;
     if (cancelBtn) cancelBtn.hidden = true;
   };
   const onRunning = () => {
+    detailStreaming = true;
     sendBtn.disabled = true;
     if (cancelBtn) cancelBtn.hidden = false;
   };
@@ -725,6 +744,13 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
         placeholder = null;
       }
       onIdle();
+      // Reconcile to the canonical transcript: the live stream shows only
+      // assistant text, so this pulls in tool calls/results and any turn the
+      // SSE didn't witness from the start.
+      loadTranscript(id);
+      // A just-created session opened as "(untitled)"; by now the server has
+      // its real title/cwd, so refresh the header too.
+      refreshSubtitle(id);
     },
     'error': (d) => {
       const msg = d.message || JSON.stringify(d);
@@ -745,6 +771,12 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
 
   Object.entries(handlers).forEach(([name, fn]) => {
     es.addEventListener(name, (ev) => {
+      // addEventListener('error', …) also catches EventSource's native
+      // connection-error event (a plain Event on every disconnect/reconnect),
+      // which has no .data. Server-sent events always carry data:, so a
+      // missing payload means a native error — ignore it (es.onerror handles
+      // reconnect) instead of rendering a spurious "{}" error bubble.
+      if (ev.data == null) return;
       let data;
       try { data = JSON.parse(ev.data); } catch { data = { raw: ev.data }; }
       try { fn(data); } catch (e) { console.error('handler error', name, e); }
@@ -758,6 +790,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
 
 async function showMainChat(id) {
   clearListInterval();
+  currentDetailId = null;
   closeES();
   subtitle.innerHTML = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
 
@@ -827,11 +860,43 @@ async function showMainChat(id) {
   promptEl.focus();
 }
 
+function renderSessionSubtitle(sess) {
+  subtitle.innerHTML =
+    `<span class="subtitle-left">` +
+      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+    `</span>` +
+    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
+    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
+}
+
+// refreshSubtitle re-reads the session so the header picks up a title/cwd that
+// filled in after the view opened (a brand-new session opens as "(untitled)";
+// the server has the real values once the first turn lands). Guarded by
+// currentDetailId so a late fetch can't write into a view already left.
+async function refreshSubtitle(id) {
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+    if (!res.ok) return;
+    const sess = await res.json();
+    if (id !== currentDetailId) return;
+    renderSessionSubtitle(sess);
+  } catch {/* ignore */}
+}
+
 async function loadTranscript(id) {
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=100');
     if (!res.ok) return;
     const turns = (await res.json()) || [];
+    // A late re-fetch must not render into a view the user already left.
+    if (id !== currentDetailId) return;
+    // Transcripts are append-only, so a change shows up as a longer list or a
+    // mutated last turn. Skip the rebuild when nothing changed (no flicker /
+    // scroll yank when there's nothing new).
+    const last = turns[turns.length - 1];
+    const sig = turns.length + ':' + (last ? JSON.stringify(last) : '');
+    if (sig === lastTranscriptSig) return;
+    lastTranscriptSig = sig;
     const el = document.getElementById('chat-scroll');
     if (!el) return;
     // Wipe transient prior content (loading stub + any messages) but

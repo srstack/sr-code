@@ -598,6 +598,10 @@ pre.raw-markdown {
 .chat-message.user .role { color: var(--accent); }
 .chat-message.agent .role { color: var(--purple); }
 .chat-message.error .role { color: var(--danger); }
+/* Tool output (tool_result) — recorded as a user-role jsonl message but shown
+   as its own muted role so it doesn't read as something the user typed. */
+.chat-message.tool .role { color: var(--text-faint); }
+.chat-message.tool .content { color: var(--text-muted); }
 .chat-message.placeholder .content { color: var(--text-disabled); font-style: italic; }
 .chat-message .content { margin: 0; }
 .chat-message .role .ts {

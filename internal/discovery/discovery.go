@@ -134,6 +134,22 @@ func (d *Discovery) upsert(path string) {
 
 	if known {
 		existing.LastEventAt = info.ModTime()
+		// cwd/title come from jsonl content written after the file appears, so
+		// the first read can miss them; re-read while either is still empty
+		// (self-limiting once both are set — no re-parse on every later write).
+		if existing.Cwd == "" || existing.Title == "" {
+			if meta, err := jsonl.ReadSessionMeta(path); err == nil {
+				if existing.Cwd == "" {
+					existing.Cwd = meta.Cwd
+				}
+				if existing.Title == "" {
+					existing.Title = meta.Title
+				}
+				if existing.StartedAt.IsZero() {
+					existing.StartedAt = meta.StartedAt
+				}
+			}
+		}
 		d.mu.Lock()
 		d.sessions[id] = existing
 		d.mu.Unlock()

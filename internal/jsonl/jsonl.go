@@ -170,7 +170,7 @@ func ReadTurns(path string, limit int) ([]Turn, error) {
 		if content == "" {
 			continue
 		}
-		turns = append(turns, Turn{Role: ev.Type, Content: content, Time: ev.Timestamp})
+		turns = append(turns, Turn{Role: turnRole(ev.Type, ev.Message), Content: content, Time: ev.Timestamp})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
@@ -179,6 +179,38 @@ func ReadTurns(path string, limit int) ([]Turn, error) {
 		turns = turns[len(turns)-limit:]
 	}
 	return turns, nil
+}
+
+// turnRole maps a jsonl event type to a transcript role. user/assistant keep
+// their type, except a "user" event whose content is a tool_result: Claude
+// Code records tool output as a user-role message, so without this it would
+// render as something the user typed. Reclassify it as "tool".
+func turnRole(eventType string, msg json.RawMessage) string {
+	if eventType == "user" && hasToolResult(msg) {
+		return "tool"
+	}
+	return eventType
+}
+
+func hasToolResult(msg json.RawMessage) bool {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return false
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 // extractTextContent flattens a message body (string OR array of blocks) into
