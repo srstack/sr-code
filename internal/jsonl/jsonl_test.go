@@ -158,6 +158,73 @@ func TestReadTurns_ToolResultRole(t *testing.T) {
 	}
 }
 
+func TestReadTurns_RichToolResults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lines := []string{
+		// Edit: tool_use carries name+file_path; toolUseResult carries the diff.
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/repo/foo.go"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"The file has been updated."}]},"toolUseResult":{"filePath":"/repo/foo.go","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":2,"lines":["-old","+new1","+new2"]}]}}`,
+		// Read: file content lives in toolUseResult.file.content.
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/repo/bar.go"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","content":"1\tpackage bar"}]},"toolUseResult":{"type":"text","file":{"filePath":"/repo/bar.go","content":"package bar\n"}}}`,
+		// Bash: stdout in toolUseResult; summary uses the command from input.
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"go test ./...\nsecond line"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:05.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":"ok"}]},"toolUseResult":{"stdout":"ok  usher  0.01s","stderr":""}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tools []Turn
+	for _, tn := range turns {
+		if tn.Role == "tool" {
+			tools = append(tools, tn)
+		}
+	}
+	if len(tools) != 3 {
+		t.Fatalf("got %d tool turns, want 3: %+v", len(tools), turns)
+	}
+
+	edit := tools[0]
+	if !strings.Contains(edit.Content, "```diff") || !strings.Contains(edit.Content, "@@ -1,1 +1,2 @@") {
+		t.Errorf("edit content missing diff fence/hunk: %q", edit.Content)
+	}
+	if !strings.Contains(edit.Content, "+new1") || !strings.Contains(edit.Content, "-old") {
+		t.Errorf("edit content missing diff lines: %q", edit.Content)
+	}
+
+	read := tools[1]
+	if !strings.Contains(read.Content, "package bar") || strings.Contains(read.Content, "```diff") {
+		t.Errorf("read content = %q", read.Content)
+	}
+
+	bash := tools[2]
+	if !strings.Contains(bash.Content, "ok  usher  0.01s") {
+		t.Errorf("bash content = %q", bash.Content)
+	}
+}
+
+func TestRenderToolResult_FallbackUnknownShape(t *testing.T) {
+	// A tool with no special-cased toolUseResult shape falls back to the inline
+	// tool_result text.
+	ev, _ := ParseLine([]byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"g1","content":"match.go\nother.go"}]},"toolUseResult":{"mode":"files_with_matches","numFiles":2}}`))
+	if body := renderToolResult(ev); !strings.Contains(body, "match.go") {
+		t.Errorf("fallback body = %q", body)
+	}
+}
+
+func TestFence_WidensPastBackticks(t *testing.T) {
+	// Body containing a ``` run must be wrapped in a longer fence.
+	out := fence("", "a\n```\nb")
+	if !strings.HasPrefix(out, "````\n") || !strings.HasSuffix(out, "\n````") {
+		t.Errorf("fence did not widen: %q", out)
+	}
+}
+
 func TestReadTurns_Limit(t *testing.T) {
 	turns, err := ReadTurns("testdata/sample.jsonl", 1)
 	if err != nil {
@@ -182,9 +249,16 @@ func TestExtractTextContent_ToolUseAndResult(t *testing.T) {
 		{"type":"text","text":"running ls"},
 		{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}
 	]}`)
+	// tool_use is inlined as "tool: Name arg" alongside the assistant's prose.
 	got := extractTextContent(msg)
-	if !strings.Contains(got, "running ls") || !strings.Contains(got, "`tool: Bash`") {
+	if !strings.Contains(got, "running ls") || !strings.Contains(got, "`tool: Bash ls`") {
 		t.Errorf("got %q", got)
+	}
+
+	// tool_use with a file_path arg shows the path beside the tool name.
+	msgEdit := []byte(`{"role":"assistant","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/repo/foo.go"}}]}`)
+	if got := extractTextContent(msgEdit); !strings.Contains(got, "`tool: Edit /repo/foo.go`") {
+		t.Errorf("edit tool_use got %q", got)
 	}
 
 	// tool_result with string content

@@ -10,6 +10,7 @@ package jsonl
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,12 @@ type Event struct {
 	Cwd       string          `json:"cwd,omitempty"`
 	UUID      string          `json:"uuid,omitempty"`
 	Message   json.RawMessage `json:"message,omitempty"`
+
+	// ToolUseResult is a line-level sibling of Message that Claude Code attaches
+	// to tool_result events. It carries the rich payload — Edit/Write diff
+	// (structuredPatch), Read file content, Bash stdout/stderr — that the inline
+	// message.content does not, so it is the source for rendering tool turns.
+	ToolUseResult json.RawMessage `json:"toolUseResult,omitempty"`
 
 	// Title appears on type=ai-title events. Field name is opportunistic —
 	// if Claude Code uses a different key we will fall back to other heuristics
@@ -139,7 +146,7 @@ func truncate(s string, n int) string {
 
 // Turn is a flattened, display-ready projection of a session jsonl line.
 type Turn struct {
-	Role    string    `json:"role"`    // "user" | "assistant"
+	Role    string    `json:"role"`    // "user" | "assistant" | "tool"
 	Content string    `json:"content"` // human-readable text (tool calls inlined)
 	Time    time.Time `json:"ts"`
 }
@@ -166,11 +173,17 @@ func ReadTurns(path string, limit int) ([]Turn, error) {
 		if ev.Type != "user" && ev.Type != "assistant" {
 			continue
 		}
-		content := extractTextContent(ev.Message)
+		role := turnRole(ev.Type, ev.Message)
+		var content string
+		if role == "tool" {
+			content = renderToolResult(ev)
+		} else {
+			content = extractTextContent(ev.Message)
+		}
 		if content == "" {
 			continue
 		}
-		turns = append(turns, Turn{Role: turnRole(ev.Type, ev.Message), Content: content, Time: ev.Timestamp})
+		turns = append(turns, Turn{Role: role, Content: content, Time: ev.Timestamp})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
@@ -214,9 +227,10 @@ func hasToolResult(msg json.RawMessage) bool {
 }
 
 // extractTextContent flattens a message body (string OR array of blocks) into
-// a single readable string. Tool uses become "[tool: Name]" annotations and
-// tool results become "[result: ...]" so transcripts remain useful even when
-// the assistant turn was mostly tool-driven.
+// a single readable string. Tool uses become "`tool: Name arg`" annotations
+// (the call/req, shown inline in the assistant turn) so transcripts read
+// top-to-bottom even when the assistant turn was mostly tool-driven; the tool's
+// result is a separate "tool" turn rendered by renderToolResult.
 func extractTextContent(msg json.RawMessage) string {
 	var m struct {
 		Content json.RawMessage `json:"content"`
@@ -232,6 +246,7 @@ func extractTextContent(msg json.RawMessage) string {
 		Type    string          `json:"type"`
 		Text    string          `json:"text"`
 		Name    string          `json:"name"`
+		Input   json.RawMessage `json:"input"`
 		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(m.Content, &blocks); err != nil {
@@ -245,11 +260,16 @@ func extractTextContent(msg json.RawMessage) string {
 				parts = append(parts, b.Text)
 			}
 		case "tool_use":
-			// Wrap in backticks so the markdown renderer treats it as inline
-			// code (distinct visual + non-link). snarkdown otherwise sees
-			// `[tool: Bash]` as a malformed reference link.
+			// The call (req) shown inline in the assistant turn, with its key
+			// argument (path / command / pattern) appended so it reads like
+			// "tool: Read /repo/foo.go". Wrapped in backticks so the markdown
+			// renderer treats it as inline code, not a malformed reference link.
 			if b.Name != "" {
-				parts = append(parts, "`tool: "+b.Name+"`")
+				label := "tool: " + b.Name
+				if t := toolTarget(b.Input); t != "" {
+					label += " " + t
+				}
+				parts = append(parts, "`"+strings.ReplaceAll(label, "`", "'")+"`")
 			}
 		case "tool_result":
 			if txt := flattenToolResult(b.Content); txt != "" {
@@ -287,4 +307,174 @@ func flattenToolResult(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// renderToolResult produces the display body for a tool_result ("tool") turn.
+// It is built from the line-level toolUseResult, which carries the rich payload
+// (Edit/Write diff, Read file content, Bash output) that the inline
+// message.content does not; tools whose shape we do not special-case fall back
+// to the inline tool_result text.
+func renderToolResult(ev Event) string {
+	var tur toolUseResultData
+	if len(ev.ToolUseResult) > 0 {
+		_ = json.Unmarshal(ev.ToolUseResult, &tur)
+	}
+	if body := tur.render(); body != "" {
+		return body
+	}
+	return clampBody(flattenToolResult(firstToolResultContent(ev.Message)))
+}
+
+// firstToolResultContent returns the raw content of the first tool_result block
+// in a message body.
+func firstToolResultContent(msg json.RawMessage) json.RawMessage {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return nil
+	}
+	var blocks []struct {
+		Type    string          `json:"type"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return nil
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			return b.Content
+		}
+	}
+	return nil
+}
+
+// patchHunk is one hunk of a Claude Code structuredPatch. Its Lines already
+// carry the unified-diff prefix (' ', '+', '-'), so they drop straight into a
+// diff fence.
+type patchHunk struct {
+	OldStart int      `json:"oldStart"`
+	OldLines int      `json:"oldLines"`
+	NewStart int      `json:"newStart"`
+	NewLines int      `json:"newLines"`
+	Lines    []string `json:"lines"`
+}
+
+// toolUseResultData decodes the shapes of toolUseResult we render richly. Edit
+// and Write carry structuredPatch; Read carries File; Bash carries Stdout/
+// Stderr. Unknown shapes leave every field zero and render() returns "".
+type toolUseResultData struct {
+	StructuredPatch []patchHunk `json:"structuredPatch"`
+	File            *struct {
+		Content string `json:"content"`
+	} `json:"file"`
+	Stdout string `json:"stdout"`
+	Stderr string `json:"stderr"`
+}
+
+// render turns the structured payload into a fenced markdown block, or "" when
+// the shape is not one we special-case (caller falls back to inline text).
+func (t toolUseResultData) render() string {
+	switch {
+	case len(t.StructuredPatch) > 0:
+		return fence("diff", clampBody(patchBody(t.StructuredPatch)))
+	case t.File != nil && t.File.Content != "":
+		return fence("", clampBody(t.File.Content))
+	case t.Stdout != "" || t.Stderr != "":
+		out := t.Stdout
+		if t.Stderr != "" {
+			if out != "" {
+				out += "\n"
+			}
+			out += t.Stderr
+		}
+		return fence("", clampBody(out))
+	}
+	return ""
+}
+
+// patchBody renders structuredPatch hunks as unified-diff text (no fence).
+func patchBody(hunks []patchHunk) string {
+	var b strings.Builder
+	for i, h := range hunks {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@", h.OldStart, h.OldLines, h.NewStart, h.NewLines)
+		for _, ln := range h.Lines {
+			b.WriteByte('\n')
+			b.WriteString(ln)
+		}
+	}
+	return b.String()
+}
+
+// toolTarget picks the most informative argument to show beside a tool name: a
+// file path, else a shell command (first line), else a search pattern.
+func toolTarget(input json.RawMessage) string {
+	if p := inputString(input, "file_path"); p != "" {
+		return p
+	}
+	if cmd := inputString(input, "command"); cmd != "" {
+		return firstLine(cmd)
+	}
+	if pat := inputString(input, "pattern"); pat != "" {
+		return pat
+	}
+	return ""
+}
+
+// inputString reads a string field from a tool_use input object, "" if absent.
+func inputString(input json.RawMessage, key string) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(m[key], &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+// fence wraps body in a markdown code fence whose backtick run is widened past
+// any run inside body, so a payload containing ``` cannot close the block early.
+func fence(lang, body string) string {
+	longest, run := 0, 0
+	for _, r := range body {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	ticks := strings.Repeat("`", max(3, longest+1))
+	return ticks + lang + "\n" + body + "\n" + ticks
+}
+
+// clampBody caps a tool body so one huge file or output cannot bloat the
+// transcript payload. Generous, because the block is collapsed by default.
+func clampBody(s string) string {
+	const maxBytes = 32 * 1024
+	const maxLines = 400
+	if len(s) > maxBytes {
+		s = s[:maxBytes] + "\n… (truncated)"
+	}
+	if lines := strings.Split(s, "\n"); len(lines) > maxLines {
+		s = strings.Join(append(lines[:maxLines], "… (truncated)"), "\n")
+	}
+	return s
 }
