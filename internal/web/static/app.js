@@ -1006,8 +1006,9 @@ async function loadTranscript(id, opts) {
     const last = turns[turns.length - 1];
     const sig = turns.length + ':' + (last ? JSON.stringify(last) : '');
     if (sig === lastTranscriptSig) { updateLoadEarlier(id); return; }
-    lastTranscriptSig = sig;
     const el = document.getElementById('chat-scroll');
+    // Can't render now (view mid-transition): leave lastTranscriptSig untouched
+    // so the next call retries this state instead of skipping it forever.
     if (!el) return;
     // Capture stick-to-bottom intent before any mutation changes the geometry.
     const wasAtBottom = isNearBottom(el);
@@ -1015,6 +1016,15 @@ async function loadTranscript(id, opts) {
     // user/assistant placeholders) — they're about to be represented by their
     // canonical turns from this fetch.
     el.querySelectorAll(':scope > .chat-loading, :scope > .chat-message.optimistic').forEach(n => n.remove());
+    const committed = () => el.querySelectorAll(':scope > .chat-message:not(.optimistic)');
+    // Self-heal: if our tracked turns drifted from what's actually in the DOM
+    // (an earlier early-return, a caught exception, or a race), rebuild from
+    // scratch. The old loadTranscript was stateless and so always matched the
+    // server; this keeps the incremental path from silently losing an update.
+    if (renderedTurns.length !== committed().length) {
+      committed().forEach(n => n.remove());
+      renderedTurns = [];
+    }
     if (!turns.length) {
       renderedTurns.forEach(r => r.node.remove());
       renderedTurns = [];
@@ -1025,6 +1035,7 @@ async function loadTranscript(id, opts) {
       const sendAnchor = el.querySelector(':scope > .send-anchor');
       if (sendAnchor) el.insertBefore(empty, sendAnchor);
       else el.appendChild(empty);
+      lastTranscriptSig = sig;
       updateLoadEarlier(id);
       return;
     }
@@ -1039,11 +1050,14 @@ async function loadTranscript(id, opts) {
     for (let i = lcp; i < renderedTurns.length; i++) renderedTurns[i].node.remove();
     renderedTurns.length = lcp;
     suppressAppendScroll = true;
-    for (let i = lcp; i < turns.length; i++) {
-      const node = appendChatMessage(turns[i]);
-      if (node) renderedTurns.push({ key: newKeys[i], node });
+    try {
+      for (let i = lcp; i < turns.length; i++) {
+        const node = appendChatMessage(turns[i]);
+        if (node) renderedTurns.push({ key: newKeys[i], node });
+      }
+    } finally {
+      suppressAppendScroll = false; // never leave it stuck, or future appends won't scroll
     }
-    suppressAppendScroll = false;
     if (opts.anchorHeight != null) {
       // "Load earlier" prepended older turns above the viewport: restore the
       // prior position by the height the prepended content added, so the reader
@@ -1053,8 +1067,11 @@ async function loadTranscript(id, opts) {
       // Only follow new turns to the bottom if the reader was already there.
       el.scrollTop = el.scrollHeight;
     }
+    // Mark this state rendered only now — a successful render — so any earlier
+    // bail-out leaves the signature stale and the next call retries.
+    lastTranscriptSig = sig;
     updateLoadEarlier(id);
-  } catch {/* ignore */}
+  } catch {/* ignore — lastTranscriptSig stays put, so the next call retries */}
 }
 
 // updateLoadEarlier shows a "load earlier" control at the top of the transcript
