@@ -45,6 +45,14 @@ let renderedTurns = [];
 const TRANSCRIPT_PAGE = 100;
 let transcriptLimit = TRANSCRIPT_PAGE;
 let transcriptTotal = 0;
+// Auto-scroll to the bottom on new content only when the user is already near
+// it, so scrolling up to read history isn't yanked back down.
+const BOTTOM_THRESHOLD = 64;
+function isNearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD; }
+// Set while a batch reconcile appends many turns so appendChatMessage skips its
+// per-append scroll — reading scrollHeight each iteration forces a synchronous
+// layout, making a big batch O(n²). The batch caller scrolls once at the end.
+let suppressAppendScroll = false;
 // Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
@@ -818,9 +826,12 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
         if (placeholder) placeholder.classList.add('optimistic');
         onRunning();
       }
+      // Follow the streaming text only if the reader is at the bottom; check
+      // before setContent grows the bubble.
+      const stick = isNearBottom(chatEl);
       accum += (accum ? '\n' : '') + text;
       setContent(placeholder, accum);
-      chatEl.scrollTop = chatEl.scrollHeight;
+      if (stick) chatEl.scrollTop = chatEl.scrollHeight;
     },
     'subprocess.exit': (d) => {
       // Canonicalize timestamps from server-persisted jsonl (set by
@@ -998,6 +1009,8 @@ async function loadTranscript(id, opts) {
     lastTranscriptSig = sig;
     const el = document.getElementById('chat-scroll');
     if (!el) return;
+    // Capture stick-to-bottom intent before any mutation changes the geometry.
+    const wasAtBottom = isNearBottom(el);
     // Drop the loading stub and any optimistic bubbles (the in-flight turn's
     // user/assistant placeholders) — they're about to be represented by their
     // canonical turns from this fetch.
@@ -1025,14 +1038,21 @@ async function loadTranscript(id, opts) {
     // front), then append everything past the common prefix.
     for (let i = lcp; i < renderedTurns.length; i++) renderedTurns[i].node.remove();
     renderedTurns.length = lcp;
+    suppressAppendScroll = true;
     for (let i = lcp; i < turns.length; i++) {
       const node = appendChatMessage(turns[i]);
       if (node) renderedTurns.push({ key: newKeys[i], node });
     }
-    // "Load earlier" prepends older turns above the viewport; appendChatMessage
-    // scrolled to the bottom, so restore the prior position by the height the
-    // newly-prepended content added — the reader stays on what they were reading.
-    if (opts.anchorHeight != null) el.scrollTop = opts.anchorTop + (el.scrollHeight - opts.anchorHeight);
+    suppressAppendScroll = false;
+    if (opts.anchorHeight != null) {
+      // "Load earlier" prepended older turns above the viewport: restore the
+      // prior position by the height the prepended content added, so the reader
+      // stays on what they were reading.
+      el.scrollTop = opts.anchorTop + (el.scrollHeight - opts.anchorHeight);
+    } else if (wasAtBottom) {
+      // Only follow new turns to the bottom if the reader was already there.
+      el.scrollTop = el.scrollHeight;
+    }
     updateLoadEarlier(id);
   } catch {/* ignore */}
 }
@@ -1089,8 +1109,11 @@ async function loadChatMessages(id) {
     const list = document.getElementById('chat-scroll');
     if (!list) return;
     list.querySelectorAll(':scope > .chat-loading, :scope > .chat-message').forEach(n => n.remove());
+    suppressAppendScroll = true;
     for (const m of data) appendChatMessage(m);
-  } catch {}
+    suppressAppendScroll = false;
+    list.scrollTop = list.scrollHeight; // fresh main-chat load lands at the bottom
+  } catch { suppressAppendScroll = false; }
 }
 
 async function loadMainChatInfo(id) {
@@ -1117,6 +1140,8 @@ function renderFocus(focus) {
 function appendChatMessage(m) {
   const list = document.getElementById('chat-scroll');
   if (!list) return null;
+  // Decide stick-to-bottom BEFORE inserting — the insert changes scrollHeight.
+  const stick = !suppressAppendScroll && isNearBottom(list);
   const div = document.createElement('div');
   const role = m.role || 'agent';
   div.className = 'chat-message ' + role + (m._placeholder ? ' placeholder' : '');
@@ -1133,7 +1158,7 @@ function appendChatMessage(m) {
   const sendAnchor = list.querySelector(':scope > .send-anchor');
   if (sendAnchor) list.insertBefore(div, sendAnchor);
   else list.appendChild(div);
-  list.scrollTop = list.scrollHeight;
+  if (stick) list.scrollTop = list.scrollHeight;
   return div;
 }
 

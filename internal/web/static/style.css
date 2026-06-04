@@ -683,11 +683,12 @@ pre.raw-markdown {
    beyond the current window; clicking grows the window by a page. */
 .load-earlier {
   display: block;
-  width: 100%;
-  margin: 0 0 0.5rem;
-  padding: 0.4rem;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto 0.5rem;
+  padding: 0.3rem 0.9rem;
   border: 1px dashed var(--border);
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--bg-subtle);
   color: var(--text-faint);
   font-size: 0.8rem;
