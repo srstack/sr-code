@@ -154,15 +154,15 @@ type Turn struct {
 // ReadTurns returns the user/assistant turns of the session at path,
 // projecting tool uses and tool results into bracketed inline annotations
 // so the transcript reads top-to-bottom in chronological order. limit > 0
-// keeps only the most recent N turns.
-func ReadTurns(path string, limit int) ([]Turn, error) {
+// keeps only the most recent N turns. total is the turn count before that
+// trim, so callers can tell whether older turns exist beyond the window.
+func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 
-	var turns []Turn
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -186,12 +186,13 @@ func ReadTurns(path string, limit int) ([]Turn, error) {
 		turns = append(turns, Turn{Role: role, Content: content, Time: ev.Timestamp})
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	total = len(turns)
 	if limit > 0 && len(turns) > limit {
 		turns = turns[len(turns)-limit:]
 	}
-	return turns, nil
+	return turns, total, nil
 }
 
 // turnRole maps a jsonl event type to a transcript role. user/assistant keep

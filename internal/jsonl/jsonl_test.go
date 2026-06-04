@@ -112,7 +112,7 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestReadTurns(t *testing.T) {
-	turns, err := ReadTurns("testdata/sample.jsonl", 0)
+	turns, _, err := ReadTurns("testdata/sample.jsonl", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestReadTurns_ToolResultRole(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	turns, err := ReadTurns(path, 0)
+	turns, _, err := ReadTurns(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestReadTurns_RichToolResults(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	turns, err := ReadTurns(path, 0)
+	turns, _, err := ReadTurns(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,12 +226,17 @@ func TestFence_WidensPastBackticks(t *testing.T) {
 }
 
 func TestReadTurns_Limit(t *testing.T) {
-	turns, err := ReadTurns("testdata/sample.jsonl", 1)
+	turns, total, err := ReadTurns("testdata/sample.jsonl", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(turns) != 1 {
 		t.Fatalf("got %d, want 1", len(turns))
+	}
+	// total reflects the full count before the limit trim, so the client can
+	// tell that older turns exist beyond the 1-turn window.
+	if total != 3 {
+		t.Errorf("total = %d, want 3", total)
 	}
 	if turns[0].Role != "user" || turns[0].Content != "second prompt" {
 		t.Errorf("limited turn = %+v", turns[0])
@@ -239,7 +244,7 @@ func TestReadTurns_Limit(t *testing.T) {
 }
 
 func TestReadTurns_Missing(t *testing.T) {
-	if _, err := ReadTurns("testdata/does-not-exist.jsonl", 0); err == nil {
+	if _, _, err := ReadTurns("testdata/does-not-exist.jsonl", 0); err == nil {
 		t.Error("expected error")
 	}
 }

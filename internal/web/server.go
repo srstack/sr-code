@@ -488,7 +488,7 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	turns, err := jsonl.ReadTurns(path, limit)
+	turns, total, err := jsonl.ReadTurns(path, limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -496,6 +496,9 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	if turns == nil {
 		turns = []jsonl.Turn{}
 	}
+	// Total turn count before the limit trim, so the client knows whether
+	// older turns exist beyond the window (to offer "load earlier").
+	w.Header().Set("X-Transcript-Total", strconv.Itoa(total))
 	writeJSON(w, http.StatusOK, turns)
 }
 

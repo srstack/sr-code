@@ -201,7 +201,7 @@ func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMess
 	if !ok {
 		return raw
 	}
-	turns, err := jsonl.ReadTurns(path, 2)
+	turns, _, err := jsonl.ReadTurns(path, 2)
 	if err != nil || len(turns) == 0 {
 		return raw
 	}
@@ -297,7 +297,7 @@ func (r *Router) ReadSessionTranscript(id string, limit int) ([]core.TranscriptT
 	if !ok {
 		return nil, errors.New("session not found")
 	}
-	turns, err := jsonl.ReadTurns(path, limit)
+	turns, _, err := jsonl.ReadTurns(path, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -39,6 +39,12 @@ let currentDetailId = null;
 // when untracked client-only bubbles — errors, optimistic placeholders — sit in
 // the same list.
 let renderedTurns = [];
+// Transcript window: render the most recent `transcriptLimit` turns; "load
+// earlier" grows it by a page and re-fetches. transcriptTotal is the server's
+// full turn count (X-Transcript-Total), used to show/hide the button.
+const TRANSCRIPT_PAGE = 100;
+let transcriptLimit = TRANSCRIPT_PAGE;
+let transcriptTotal = 0;
 // Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
@@ -595,6 +601,8 @@ async function showDetail(id) {
   currentDetailId = id;
   lastTranscriptSig = '';
   renderedTurns = [];
+  transcriptLimit = TRANSCRIPT_PAGE;
+  transcriptTotal = 0;
   detailStreaming = false;
   subtitle.textContent = 'session detail';
 
@@ -752,15 +760,21 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
     opened = true;
   };
 
+  const setLoadEarlierDisabled = (v) => {
+    const b = document.querySelector('#chat-scroll > .load-earlier');
+    if (b) b.disabled = v;
+  };
   const onIdle = () => {
     detailStreaming = false;
     sendBtn.disabled = false;
     if (cancelBtn) cancelBtn.hidden = true;
+    setLoadEarlierDisabled(false);
   };
   const onRunning = () => {
     detailStreaming = true;
     sendBtn.disabled = true;
     if (cancelBtn) cancelBtn.hidden = false;
+    setLoadEarlierDisabled(true);
   };
 
   const setRoleText = (el, text) => {
@@ -965,19 +979,22 @@ async function refreshSubtitle(id) {
   } catch {/* ignore */}
 }
 
-async function loadTranscript(id) {
+async function loadTranscript(id, opts) {
+  opts = opts || {};
   try {
-    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=100');
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=' + transcriptLimit);
     if (!res.ok) return;
     const turns = (await res.json()) || [];
     // A late re-fetch must not render into a view the user already left.
     if (id !== currentDetailId) return;
+    const total = parseInt(res.headers.get('X-Transcript-Total') || '', 10);
+    transcriptTotal = Number.isFinite(total) ? total : turns.length;
     // Transcripts are append-only, so a change shows up as a longer list or a
     // mutated last turn. Skip the rebuild when nothing changed (no flicker /
     // scroll yank when there's nothing new).
     const last = turns[turns.length - 1];
     const sig = turns.length + ':' + (last ? JSON.stringify(last) : '');
-    if (sig === lastTranscriptSig) return;
+    if (sig === lastTranscriptSig) { updateLoadEarlier(id); return; }
     lastTranscriptSig = sig;
     const el = document.getElementById('chat-scroll');
     if (!el) return;
@@ -995,6 +1012,7 @@ async function loadTranscript(id) {
       const sendAnchor = el.querySelector(':scope > .send-anchor');
       if (sendAnchor) el.insertBefore(empty, sendAnchor);
       else el.appendChild(empty);
+      updateLoadEarlier(id);
       return;
     }
     // Reconcile against what's already rendered. Transcripts are append-only,
@@ -1011,7 +1029,47 @@ async function loadTranscript(id) {
       const node = appendChatMessage(turns[i]);
       if (node) renderedTurns.push({ key: newKeys[i], node });
     }
+    // "Load earlier" prepends older turns above the viewport; appendChatMessage
+    // scrolled to the bottom, so restore the prior position by the height the
+    // newly-prepended content added — the reader stays on what they were reading.
+    if (opts.anchorHeight != null) el.scrollTop = opts.anchorTop + (el.scrollHeight - opts.anchorHeight);
+    updateLoadEarlier(id);
   } catch {/* ignore */}
+}
+
+// updateLoadEarlier shows a "load earlier" control at the top of the transcript
+// when the server holds older turns beyond the current window, and removes it
+// once the whole history is loaded. Disabled mid-turn (the window is shifting).
+function updateLoadEarlier(id) {
+  const el = document.getElementById('chat-scroll');
+  if (!el) return;
+  let btn = el.querySelector(':scope > .load-earlier');
+  const more = transcriptTotal > renderedTurns.length;
+  if (!more) { if (btn) btn.remove(); return; }
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.className = 'load-earlier';
+    btn.type = 'button';
+    btn.addEventListener('click', () => loadEarlier(id));
+    el.insertBefore(btn, el.firstChild);
+  } else if (el.firstChild !== btn) {
+    el.insertBefore(btn, el.firstChild);
+  }
+  btn.disabled = detailStreaming;
+  btn.textContent = '↑ load earlier (' + renderedTurns.length + '/' + transcriptTotal + ')';
+}
+
+// loadEarlier grows the window by a page and re-fetches, anchoring the scroll so
+// the prepended history doesn't yank the reader. No-op while a turn streams.
+async function loadEarlier(id) {
+  if (detailStreaming) return;
+  const el = document.getElementById('chat-scroll');
+  if (!el) return;
+  transcriptLimit += TRANSCRIPT_PAGE;
+  const anchorTop = el.scrollTop;
+  const anchorHeight = el.scrollHeight;
+  lastTranscriptSig = ''; // window changed — force the reconcile past the gate
+  await loadTranscript(id, { anchorTop, anchorHeight });
 }
 
 // turnKey identifies a transcript turn for incremental reconcile. Append-only

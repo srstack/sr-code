@@ -679,6 +679,22 @@ pre.raw-markdown {
 .chat-message.tool .content { color: var(--text-muted); }
 .chat-message.placeholder .content { color: var(--text-disabled); font-style: italic; }
 .chat-message .content { margin: 0; }
+/* "Load earlier" sits at the top of the transcript when older turns exist
+   beyond the current window; clicking grows the window by a page. */
+.load-earlier {
+  display: block;
+  width: 100%;
+  margin: 0 0 0.5rem;
+  padding: 0.4rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  color: var(--text-faint);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.load-earlier:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.load-earlier:disabled { opacity: 0.5; cursor: default; }
 .chat-message .role .ts {
   font-size: 0.7rem;
   color: var(--text-disabled);
