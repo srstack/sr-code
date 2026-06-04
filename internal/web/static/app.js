@@ -781,9 +781,16 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       // (no token deltas). A turn may produce several assistant messages (text
       // before a tool call, then more after); accumulate their text into the
       // one placeholder. Tool-only messages have no text and are skipped.
-      if (!placeholder) return;
       const text = assistantText(d);
       if (!text) return;
+      // subprocess.started normally creates the bubble, but a session's first
+      // turn begins before this SSE subscribes (StartSession publishes at once
+      // and the broker has no replay), so that event is missed. Create the
+      // bubble lazily on the first assistant text so turn 1 streams like the rest.
+      if (!placeholder) {
+        placeholder = appendChatMessage({ role: 'assistant', content: '' });
+        onRunning();
+      }
       accum += (accum ? '\n' : '') + text;
       setContent(placeholder, accum);
       chatEl.scrollTop = chatEl.scrollHeight;
