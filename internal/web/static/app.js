@@ -31,6 +31,14 @@ let currentES = null;
 let detailStreaming = false;
 let lastTranscriptSig = '';
 let currentDetailId = null;
+// The committed transcript turns currently in the DOM, as {key, node} in order.
+// Lets loadTranscript reconcile incrementally (append only what's new) instead
+// of wiping and re-rendering all ~100 turns on every turn-end — the latter is
+// O(n) per turn and visibly janks long, tool-heavy sessions. Tracking the nodes
+// explicitly (rather than re-querying by position) keeps the diff correct even
+// when untracked client-only bubbles — errors, optimistic placeholders — sit in
+// the same list.
+let renderedTurns = [];
 // Last sidebar HTML written to the DOM. The sidebar re-polls every 5s; skipping
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
@@ -586,6 +594,7 @@ async function showDetail(id) {
   // can't suppress this one's first render.
   currentDetailId = id;
   lastTranscriptSig = '';
+  renderedTurns = [];
   detailStreaming = false;
   subtitle.textContent = 'session detail';
 
@@ -680,8 +689,10 @@ async function showDetail(id) {
     sendBtn.disabled = true;
     promptEl.value = '';
     // Optimistic: show user message immediately. Assistant placeholder is
-    // created by openEventStream on subprocess.started.
+    // created by openEventStream on subprocess.started. Marked .optimistic so
+    // the turn-end reconcile drops it in favor of the canonical user turn.
     turnState.userNode = appendChatMessage({ role: 'user', content: text });
+    if (turnState.userNode) turnState.userNode.classList.add('optimistic');
     try {
       const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
@@ -774,6 +785,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
     'subprocess.started': () => {
       accum = '';
       placeholder = appendChatMessage({ role: 'assistant', content: '' });
+      if (placeholder) placeholder.classList.add('optimistic');
       onRunning();
     },
     'assistant': (d) => {
@@ -789,6 +801,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       // bubble lazily on the first assistant text so turn 1 streams like the rest.
       if (!placeholder) {
         placeholder = appendChatMessage({ role: 'assistant', content: '' });
+        if (placeholder) placeholder.classList.add('optimistic');
         onRunning();
       }
       accum += (accum ? '\n' : '') + text;
@@ -822,12 +835,15 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       const msg = d.message || JSON.stringify(d);
       if (placeholder) {
         updateMessageTs(placeholder, new Date().toISOString());
-        placeholder.className = 'chat-message error';
+        // Keep .optimistic: an error isn't a canonical transcript turn, so the
+        // next reconcile should clear it (matching the old full-rebuild).
+        placeholder.className = 'chat-message error optimistic';
         setRoleText(placeholder, 'error');
         setContent(placeholder, msg);
         placeholder = null;
       } else {
-        appendChatMessage({ role: 'error', content: msg, ts: new Date().toISOString() });
+        const n = appendChatMessage({ role: 'error', content: msg, ts: new Date().toISOString() });
+        if (n) n.classList.add('optimistic');
       }
       onIdle();
     },
@@ -965,10 +981,13 @@ async function loadTranscript(id) {
     lastTranscriptSig = sig;
     const el = document.getElementById('chat-scroll');
     if (!el) return;
-    // Wipe transient prior content (loading stub + any messages) but
-    // preserve the send-anchor child.
-    el.querySelectorAll(':scope > .chat-loading, :scope > .chat-message').forEach(n => n.remove());
+    // Drop the loading stub and any optimistic bubbles (the in-flight turn's
+    // user/assistant placeholders) — they're about to be represented by their
+    // canonical turns from this fetch.
+    el.querySelectorAll(':scope > .chat-loading, :scope > .chat-message.optimistic').forEach(n => n.remove());
     if (!turns.length) {
+      renderedTurns.forEach(r => r.node.remove());
+      renderedTurns = [];
       const empty = document.createElement('div');
       empty.className = 'chat-loading muted';
       empty.style.padding = '0.5rem';
@@ -978,8 +997,30 @@ async function loadTranscript(id) {
       else el.appendChild(empty);
       return;
     }
-    for (const t of turns) appendChatMessage(t);
+    // Reconcile against what's already rendered. Transcripts are append-only,
+    // so the new list shares a prefix with the old; keep that prefix's DOM
+    // untouched and only append (or, if the tail diverged, replace the tail).
+    const newKeys = turns.map(turnKey);
+    let lcp = 0;
+    while (lcp < renderedTurns.length && lcp < newKeys.length && renderedTurns[lcp].key === newKeys[lcp]) lcp++;
+    // Drop the diverged tail (last turn finalized, or the window slid past the
+    // front), then append everything past the common prefix.
+    for (let i = lcp; i < renderedTurns.length; i++) renderedTurns[i].node.remove();
+    renderedTurns.length = lcp;
+    for (let i = lcp; i < turns.length; i++) {
+      const node = appendChatMessage(turns[i]);
+      if (node) renderedTurns.push({ key: newKeys[i], node });
+    }
   } catch {/* ignore */}
+}
+
+// turnKey identifies a transcript turn for incremental reconcile. Append-only
+// turns are stable, so role + timestamp + a content fingerprint (length plus a
+// short prefix) is enough to spot the divergence point cheaply, without
+// stringifying every turn's (potentially 32KB) body on each reconcile.
+function turnKey(t) {
+  const c = t.content || '';
+  return (t.role || '') + '' + (t.ts || '') + '' + c.length + '' + c.slice(0, 48);
 }
 
 async function loadChatMessages(id) {
