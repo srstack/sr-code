@@ -23,6 +23,10 @@ const renderModeBtn = document.getElementById('render-mode-btn');
 
 let listInterval = null;
 let currentES = null;
+// The terminal-mirror SSE (the inline pane panel), tracked separately from
+// currentES so the detail view's /events stream and the mirror's /screen
+// stream can be open at once and both get torn down on navigation.
+let currentScreenES = null;
 // Detail-view transcript sync: the SSE renders only turns seen from
 // subprocess.started, so we re-fetch on turn-end and on reconnect to catch the
 // rest. Flags: detailStreaming (gate the reconnect re-fetch off a live turn),
@@ -150,6 +154,10 @@ function timeNow() {
 
 function closeES() {
   if (currentES) { currentES.close(); currentES = null; }
+  closeScreenES();
+}
+function closeScreenES() {
+  if (currentScreenES) { currentScreenES.close(); currentScreenES = null; }
 }
 function clearListInterval() {
   if (listInterval) { clearInterval(listInterval); listInterval = null; }
@@ -637,6 +645,18 @@ async function showDetail(id) {
     <div id="chat-scroll" class="chat-area">
       <div class="chat-loading muted" style="padding:0.5rem">loading…</div>
       <section class="send-anchor">
+        <div id="term-panel" class="term-panel" hidden>
+          <div class="term-screen"><pre id="term-grid" class="term-grid muted">connecting…</pre></div>
+          <div class="term-keys">
+            <button type="button" data-key="escape">esc</button>
+            <button type="button" data-key="tab">tab</button>
+            <button type="button" data-key="up" aria-label="up">↑</button>
+            <button type="button" data-key="down" aria-label="down">↓</button>
+            <button type="button" data-key="left" aria-label="left">←</button>
+            <button type="button" data-key="right" aria-label="right">→</button>
+            <button type="button" data-key="enter">⏎</button>
+          </div>
+        </div>
         <div class="input-row">
           <textarea id="prompt" placeholder="message…"></textarea>
           <button id="send">send</button>
@@ -647,6 +667,10 @@ async function showDetail(id) {
             aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
             title="when on, every PreToolUse hook for this session is allowed without prompting">
             auto-approve: ${sess.auto_approve ? 'on' : 'off'}
+          </button>
+          <button id="term-toggle" class="term-toggle" type="button" aria-pressed="false"
+            title="terminal mirror — click to cycle off → auto → on. auto reveals on send and hides when you scroll up into history; on stays pinned open.">
+            terminal: off
           </button>
         </div>
       </section>
@@ -683,6 +707,112 @@ async function showDetail(id) {
     });
   }
 
+  // Terminal mirror: a collapsible live pane docked above the input, driven by
+  // a 3-state toggle that cycles off → auto → on (persisted in localStorage):
+  //   off  — hidden, no automatic behaviour (default)
+  //   auto — reveals on send (the un-flushed turn is starting) and hides again
+  //          after a deliberate scroll up into history; re-reveals next send
+  //   on   — pinned open, never auto-hidden
+  // The /screen stream runs only while actually shown, so background sessions
+  // don't poll capture-pane. Soft keys wire once (the grid node is permanent).
+  const termToggle = document.getElementById('term-toggle');
+  const termPanel = document.getElementById('term-panel');
+  let termMode = (() => { try { return localStorage.getItem('usher.term.mode') || 'off'; } catch { return 'off'; } })();
+  let termAutoShown = false; // auto-mode runtime reveal (set by send, cleared by scroll)
+  let termShown = false;     // whether the panel is currently streaming/visible
+  let termAppliedRows = 0;   // rows last applied — gates needless restreams
+  let softKeysWired = false;
+  // Pane/box rows by mode (the client owns this policy; the server just clamps).
+  // auto is a fixed compact glance; on fills half the chat area, bounded so the
+  // input/controls below stay visible. The pane AND the viewer box are both
+  // sized from this one number, so they can't drift.
+  const TERM_ROW_PX = 16.25; // .term-grid 13px × line-height 1.25 (keep in sync with CSS)
+  const targetRows = (mode) => {
+    if (mode !== 'on') return 10;
+    const chatH = chatEl.clientHeight;
+    const roomRows = Math.floor((chatH - 6 * 16) / TERM_ROW_PX); // leave ~6rem for input
+    const halfRows = Math.floor((chatH / 2) / TERM_ROW_PX);
+    return Math.max(1, Math.min(halfRows, roomRows));
+  };
+  // applyTermVisibility resolves termMode + termAutoShown into the shown/hidden
+  // state and the pane/box size. The /screen restream is what re-applies a new
+  // pane size, so it's skipped when nothing changed (e.g. a send re-asserting an
+  // already-open auto panel) — only a real reveal or size change restreams.
+  const applyTermVisibility = () => {
+    const show = termMode === 'on' || (termMode === 'auto' && termAutoShown);
+    if (!show) {
+      if (termShown) { termShown = false; if (termPanel) termPanel.hidden = true; closeScreenES(); }
+      return;
+    }
+    const rows = targetRows(termMode);
+    if (termShown && rows === termAppliedRows) return; // already shown at this size
+    termShown = true;
+    termAppliedRows = rows;
+    if (termPanel) termPanel.hidden = false;
+    if (!softKeysWired) { wireSoftKeys(id); softKeysWired = true; }
+    const gridEl = document.getElementById('term-grid');
+    if (gridEl) {
+      const box = gridEl.parentElement;
+      // content-box: max-height is the content area, so rows×ROW_PX shows exactly
+      // `rows` lines (+a few px slack to avoid a sub-pixel scrollbar).
+      box.style.maxHeight = Math.ceil(rows * TERM_ROW_PX) + 4 + 'px';
+      openScreenStream(id, gridEl, measureCols(box), rows);
+    }
+    // The panel grows the sticky anchor; keep the chat pinned if it was.
+    if (isNearBottom(chatEl)) chatEl.scrollTop = chatEl.scrollHeight;
+  };
+  // applyTermMode reflects termMode onto the button, then resolves visibility.
+  const applyTermMode = () => {
+    if (!termToggle) return;
+    termToggle.setAttribute('data-mode', termMode);
+    termToggle.setAttribute('aria-pressed', termMode === 'off' ? 'false' : 'true');
+    termToggle.textContent = 'terminal: ' + termMode;
+    applyTermVisibility();
+  };
+  if (termToggle && termPanel) {
+    termToggle.addEventListener('click', () => {
+      termMode = termMode === 'off' ? 'auto' : termMode === 'auto' ? 'on' : 'off';
+      try { localStorage.setItem('usher.term.mode', termMode); } catch { /* private mode */ }
+      // Entering auto reveals immediately (click feedback); the auto rules take
+      // over from there. Leaving auto clears the runtime reveal flag.
+      termAutoShown = termMode === 'auto';
+      applyTermMode();
+    });
+    applyTermMode(); // honour the persisted mode on open ('on' reveals now)
+  }
+
+  // Auto-hide on scroll (auto mode only): a deliberate scroll up into history
+  // dismisses the mirror. Listen to wheel/touch *intent*, not the 'scroll' event
+  // — the stick-to-bottom auto-scrolls fire 'scroll' too and would self-hide
+  // mid-stream. Accumulate upward travel; a downward gesture breaks the run.
+  let termUpAccum = 0;
+  const TERM_HIDE_SCROLL = 300; // px of cumulative upward gesture to auto-hide
+  const onTermScroll = (deltaY) => {
+    if (termMode !== 'auto' || !termShown) { termUpAccum = 0; return; }
+    if (deltaY < 0) {
+      termUpAccum += -deltaY;
+      if (termUpAccum >= TERM_HIDE_SCROLL) {
+        termUpAccum = 0;
+        termAutoShown = false;
+        applyTermMode();
+      }
+    } else {
+      termUpAccum = 0;
+    }
+  };
+  // Only count gestures over the chat itself — scrolling inside the terminal
+  // pane (which lives within chat-scroll) must not dismiss it.
+  const inTerm = (e) => termPanel && termPanel.contains(e.target);
+  chatEl.addEventListener('wheel', (e) => { if (!inTerm(e)) onTermScroll(e.deltaY); }, { passive: true });
+  let termTouchY = null;
+  chatEl.addEventListener('touchstart', (e) => { termTouchY = (!inTerm(e) && e.touches[0]) ? e.touches[0].clientY : null; }, { passive: true });
+  chatEl.addEventListener('touchmove', (e) => {
+    if (termTouchY == null || !e.touches[0] || inTerm(e)) return;
+    const y = e.touches[0].clientY;
+    onTermScroll(termTouchY - y); // finger down (y increases) = content scrolls up = negative
+    termTouchY = y;
+  }, { passive: true });
+
   cancelBtn.addEventListener('click', async () => {
     cancelBtn.disabled = true;
     try {
@@ -704,6 +834,9 @@ async function showDetail(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    // Auto mode: the turn is starting, so its un-flushed output is about to
+    // appear — reveal the mirror now (no-op in off/on).
+    if (termMode === 'auto') { termAutoShown = true; applyTermMode(); }
     // Optimistic: show user message immediately. Assistant placeholder is
     // created by openEventStream on subprocess.started. Marked .optimistic so
     // the turn-end reconcile drops it in favor of the canonical user turn.
@@ -891,6 +1024,191 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   });
 
   es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
+}
+
+// ---------- Terminal mirror (read-only) ----------
+//
+// A1 escape hatch: an inline, collapsible panel above the chat input that
+// mirrors the session's live tmux pane (claude's TUI) as a periodically
+// re-captured frame over SSE, plus a row of soft keys so the user can drive
+// menus the curated send path can't reach (arrow navigation, esc, ctrl-c).
+// Read-only otherwise — no arbitrary typing; that's what chat is for.
+
+// openScreenStream subscribes to the pane mirror SSE. Each `screen` event
+// carries the full re-captured frame (server only sends it when it changed);
+// `nopane` means usher holds no live window. EventSource auto-reconnects.
+// Tracked in currentScreenES (not currentES) so it coexists with the detail
+// view's /events stream.
+function openScreenStream(id, screenEl, cols, rows) {
+  closeScreenES();
+  const params = [];
+  if (cols) params.push('cols=' + cols);
+  if (rows) params.push('rows=' + rows);
+  const q = params.length ? ('?' + params.join('&')) : '';
+  const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/screen' + q);
+  currentScreenES = es;
+  let lastRaw = null;
+  es.addEventListener('screen', (ev) => {
+    if (ev.data == null) return;
+    let s;
+    try { s = JSON.parse(ev.data); } catch { return; }
+    if (s === lastRaw) return;
+    lastRaw = s;
+    const wrap = screenEl.parentElement;
+    // Keep the view pinned to the bottom only if the reader is already there,
+    // so scrolling up to inspect output isn't yanked back on the next frame.
+    const atBottom = wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40) : true;
+    screenEl.classList.remove('muted');
+    screenEl.innerHTML = ansiToHtml(trimTrailingBlankLines(s));
+    if (atBottom && wrap) wrap.scrollTop = wrap.scrollHeight;
+  });
+  es.addEventListener('nopane', () => {
+    lastRaw = null;
+    screenEl.classList.add('muted');
+    screenEl.textContent =
+      'no live process for this session — open chat and send a message to start one.';
+  });
+  es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
+}
+
+// wireSoftKeys POSTs the tapped key to /keys. The server allow-lists key names;
+// the screen stream reflects the result, so we don't render an ack — only a
+// brief red flash if the key was rejected (e.g. the pane went away).
+function wireSoftKeys(id) {
+  document.querySelectorAll('.term-keys button[data-key]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: btn.dataset.key }),
+        });
+        if (!res.ok) {
+          btn.classList.add('term-key-err');
+          setTimeout(() => btn.classList.remove('term-key-err'), 500);
+        }
+      } catch {/* transient; the next tap or frame recovers */}
+    });
+  });
+}
+
+// measureCols turns the screen box's available width into terminal columns, so
+// the tmux pane can be sized to fit the viewer (measured once, on expand). A
+// hidden ruler in the grid's font gives an accurate per-char width; the server
+// clamps the result to a sane range.
+function measureCols(boxEl) {
+  const ruler = document.createElement('span');
+  ruler.textContent = '0'.repeat(100);
+  ruler.style.cssText =
+    'position:absolute;visibility:hidden;white-space:pre;' +
+    'font:13px ui-monospace,"SF Mono",Menlo,monospace';
+  document.body.appendChild(ruler);
+  const charPx = ruler.getBoundingClientRect().width / 100;
+  ruler.remove();
+  if (!charPx || !boxEl) return 80;
+  // clientWidth includes the side padding; trim a little so a full-width line
+  // doesn't trip horizontal scroll.
+  const cols = Math.floor((boxEl.clientWidth - 24) / charPx);
+  return cols > 0 ? cols : 80;
+}
+
+// trimTrailingBlankLines drops empty trailing rows from a capture-pane frame so
+// the mirror isn't padded out to the full pane height. Blankness is tested
+// after stripping SGR escapes so a colour-only-but-empty line still counts.
+function trimTrailingBlankLines(s) {
+  const lines = String(s).split('\n');
+  while (lines.length &&
+         lines[lines.length - 1].replace(/\x1b\[[0-9;]*m/g, '').trim() === '') {
+    lines.pop();
+  }
+  return lines.join('\n');
+}
+
+// Base 16-colour ANSI palette (30-37 normal, 90-97 bright), toned to read on
+// the dark terminal background.
+const ANSI_COLORS = [
+  '#484f58', '#ff7b72', '#3fb950', '#d29922', '#58a6ff', '#bc8cff', '#39c5cf', '#b1bac4',
+  '#6e7681', '#ffa198', '#56d364', '#e3b341', '#79c0ff', '#d2a8ff', '#56d4dd', '#f0f6fc',
+];
+const TERM_BG = '#0d1117';
+const TERM_FG = '#c9d1d9';
+
+// ansiToHtml converts a `capture-pane -e` frame (plain text + SGR colour
+// escapes) into HTML spans. capture-pane -e emits only SGR (`ESC [ … m`), so
+// that's all we parse: bold/dim/italic/underline/inverse, the 16 base colours,
+// 256-colour, and truecolour. Inverse swaps fg/bg — that's how a TUI paints its
+// selected menu row, the whole reason this mirror exists.
+function ansiToHtml(s) {
+  const str = String(s);
+  let fg = null, bg = null, bold = false, dim = false, ital = false, ul = false, inv = false;
+  let out = '', open = false;
+  const color256 = (n) => {
+    if (n < 16) return ANSI_COLORS[n];
+    if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
+    n -= 16;
+    const r = Math.floor(n / 36), g = Math.floor((n % 36) / 6), b = n % 6;
+    const c = (x) => (x === 0 ? 0 : 55 + x * 40);
+    return `rgb(${c(r)},${c(g)},${c(b)})`;
+  };
+  const closeSpan = () => { if (open) { out += '</span>'; open = false; } };
+  const openSpan = () => {
+    let f = fg, b = bg;
+    if (inv) { f = bg === null ? TERM_BG : bg; b = fg === null ? TERM_FG : fg; }
+    const st = [];
+    if (f !== null) st.push('color:' + f);
+    if (b !== null) st.push('background:' + b);
+    if (bold) st.push('font-weight:600');
+    if (dim) st.push('opacity:0.6');
+    if (ital) st.push('font-style:italic');
+    if (ul) st.push('text-decoration:underline');
+    if (!st.length) return;
+    out += '<span style="' + st.join(';') + '">';
+    open = true;
+  };
+  const esc1 = (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c);
+  let i = 0;
+  while (i < str.length) {
+    const ch = str[i];
+    if (ch === '\x1b' && str[i + 1] === '[') {
+      const m = /^\x1b\[([0-9;]*)m/.exec(str.slice(i));
+      if (m) {
+        closeSpan();
+        const ps = m[1] === '' ? [0] : m[1].split(';').map(Number);
+        for (let k = 0; k < ps.length; k++) {
+          const p = ps[k];
+          if (p === 0) { fg = bg = null; bold = dim = ital = ul = inv = false; }
+          else if (p === 1) bold = true;
+          else if (p === 2) dim = true;
+          else if (p === 3) ital = true;
+          else if (p === 4) ul = true;
+          else if (p === 7) inv = true;
+          else if (p === 22) bold = dim = false;
+          else if (p === 23) ital = false;
+          else if (p === 24) ul = false;
+          else if (p === 27) inv = false;
+          else if (p >= 30 && p <= 37) fg = ANSI_COLORS[p - 30];
+          else if (p >= 40 && p <= 47) bg = ANSI_COLORS[p - 40];
+          else if (p >= 90 && p <= 97) fg = ANSI_COLORS[p - 90 + 8];
+          else if (p >= 100 && p <= 107) bg = ANSI_COLORS[p - 100 + 8];
+          else if (p === 39) fg = null;
+          else if (p === 49) bg = null;
+          else if (p === 38 || p === 48) {
+            const mode = ps[k + 1];
+            if (mode === 5) { const col = color256(ps[k + 2]); if (p === 38) fg = col; else bg = col; k += 2; }
+            else if (mode === 2) { const col = `rgb(${ps[k + 2] || 0},${ps[k + 3] || 0},${ps[k + 4] || 0})`; if (p === 38) fg = col; else bg = col; k += 4; }
+          }
+        }
+        openSpan();
+        i += m[0].length;
+        continue;
+      }
+    }
+    if (ch === '\x1b') { i++; continue; } // drop a stray/unrecognised escape
+    out += esc1(ch);
+    i++;
+  }
+  closeSpan();
+  return out;
 }
 
 // ---------- Main chat view ----------

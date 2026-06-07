@@ -757,6 +757,85 @@ pre.raw-markdown {
 }
 .auto-approve-toggle:disabled { opacity: 0.6; cursor: progress; }
 
+.term-toggle {
+  font-size: 0.78rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--bg-chrome);
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.term-toggle:hover { background: var(--bg-subtle); }
+.term-toggle[aria-pressed="true"] {  /* auto: subtle accent */
+  background: var(--bg-accent);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+.term-toggle[data-mode="on"] {       /* on: solid, pinned-open */
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* ----- Terminal mirror (read-only, inline above the input) ------------- */
+.term-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+/* The class's display:flex outranks the UA's [hidden]{display:none}, so the
+ * panel won't collapse without this — restore hiding when toggled off. */
+.term-panel[hidden] { display: none; }
+/* Scroll box (the dark terminal surface): a plain block with overflow so the
+ * grid scrolls both ways; JS pins to bottom. max-height here is only a fallback
+ * — app.js sets it from the mode's row count (see applyTermVisibility). */
+.term-screen {
+  max-height: 11rem;
+  overflow: auto;
+  padding: 0.4rem 0.6rem;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.term-grid {
+  /* The pane is sized to the viewer's width on expand, so normal lines fill
+   * the box and sit at the left (like a real terminal). width:max-content lets
+   * an over-wide line (CJK/emoji rendered wider than its cell count) extend and
+   * scroll horizontally rather than wrap. */
+  margin: 0;
+  width: max-content;
+  white-space: pre;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.25;
+  color: #c9d1d9;
+}
+/* Status messages ("connecting…", "no live process…") wrap within the box and
+ * use the page's muted colour instead of the terminal palette. */
+.term-grid.muted { color: var(--text-faint); white-space: pre-wrap; width: auto; max-width: 100%; }
+.term-keys {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);  /* one row; columns shrink to fit narrow phones */
+  gap: 0.4rem;
+}
+.term-keys button {
+  min-width: 0;          /* let the grid column shrink below content width */
+  min-height: 2rem;      /* finger-friendly tap target */
+  font-size: 16px;       /* ≥16px keeps one font set; tappable on mobile */
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  border: 1px solid var(--border);
+  background: var(--bg-chrome);
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.term-keys button:hover { background: var(--bg-subtle); }
+.term-keys button:active { background: var(--bg-hover); }
+.term-keys button.term-key-err { background: var(--danger); border-color: var(--danger); color: #fff; }
+
 .input-row button.cancel {
   border-color: var(--danger);
   background: var(--danger);
