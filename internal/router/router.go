@@ -254,6 +254,41 @@ func (r *Router) SubscribeSession(id string) (<-chan broker.Event, func()) {
 	return r.broker.Subscribe(id)
 }
 
+// --- terminal mirror -----------------------------------------------------
+
+// CaptureScreen returns the current rendered pane contents (with colour
+// escapes) for a session usher holds a live process for — the read-only
+// terminal mirror's frame source. Ownership is required: there's no pane to
+// mirror unless usher has a live window (sender.Has), and we must not reach
+// into the user's own terminal/IDE claude on a shared socket.
+func (r *Router) CaptureScreen(id string) (string, error) {
+	if !r.sender.Has(id) {
+		return "", errors.New("session not live")
+	}
+	return r.sender.CapturePane(id)
+}
+
+// SendKeys forwards navigation keys to a live session's pane, powering the
+// terminal mirror's soft keys. Same ownership gate as CaptureScreen. The web
+// layer restricts which key names reach here; this only enforces ownership.
+func (r *Router) SendKeys(id string, keys ...string) error {
+	if !r.sender.Has(id) {
+		return errors.New("session not live")
+	}
+	return r.sender.SendKeys(id, keys...)
+}
+
+// ResizeCanvas sets the mirror's pane to cols×rows (and repairs any
+// manual-attach drift). Called when a /screen stream opens, with cols and rows
+// derived client-side from the viewer. Same ownership gate; a no-op error for
+// unowned sessions is ignored by the caller.
+func (r *Router) ResizeCanvas(id string, cols, rows int) error {
+	if !r.sender.Has(id) {
+		return errors.New("session not live")
+	}
+	return r.sender.ResizeCanvas(id, cols, rows)
+}
+
 // --- hook / interactions -------------------------------------------------
 
 func (r *Router) ListPendingInteractions() []hook.Pending { return r.hooks.List() }

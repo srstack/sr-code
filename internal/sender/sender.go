@@ -118,6 +118,25 @@ func (s *Sender) LiveSessions() []string { return s.pool.liveSessions() }
 // process (Ctrl-C into the pane).
 func (s *Sender) Interrupt(sessionID string) error { return s.pool.interrupt(sessionID) }
 
+// CapturePane returns the current rendered contents (with colour escapes) of
+// the session's interactive pane, for the read-only terminal mirror. Errors
+// if usher holds no live window for sessionID.
+func (s *Sender) CapturePane(sessionID string) (string, error) {
+	return s.pool.capturePane(sessionID)
+}
+
+// SendKeys forwards tmux key names to the session's pane, powering the
+// terminal mirror's soft keys.
+func (s *Sender) SendKeys(sessionID string, keys ...string) error {
+	return s.pool.sendKeys(sessionID, keys...)
+}
+
+// ResizeCanvas sets the session pane to cols×rows for the terminal mirror (also
+// repairs any manual-attach drift). Called when the mirror opens.
+func (s *Sender) ResizeCanvas(sessionID string, cols, rows int) error {
+	return s.pool.resizeCanvas(sessionID, cols, rows)
+}
+
 // Shutdown tears down usher's tmux server (all live windows). Call on exit if
 // you do NOT want processes to survive for the next usher run.
 func (s *Sender) Shutdown() { s.pool.shutdown() }

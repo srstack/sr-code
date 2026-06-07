@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -174,8 +175,15 @@ func (p *pool) spawn(sessionID, cwd string, resume bool) error {
 
 	var err error
 	if !p.sessionExists() {
+		// Fixed canvas (usher never attaches a client, so this holds for the
+		// session's life; all windows inherit it). 80 keeps claude's TUI
+		// compact for the terminal mirror; nothing downstream depends on it.
+		// A manual `tmux attach` can drift this (and doesn't revert on detach),
+		// but the mirror re-asserts it on open via resizeCanvas — so we leave
+		// window-size at its default (latest) here, keeping such an attach
+		// full-size for debugging.
 		args := append([]string{"new-session", "-d", "-s", tmuxSessionName,
-			"-n", sessionID, "-c", cwd, "-x", "200", "-y", "50"}, envFlags...)
+			"-n", sessionID, "-c", cwd, "-x", "80", "-y", "50"}, envFlags...)
 		_, err = p.runner.run(append(args, cmd)...)
 	} else {
 		args := append([]string{"new-window", "-t", tmuxSessionName,
@@ -225,6 +233,39 @@ func (p *pool) acceptTrust(sessionID string) error {
 func (p *pool) interrupt(sessionID string) error {
 	_, err := p.runner.run("send-keys", "-t", target(sessionID), "C-c")
 	return err
+}
+
+// capturePane returns the current rendered contents of the session's pane,
+// including SGR colour/attribute escapes (-e) so a viewer can reproduce the
+// TUI's selection highlight. Powers the read-only terminal mirror. Errors if
+// the window isn't live.
+func (p *pool) capturePane(sessionID string) (string, error) {
+	return p.runner.run("capture-pane", "-p", "-e", "-t", target(sessionID))
+}
+
+// sendKeys forwards tmux key names (e.g. "Up", "Enter", "C-c") to the
+// session's pane. Used by the terminal mirror's soft keys to drive claude's
+// TUI menus that the curated send path can't reach. No paste-buffer here —
+// these are individual navigation keystrokes, not a prompt body.
+func (p *pool) sendKeys(sessionID string, keys ...string) error {
+	args := append([]string{"send-keys", "-t", target(sessionID)}, keys...)
+	_, err := p.runner.run(args...)
+	return err
+}
+
+// resizeCanvas sets the pane to cols×rows, called when the terminal mirror opens
+// (both derived from the viewer client-side). This doubles as drift repair: a
+// manual `tmux attach` resizes the window and doesn't revert on detach, and the
+// mirror is the only consumer that cares about pane size. resize-window flips
+// the window to manual sizing, so we restore window-size to latest afterward,
+// keeping a later manual attach full-size for debugging.
+func (p *pool) resizeCanvas(sessionID string, cols, rows int) error {
+	if _, err := p.runner.run("resize-window", "-t", target(sessionID),
+		"-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows)); err != nil {
+		return err
+	}
+	_, _ = p.runner.run("set-option", "-t", tmuxSessionName, "window-size", "latest")
+	return nil
 }
 
 func (p *pool) shutdown() {

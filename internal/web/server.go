@@ -109,6 +109,8 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
+	webMux.HandleFunc("GET /api/sessions/{id}/screen", s.handleScreen)
+	webMux.HandleFunc("POST /api/sessions/{id}/keys", s.handleKeys)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/archive", s.handleUnarchive)
@@ -551,6 +553,166 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// --- terminal mirror -----------------------------------------------------
+
+const (
+	screenPollInterval = 500 * time.Millisecond
+	screenHeartbeat    = 15 * time.Second
+)
+
+// softKeys maps the terminal mirror's allow-listed key names to tmux send-keys
+// arguments. The mirror deliberately exposes only navigation/control keys, not
+// arbitrary typing — the chat send path already covers free text, and an
+// allow-list stops a client from injecting unexpected key sequences into the
+// pane. send-keys forwards what it's given verbatim, so the gate lives here.
+var softKeys = map[string]string{
+	"up":     "Up",
+	"down":   "Down",
+	"left":   "Left",
+	"right":  "Right",
+	"enter":  "Enter",
+	"escape": "Escape",
+	"tab":    "Tab",
+}
+
+// handleScreen streams a session's live tmux pane as a periodically
+// re-captured snapshot — the raw TUI mirror behind the read-only terminal
+// view, distinct from /events (the jsonl-tailed message stream). Every
+// screenPollInterval we capture-pane and, when the frame changed, push it as a
+// `screen` event. When usher holds no live window we emit a single `nopane`
+// event (not repeated) so the client can prompt "start the session from chat"
+// without the stream spamming identical frames.
+func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Size the pane to the viewer (cols + rows measured/derived client-side) so
+	// the mirror fills the panel without scroll; this also repairs any
+	// manual-attach drift. The client owns the policy (auto vs on, the fraction
+	// of the viewport); the server just clamps to wide defensive bounds so a bad
+	// client can't ask for an absurd size. Best-effort: an unowned session just
+	// errors and the first capture emits `nopane`.
+	cols := 80
+	if v := r.URL.Query().Get("cols"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cols = n
+		}
+	}
+	rows := 24
+	if v := r.URL.Query().Get("rows"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rows = n
+		}
+	}
+	cols = clampInt(cols, 60, 240)
+	rows = clampInt(rows, 4, 200)
+	_ = s.router.ResizeCanvas(id, cols, rows)
+
+	ticker := time.NewTicker(screenPollInterval)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(screenHeartbeat)
+	defer heartbeat.Stop()
+
+	lastFrame := ""
+	lastErr := false
+	// emit captures one frame and writes it if it changed. Returns false only
+	// when the connection is gone (a write failed), to end the stream.
+	emit := func() bool {
+		screen, err := s.router.CaptureScreen(id)
+		if err != nil {
+			if lastErr {
+				return true // already told the client; don't repeat
+			}
+			lastErr, lastFrame = true, ""
+			if _, werr := fmt.Fprint(w, "event: nopane\ndata: {}\n\n"); werr != nil {
+				return false
+			}
+			flusher.Flush()
+			return true
+		}
+		lastErr = false
+		if screen == lastFrame {
+			return true
+		}
+		lastFrame = screen
+		payload, _ := json.Marshal(screen) // JSON-encode: escapes the ESC + newlines for a single SSE data line
+		if _, werr := fmt.Fprintf(w, "event: screen\ndata: %s\n\n", payload); werr != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	if !emit() {
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			if !emit() {
+				return
+			}
+		}
+	}
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+type keyRequest struct {
+	Key string `json:"key"`
+}
+
+func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req keyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	tmuxKey, ok := softKeys[req.Key]
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "unknown key")
+		return
+	}
+	if err := s.router.SendKeys(id, tmuxKey); err != nil {
+		// No live window to receive the key (or the session is the user's own,
+		// unowned). 409: the client shows the pane is not live.
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // --- main chat -----------------------------------------------------------

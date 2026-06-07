@@ -17,9 +17,10 @@ type fakeTmux struct {
 	mu        sync.Mutex
 	windows   []string
 	exists    bool
-	cmds      [][]string
-	stdins    []string // stdin passed to each runStdin call
-	failSpawn bool     // when set, new-session/new-window return an error
+	cmds       [][]string
+	stdins     []string // stdin passed to each runStdin call
+	failSpawn  bool     // when set, new-session/new-window return an error
+	captureOut string   // canned capture-pane output
 }
 
 func (f *fakeTmux) runStdin(in string, args ...string) (string, error) {
@@ -61,6 +62,8 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 		f.windows = nil
 		f.exists = false
 		return "", nil
+	case "capture-pane":
+		return f.captureOut, nil
 	default: // set-window-option, set-buffer, paste-buffer, send-keys
 		return "", nil
 	}
@@ -216,6 +219,93 @@ func TestPool_SpawnPropagatesEnv(t *testing.T) {
 	f.mu.Unlock()
 	if !ok {
 		t.Fatalf("spawn should pass -e USHER_HOOK_SOCK; cmds=%v", f.cmds)
+	}
+}
+
+func TestPool_CapturePaneTargetsWindow(t *testing.T) {
+	f := &fakeTmux{captureOut: "\x1b[7mselected\x1b[0m row\n"}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+	mustEnsure(t, p, "s1")
+	f.cmds = nil
+
+	out, err := p.capturePane("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "\x1b[7mselected\x1b[0m row\n" {
+		t.Fatalf("capturePane should return the frame verbatim (escapes intact); got %q", out)
+	}
+	// Must use -e (colour escapes, for the selection highlight) and target the
+	// session's window.
+	var c []string
+	for _, cmd := range f.cmds {
+		if len(cmd) > 0 && cmd[0] == "capture-pane" {
+			c = cmd
+		}
+	}
+	if c == nil {
+		t.Fatalf("expected a capture-pane command; cmds=%v", f.cmds)
+	}
+	if !contains(c, "-e") || flagVal(c, "-t") != "usher:s1" {
+		t.Fatalf("capture-pane should pass -e and -t usher:s1; got %v", c)
+	}
+}
+
+func TestPool_SendKeysForwardsNames(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+	mustEnsure(t, p, "s1")
+	f.cmds = nil
+
+	if err := p.sendKeys("s1", "Up"); err != nil {
+		t.Fatal(err)
+	}
+	var c []string
+	for _, cmd := range f.cmds {
+		if len(cmd) > 0 && cmd[0] == "send-keys" {
+			c = cmd
+		}
+	}
+	if c == nil {
+		t.Fatalf("expected a send-keys command; cmds=%v", f.cmds)
+	}
+	// The key name must be forwarded as a bare argument (not -l literal text),
+	// targeting the session window.
+	if flagVal(c, "-t") != "usher:s1" || !contains(c, "Up") || contains(c, "-l") {
+		t.Fatalf("send-keys should forward the key name to usher:s1; got %v", c)
+	}
+}
+
+func TestPool_ResizeCanvasSetsColsAndRestoresLatest(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+	mustEnsure(t, p, "s1")
+	f.cmds = nil
+
+	if err := p.resizeCanvas("s1", 120, 40); err != nil {
+		t.Fatal(err)
+	}
+	var resize, restore []string
+	for _, c := range f.cmds {
+		if len(c) == 0 {
+			continue
+		}
+		if c[0] == "resize-window" {
+			resize = c
+		}
+		if c[0] == "set-option" && contains(c, "window-size") {
+			restore = c
+		}
+	}
+	// Must resize the window to the requested cols × rows…
+	if resize == nil || flagVal(resize, "-t") != "usher:s1" ||
+		flagVal(resize, "-x") != "120" || flagVal(resize, "-y") != "40" {
+		t.Fatalf("resizeCanvas should resize-window usher:s1 to 120x40; got %v", resize)
+	}
+	// …then restore window-size to latest so a later manual attach stays
+	// full-size (resize-window flips the window to manual).
+	if restore == nil || !contains(restore, "latest") {
+		t.Fatalf("resizeCanvas should restore window-size latest; got %v", restore)
 	}
 }
 
