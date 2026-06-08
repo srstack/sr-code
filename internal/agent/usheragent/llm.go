@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"usher/internal/core"
 	"usher/internal/hook"
 )
 
@@ -85,7 +86,7 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 		msgs = append(msgs, ChatMessage{
 			Role: "system",
 			Content: fmt.Sprintf(
-				"Current focus: session %s. When the user gives an instruction without naming a session, default to this one. Switch transparently if they refer to another, and briefly disclose the switch.",
+				"Current focus: session %s. When the user gives an instruction without naming a session, default to this one. Don't announce switches or add focus links yourself — the dashboard does that automatically.",
 				currentFocus,
 			),
 		})
@@ -152,7 +153,7 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (string, string) {
 	switch name {
 	case "list_sessions":
-		b, _ := json.Marshal(a.api.ListSessions())
+		b, _ := json.Marshal(a.enrichedSessions())
 		return string(b), ""
 
 	case "send_to_session":
@@ -280,9 +281,65 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		// the agent last sent to.
 		return `{"status":"ok"}`, ""
 
+	case "set_auto_approve":
+		var args struct {
+			SessionID string `json:"session_id"`
+			Enabled   bool   `json:"enabled"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" {
+			return errResult("session_id is required"), ""
+		}
+		a.api.SetAutoApprove(args.SessionID, args.Enabled)
+		// Housekeeping, not a send — don't change focus (same as respond).
+		payload, _ := json.Marshal(map[string]any{"status": "ok", "session_id": args.SessionID, "auto_approve": args.Enabled})
+		return string(payload), ""
+
+	case "set_archived":
+		var args struct {
+			SessionID string `json:"session_id"`
+			Archived  bool   `json:"archived"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" {
+			return errResult("session_id is required"), ""
+		}
+		if args.Archived {
+			a.api.Archive(args.SessionID)
+		} else {
+			a.api.Unarchive(args.SessionID)
+		}
+		payload, _ := json.Marshal(map[string]any{"status": "ok", "session_id": args.SessionID, "archived": args.Archived})
+		return string(payload), ""
+
 	default:
 		return errResult("unknown tool: " + name), ""
 	}
+}
+
+// sessionView adds the two web-sidebar flags (archived, auto_approve) to a
+// session so the agent can see and report them.
+type sessionView struct {
+	core.Session
+	Archived    bool `json:"archived"`
+	AutoApprove bool `json:"auto_approve"`
+}
+
+func (a *LLMAgent) enrichedSessions() []sessionView {
+	sessions := a.api.ListSessions()
+	out := make([]sessionView, len(sessions))
+	for i, s := range sessions {
+		out[i] = sessionView{
+			Session:     s,
+			Archived:    a.api.IsArchived(s.ID),
+			AutoApprove: a.api.IsAutoApprove(s.ID),
+		}
+	}
+	return out
 }
 
 func errResult(msg string) string {
@@ -347,7 +404,7 @@ func defaultTools() []ChatTool {
 			Type: "function",
 			Function: ChatFunction{
 				Name: "list_sessions",
-				Description: `Refresh the full list of Claude Code sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at for each.
+				Description: `Refresh the full list of Claude Code sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at, archived, auto_approve for each.
 
 USE FOR: questions you can't answer from <current_state> — exact timestamps, status that may have changed in the last few seconds.
 
@@ -447,18 +504,64 @@ DO NOT USE FOR: routing into an existing session that matches the work — use s
 				},
 			},
 		},
+		// Permission tools disabled for now: requests are resolved by the global
+		// web modal, so the agent never gets a turn to act on them. executeTool
+		// cases + AgentAPI methods are kept — uncomment to re-enable.
+		/*
+				{
+					Type: "function",
+					Function: ChatFunction{
+						Name: "list_pending_interactions",
+						Description: `List PreToolUse permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
+
+			USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
+
+			DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. The count alone is in <current_state>.pending_permission_requests.`,
+						Parameters: map[string]any{
+							"type":                 "object",
+							"properties":           map[string]any{},
+							"additionalProperties": false,
+						},
+					},
+				},
+				{
+					Type: "function",
+					Function: ChatFunction{
+						Name: "respond_to_interaction",
+						Description: `Approve or deny a single pending PreToolUse permission request by id.
+
+			USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
+
+			DO NOT blanket-approve anything dangerous-looking (mass deletes, sending sensitive data, broad access) without confirming with the user first.`,
+						Parameters: map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"id":       map[string]any{"type": "string"},
+								"behavior": map[string]any{"type": "string", "enum": []string{"allow", "deny"}},
+								"reason":   map[string]any{"type": "string"},
+							},
+							"required":             []string{"id", "behavior"},
+							"additionalProperties": false,
+						},
+					},
+				},
+		*/
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name: "list_pending_interactions",
-				Description: `List PreToolUse permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
+				Name: "set_auto_approve",
+				Description: `Turn a session's permission auto-approval on or off. When on, usher silently allows that session's PreToolUse prompts instead of queuing them for a decision.
 
-USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
+USE FOR: "stop asking me about session X", "auto-approve the deploy session", "let X run unattended", and turning it back off ("ask me again for X").
 
-DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. The count alone is in <current_state>.pending_permission_requests.`,
+DO NOT blanket-enable on a session doing dangerous work (mass deletes, prod changes) without confirming with the user — it suppresses every future prompt for that session.`,
 				Parameters: map[string]any{
-					"type":                 "object",
-					"properties":           map[string]any{},
+					"type": "object",
+					"properties": map[string]any{
+						"session_id": map[string]any{"type": "string", "description": "Full session ID, exactly as returned by list_sessions."},
+						"enabled":    map[string]any{"type": "boolean", "description": "true to auto-approve this session's prompts, false to resume asking."},
+					},
+					"required":             []string{"session_id", "enabled"},
 					"additionalProperties": false,
 				},
 			},
@@ -466,20 +569,17 @@ DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. T
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name: "respond_to_interaction",
-				Description: `Approve or deny a single pending PreToolUse permission request by id.
+				Name: "set_archived",
+				Description: `Archive or unarchive a session. Archived sessions are hidden from the default session list (they still exist and can be unarchived). Use to tidy finished / stale sessions.
 
-USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
-
-DO NOT blanket-approve anything dangerous-looking (mass deletes, sending sensitive data, broad access) without confirming with the user first.`,
+USE FOR: "archive the old spike", "hide the finished sessions", "bring back session X", "unarchive Y".`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"id":       map[string]any{"type": "string"},
-						"behavior": map[string]any{"type": "string", "enum": []string{"allow", "deny"}},
-						"reason":   map[string]any{"type": "string"},
+						"session_id": map[string]any{"type": "string", "description": "Full session ID, exactly as returned by list_sessions."},
+						"archived":   map[string]any{"type": "boolean", "description": "true to archive (hide), false to unarchive (restore)."},
 					},
-					"required":             []string{"id", "behavior"},
+					"required":             []string{"session_id", "archived"},
 					"additionalProperties": false,
 				},
 			},

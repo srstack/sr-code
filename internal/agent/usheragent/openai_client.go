@@ -48,23 +48,151 @@ type ChatRequest struct {
 	Tools    []ChatTool    `json:"tools,omitempty"`
 }
 
+// ChatMessage's Extra holds any wire fields we don't model by name, so we can
+// send them back unchanged. Reasoning models need this: DeepSeek puts
+// `reasoning_content` on the message and 400s if it's not replayed on the next
+// turn. ToolCall has the same Extra for Gemini's thought_signature.
 type ChatMessage struct {
-	Role       string     `json:"role"` // system | user | assistant | tool
-	Content    string     `json:"content,omitempty"`
-	Name       string     `json:"name,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant role
-	ToolCallID string     `json:"tool_call_id,omitempty"` // tool role
+	Role       string     // system | user | assistant | tool
+	Content    string     //
+	Name       string     //
+	ToolCalls  []ToolCall // assistant role
+	ToolCallID string     // tool role
+	Extra      map[string]json.RawMessage
 }
 
 type ToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"` // always "function"
-	Function ToolCallFunc `json:"function"`
+	ID       string       // always present
+	Type     string       // always "function"
+	Function ToolCallFunc //
+	// Extra keeps unknown fields like Gemini's extra_content.thought_signature.
+	Extra map[string]json.RawMessage
 }
 
 type ToolCallFunc struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"` // JSON-encoded string per OpenAI spec
+}
+
+// keys we have named fields for; anything else goes to Extra on decode.
+var (
+	knownMessageKeys  = []string{"role", "content", "name", "tool_calls", "tool_call_id"}
+	knownToolCallKeys = []string{"id", "type", "function"}
+)
+
+func (m ChatMessage) MarshalJSON() ([]byte, error) {
+	out := make(map[string]json.RawMessage, len(m.Extra)+len(knownMessageKeys))
+	for k, v := range m.Extra {
+		out[k] = v
+	}
+	if err := putField(out, "role", m.Role, false); err != nil { // role has no omitempty
+		return nil, err
+	}
+	if err := putField(out, "content", m.Content, m.Content == ""); err != nil {
+		return nil, err
+	}
+	if err := putField(out, "name", m.Name, m.Name == ""); err != nil {
+		return nil, err
+	}
+	if err := putField(out, "tool_calls", m.ToolCalls, len(m.ToolCalls) == 0); err != nil {
+		return nil, err
+	}
+	if err := putField(out, "tool_call_id", m.ToolCallID, m.ToolCallID == ""); err != nil {
+		return nil, err
+	}
+	return json.Marshal(out)
+}
+
+func (m *ChatMessage) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if err := pullField(raw, "role", &m.Role); err != nil {
+		return err
+	}
+	if err := pullField(raw, "content", &m.Content); err != nil {
+		return err
+	}
+	if err := pullField(raw, "name", &m.Name); err != nil {
+		return err
+	}
+	if err := pullField(raw, "tool_calls", &m.ToolCalls); err != nil {
+		return err
+	}
+	if err := pullField(raw, "tool_call_id", &m.ToolCallID); err != nil {
+		return err
+	}
+	for _, k := range knownMessageKeys {
+		delete(raw, k)
+	}
+	if len(raw) > 0 {
+		m.Extra = raw
+	}
+	return nil
+}
+
+func (c ToolCall) MarshalJSON() ([]byte, error) {
+	out := make(map[string]json.RawMessage, len(c.Extra)+len(knownToolCallKeys))
+	for k, v := range c.Extra {
+		out[k] = v
+	}
+	// id/type/function are always emitted (no omitempty).
+	if err := putField(out, "id", c.ID, false); err != nil {
+		return nil, err
+	}
+	if err := putField(out, "type", c.Type, false); err != nil {
+		return nil, err
+	}
+	if err := putField(out, "function", c.Function, false); err != nil {
+		return nil, err
+	}
+	return json.Marshal(out)
+}
+
+func (c *ToolCall) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if err := pullField(raw, "id", &c.ID); err != nil {
+		return err
+	}
+	if err := pullField(raw, "type", &c.Type); err != nil {
+		return err
+	}
+	if err := pullField(raw, "function", &c.Function); err != nil {
+		return err
+	}
+	for _, k := range knownToolCallKeys {
+		delete(raw, k)
+	}
+	if len(raw) > 0 {
+		c.Extra = raw
+	}
+	return nil
+}
+
+// putField writes val under key unless omit is true (our omitempty).
+func putField(out map[string]json.RawMessage, key string, val any, omit bool) error {
+	if omit {
+		return nil
+	}
+	b, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	out[key] = b
+	return nil
+}
+
+// pullField decodes raw[key] into dst if present.
+func pullField(raw map[string]json.RawMessage, key string, dst any) error {
+	v, ok := raw[key]
+	if !ok {
+		return nil
+	}
+	return json.Unmarshal(v, dst)
 }
 
 type ChatTool struct {

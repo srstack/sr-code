@@ -24,6 +24,15 @@ type AgentAPI interface {
 	ListPendingInteractions() []hook.Pending
 	RespondInteraction(id string, resp hook.Response) error
 
+	// Session housekeeping — the same per-session controls the web sidebar
+	// has: archive a session, or auto-approve its permission prompts. The
+	// read methods let the agent report current state.
+	Archive(id string)
+	Unarchive(id string)
+	IsArchived(id string) bool
+	SetAutoApprove(id string, enabled bool)
+	IsAutoApprove(id string) bool
+
 	// ReadSessionTranscript returns the most recent N user/assistant turns
 	// from the session's jsonl. limit ≤ 0 means "no cap"; callers should
 	// pass a sane default (the LLM agent uses 20 with a 200 ceiling).

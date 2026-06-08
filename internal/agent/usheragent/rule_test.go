@@ -25,6 +25,14 @@ type fakeAPI struct {
 	waitReplies map[string]string
 	waitErrs    map[string]error
 	waitedFor   []string
+
+	archived    map[string]bool
+	autoApprove map[string]bool
+
+	created     []createCall
+	createReply string
+	createNewID string
+	createErr   error
 }
 
 func newFakeAPI() *fakeAPI {
@@ -33,6 +41,8 @@ func newFakeAPI() *fakeAPI {
 		transcripts: map[string][]core.TranscriptTurn{},
 		waitReplies: map[string]string{},
 		waitErrs:    map[string]error{},
+		archived:    map[string]bool{},
+		autoApprove: map[string]bool{},
 	}
 }
 
@@ -74,9 +84,18 @@ func (f *fakeAPI) SendToSessionAndWait(_ context.Context, id, text string, _ tim
 	}
 	return "", nil
 }
-func (f *fakeAPI) CreateSession(_ context.Context, _, _ string, _ time.Duration) (string, string, error) {
-	return "", "", fmt.Errorf("rule agent test fake: CreateSession not used")
+func (f *fakeAPI) CreateSession(_ context.Context, cwd, msg string, _ time.Duration) (string, string, error) {
+	f.created = append(f.created, createCall{cwd, msg})
+	if f.createErr != nil {
+		return f.createNewID, f.createReply, f.createErr
+	}
+	return f.createNewID, f.createReply, nil
 }
+func (f *fakeAPI) Archive(id string)                { f.archived[id] = true }
+func (f *fakeAPI) Unarchive(id string)              { f.archived[id] = false }
+func (f *fakeAPI) IsArchived(id string) bool        { return f.archived[id] }
+func (f *fakeAPI) SetAutoApprove(id string, e bool) { f.autoApprove[id] = e }
+func (f *fakeAPI) IsAutoApprove(id string) bool     { return f.autoApprove[id] }
 
 func handle(t *testing.T, a *RuleAgent, msg string) string {
 	t.Helper()
@@ -224,6 +243,10 @@ func TestRule_SendError(t *testing.T) {
 	}
 }
 
+// Permission commands (/pending, /approve, /deny) are disabled while
+// permissions are handled by the global web modal — see rule.go. Re-enable
+// these tests when the commands come back.
+/*
 func TestRule_PendingAndRespond(t *testing.T) {
 	api := newFakeAPI()
 	api.pending = []hook.Pending{
@@ -262,5 +285,118 @@ func TestRule_ApproveNoMatch(t *testing.T) {
 	a := NewRule(newFakeAPI())
 	if got := handle(t, a, "/approve missing"); !strings.Contains(got, "no pending") {
 		t.Errorf("got %q", got)
+	}
+}
+*/
+
+func TestRule_ArchiveAndUnarchive(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "spike"}}
+	a := NewRule(api)
+
+	res := handleFull(t, a, "/archive abc")
+	if !strings.Contains(res.Reply, "archived abc12345") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if !api.archived["abc12345"] {
+		t.Error("session not archived")
+	}
+	if res.FocusSession != "" {
+		t.Errorf("archive should not set focus, got %q", res.FocusSession)
+	}
+
+	if got := handle(t, a, "/unarchive abc"); !strings.Contains(got, "unarchived abc12345") {
+		t.Errorf("got %q", got)
+	}
+	if api.archived["abc12345"] {
+		t.Error("session still archived")
+	}
+}
+
+func TestRule_AutoApprove(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "deploy"}}
+	a := NewRule(api)
+
+	if got := handle(t, a, "/auto-approve abc on"); !strings.Contains(got, "auto-approve on") {
+		t.Errorf("got %q", got)
+	}
+	if !api.autoApprove["abc12345"] {
+		t.Error("auto-approve not enabled")
+	}
+	if got := handle(t, a, "/auto-approve abc off"); !strings.Contains(got, "auto-approve off") {
+		t.Errorf("got %q", got)
+	}
+	if api.autoApprove["abc12345"] {
+		t.Error("auto-approve not disabled")
+	}
+	if got := handle(t, a, "/auto-approve abc"); !strings.Contains(got, "usage") {
+		t.Errorf("missing mode should show usage, got %q", got)
+	}
+}
+
+func TestRule_ListShowsFlags(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x", Cwd: "/tmp"}}
+	api.autoApprove["abc12345"] = true
+	api.archived["abc12345"] = true
+	a := NewRule(api)
+	out := handle(t, a, "/list")
+	if !strings.Contains(out, "auto-approve") || !strings.Contains(out, "archived") {
+		t.Errorf("list missing flags: %q", out)
+	}
+}
+
+func TestRule_Ask(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
+	api.waitReplies["abc12345"] = "the answer is 42"
+	a := NewRule(api)
+	res := handleFull(t, a, "/ask abc what is the answer")
+	if !strings.Contains(res.Reply, "42") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if res.FocusSession != "abc12345" {
+		t.Errorf("ask should set focus, got %q", res.FocusSession)
+	}
+	if len(api.waitedFor) != 1 || api.waitedFor[0] != "abc12345" {
+		t.Errorf("waitedFor = %v", api.waitedFor)
+	}
+}
+
+func TestRule_Read(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
+	api.transcripts["abc12345"] = []core.TranscriptTurn{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello back"},
+	}
+	a := NewRule(api)
+	res := handleFull(t, a, "/read abc")
+	if !strings.Contains(res.Reply, "hello back") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if res.FocusSession != "abc12345" {
+		t.Errorf("read should set focus, got %q", res.FocusSession)
+	}
+}
+
+func TestRule_New(t *testing.T) {
+	api := newFakeAPI()
+	api.createNewID = "new-uuid-1234"
+	api.createReply = "ready"
+	a := NewRule(api)
+	res := handleFull(t, a, "/new /tmp build me a thing")
+	if !strings.Contains(res.Reply, "new-uuid") || !strings.Contains(res.Reply, "ready") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if res.FocusSession != "new-uuid-1234" {
+		t.Errorf("focus = %q", res.FocusSession)
+	}
+	if len(api.created) != 1 || api.created[0].Cwd != "/tmp" || api.created[0].Msg != "build me a thing" {
+		t.Errorf("created = %+v", api.created)
+	}
+	if got := handle(t, a, "/new /tmp"); !strings.Contains(got, "usage") {
+		t.Errorf("missing message should show usage, got %q", got)
 	}
 }

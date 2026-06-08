@@ -12,6 +12,61 @@ import (
 
 func atomicAdd(p *int32, n int32) int32 { return atomic.AddInt32(p, n) }
 
+// A DeepSeek-style (message-level reasoning_content) + Gemini-style
+// (tool_call-level extra_content.thought_signature) assistant turn must
+// survive a decode→encode round-trip so it can be replayed verbatim.
+func TestChatMessage_RoundTripsProviderReasoningFields(t *testing.T) {
+	in := `{"role":"assistant","content":"","reasoning_content":"let me think...","tool_calls":[` +
+		`{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"},` +
+		`"extra_content":{"google":{"thought_signature":"SIG123"}}}]}`
+
+	var m ChatMessage
+	if err := json.Unmarshal([]byte(in), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Role != "assistant" || len(m.ToolCalls) != 1 {
+		t.Fatalf("known fields lost: role=%q toolcalls=%d", m.Role, len(m.ToolCalls))
+	}
+	if _, ok := m.Extra["reasoning_content"]; !ok {
+		t.Error("message-level reasoning_content not captured in Extra")
+	}
+	if _, ok := m.ToolCalls[0].Extra["extra_content"]; !ok {
+		t.Error("tool_call-level extra_content not captured in Extra")
+	}
+
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"reasoning_content":"let me think..."`) {
+		t.Errorf("reasoning_content dropped on re-marshal: %s", s)
+	}
+	if !strings.Contains(s, `"thought_signature":"SIG123"`) {
+		t.Errorf("thought_signature dropped on re-marshal: %s", s)
+	}
+}
+
+// No Extra fields → output must match the old struct-tag behavior exactly
+// (omitempty for content/name/tool_calls/tool_call_id; role always present).
+func TestChatMessage_OmitemptyPreserved(t *testing.T) {
+	// json.Marshal sorts map keys alphabetically, so order is deterministic.
+	if got, _ := json.Marshal(ChatMessage{Role: "user", Content: "hi"}); string(got) != `{"content":"hi","role":"user"}` {
+		t.Errorf("plain message = %s", got)
+	}
+	// assistant-with-tool-calls has empty content → must be omitted, as before.
+	m := ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{
+		ID: "c1", Type: "function", Function: ToolCallFunc{Name: "f", Arguments: "{}"},
+	}}}
+	got, _ := json.Marshal(m)
+	if strings.Contains(string(got), `"content"`) {
+		t.Errorf("empty content should be omitted: %s", got)
+	}
+	if !strings.Contains(string(got), `"tool_calls"`) {
+		t.Errorf("tool_calls missing: %s", got)
+	}
+}
+
 func TestChatClient_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {

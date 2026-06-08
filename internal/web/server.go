@@ -826,6 +826,31 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
+func shortID(id string) string {
+	if len(id) >= 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// focusSwitchBanner returns a one-line clickable banner when `touched` (the
+// session this turn acted on) differs from prevFocus, or "" if focus didn't
+// change. The link is the SPA's session route, rendered in the chat bubble.
+func focusSwitchBanner(prevFocus, touched, title string) string {
+	if touched == "" || touched == prevFocus {
+		return ""
+	}
+	verb := "Switching to"
+	if prevFocus == "" {
+		verb = "Routing to"
+	}
+	label := title
+	if label == "" {
+		label = shortID(touched)
+	}
+	return fmt.Sprintf("↪ %s [%s](#/s/%s)\n\n", verb, label, touched)
+}
+
 func (s *Server) handleGetMainChat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgs, err := s.main.Read(id, 0)
@@ -904,9 +929,16 @@ func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
 	if newFocus == "" {
 		newFocus = prevFocus
 	}
+	// Announce a focus change server-side (the model relays verbatim and can't
+	// reliably detect a switch itself): prepend a linked banner when this turn
+	// routed to a session different from the prior focus.
+	title := ""
+	if sess, ok := s.router.GetSession(res.FocusSession); ok {
+		title = sess.Title
+	}
 	agentMsg := mainchat.Message{
 		Role:         "agent",
-		Content:      res.Reply,
+		Content:      focusSwitchBanner(prevFocus, res.FocusSession, title) + res.Reply,
 		Time:         time.Now().UTC(),
 		FocusSession: newFocus,
 	}

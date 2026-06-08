@@ -86,10 +86,15 @@ The **main chat** link opens a conversation with usher's routing agent. The
 default **rule agent** is a few slash commands:
 
 ```
-/list                   list sessions
-/send <prefix> <text>   send to the matching session (by id prefix or title)
-/pending                list pending permission requests
-/approve | /deny <id>   resolve a pending request
+/list                          list sessions (shows auto-approve / archived flags)
+/send <prefix> <text>          send to the matching session (by id prefix or title)
+/ask <prefix> <text>           send and wait for the session's reply
+/read <prefix> [n]             show the last n turns of a session (default 20)
+/new <cwd> <text>              start a new session in <cwd> with an initial message
+/pending                       list pending permission requests
+/approve | /deny <id>          resolve a pending request
+/archive | /unarchive <prefix> hide / restore a session
+/auto-approve <prefix> on|off  toggle auto-approving the session's prompts
 ```
 
 The optional **LLM agent** (`--agent-mode llm`) takes natural language instead.

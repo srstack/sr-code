@@ -57,10 +57,13 @@ type fakeAgentAPI struct {
 	waitErrs    map[string]error
 	waitedFor   []sendCall
 
-	created      []createCall
-	createReply  string
-	createNewID  string
-	createErr    error
+	created     []createCall
+	createReply string
+	createNewID string
+	createErr   error
+
+	archived    map[string]bool
+	autoApprove map[string]bool
 }
 type sendCall struct{ ID, Text string }
 type createCall struct{ Cwd, Msg string }
@@ -70,6 +73,8 @@ func newFakeAgentAPI() *fakeAgentAPI {
 		transcripts: map[string][]core.TranscriptTurn{},
 		waitReplies: map[string]string{},
 		waitErrs:    map[string]error{},
+		archived:    map[string]bool{},
+		autoApprove: map[string]bool{},
 	}
 }
 
@@ -110,6 +115,11 @@ func (f *fakeAgentAPI) CreateSession(_ context.Context, cwd, msg string, _ time.
 	}
 	return f.createNewID, f.createReply, nil
 }
+func (f *fakeAgentAPI) Archive(id string)                { f.archived[id] = true }
+func (f *fakeAgentAPI) Unarchive(id string)              { f.archived[id] = false }
+func (f *fakeAgentAPI) IsArchived(id string) bool        { return f.archived[id] }
+func (f *fakeAgentAPI) SetAutoApprove(id string, e bool) { f.autoApprove[id] = e }
+func (f *fakeAgentAPI) IsAutoApprove(id string) bool     { return f.autoApprove[id] }
 
 // --- helpers ---
 
@@ -455,6 +465,121 @@ func TestLLMAgent_CreateSessionMissingArgs(t *testing.T) {
 	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
 	if _, err := a.Handle(context.Background(), nil, "", "scratch"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLLMAgent_SetAutoApprove(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "deadbeef", Title: "deploy"}}
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c", "set_auto_approve", `{"session_id":"deadbeef","enabled":true}`),
+		chatTextResp("auto-approve is on for the deploy session"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res := runHandle(t, a, "stop asking me about the deploy session")
+	if !api.autoApprove["deadbeef"] {
+		t.Error("auto-approve not enabled")
+	}
+	if res.FocusSession != "" {
+		t.Errorf("set_auto_approve must not set focus, got %q", res.FocusSession)
+	}
+}
+
+func TestLLMAgent_SetArchived(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "deadbeef", Title: "old spike"}}
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c", "set_archived", `{"session_id":"deadbeef","archived":true}`),
+		chatTextResp("archived the old spike"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res := runHandle(t, a, "archive the old spike")
+	if !api.archived["deadbeef"] {
+		t.Error("session not archived")
+	}
+	if res.FocusSession != "" {
+		t.Errorf("set_archived must not set focus, got %q", res.FocusSession)
+	}
+}
+
+func TestLLMAgent_ListSessionsEnrichedWithFlags(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x", Cwd: "/x"}}
+	api.autoApprove["abc12345"] = true
+	api.archived["abc12345"] = true
+	srv, m := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c", "list_sessions", `{}`),
+		chatTextResp("ok"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	_ = runHandle(t, a, "list everything")
+
+	var toolMsg *ChatMessage
+	for i := range m.lastReq.Messages {
+		if m.lastReq.Messages[i].Role == "tool" {
+			toolMsg = &m.lastReq.Messages[i]
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("no tool message")
+	}
+	if !strings.Contains(toolMsg.Content, `"auto_approve":true`) || !strings.Contains(toolMsg.Content, `"archived":true`) {
+		t.Errorf("list_sessions output missing flags: %q", toolMsg.Content)
+	}
+}
+
+// The real failure mode: a reasoning model returns thinking state on the
+// assistant tool-call turn, and the SECOND request (after the tool result)
+// must replay it verbatim or the provider 400s. We assert both DeepSeek's
+// message-level reasoning_content and Gemini's tool_call-level extra_content
+// reach the server on that second request.
+func TestLLMAgent_ReplaysProviderReasoningAcrossToolLoop(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
+
+	first := ChatResponse{Choices: []ChatChoice{{
+		Message: ChatMessage{
+			Role:  "assistant",
+			Extra: map[string]json.RawMessage{"reasoning_content": json.RawMessage(`"thinking…"`)},
+			ToolCalls: []ToolCall{{
+				ID:       "call_1",
+				Type:     "function",
+				Function: ToolCallFunc{Name: "list_sessions", Arguments: "{}"},
+				Extra:    map[string]json.RawMessage{"extra_content": json.RawMessage(`{"google":{"thought_signature":"SIG123"}}`)},
+			}},
+		},
+		FinishReason: "tool_calls",
+	}}}
+	srv, m := newMockChatServer(t, []ChatResponse{first, chatTextResp("there is 1 session")})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	if _, err := a.Handle(context.Background(), nil, "", "how many sessions?"); err != nil {
+		t.Fatal(err)
+	}
+
+	// m.lastReq is the SECOND request, decoded with our types — the replayed
+	// assistant tool-call message must still carry both reasoning fields.
+	var replayed *ChatMessage
+	for i := range m.lastReq.Messages {
+		if m.lastReq.Messages[i].Role == "assistant" && len(m.lastReq.Messages[i].ToolCalls) > 0 {
+			replayed = &m.lastReq.Messages[i]
+		}
+	}
+	if replayed == nil {
+		t.Fatal("assistant tool-call message was not replayed in the second request")
+	}
+	if _, ok := replayed.Extra["reasoning_content"]; !ok {
+		t.Error("DeepSeek-style reasoning_content was not replayed")
+	}
+	if len(replayed.ToolCalls) == 0 || replayed.ToolCalls[0].Extra["extra_content"] == nil {
+		t.Error("Gemini-style extra_content/thought_signature was not replayed")
 	}
 }
 
