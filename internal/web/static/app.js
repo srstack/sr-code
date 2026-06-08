@@ -771,6 +771,15 @@ async function showDetail(id) {
   };
   if (termToggle && termPanel) {
     termToggle.addEventListener('click', () => {
+      // When auto is just tucked away (scroll-hidden, or not yet revealed on a
+      // fresh load), a click should bring it back rather than advance the cycle
+      // — otherwise re-showing takes three clicks (auto → on → off → auto). The
+      // mode stays auto, so the next send still auto-reveals as designed.
+      if (termMode === 'auto' && !termShown) {
+        termAutoShown = true;
+        applyTermMode();
+        return;
+      }
       termMode = termMode === 'off' ? 'auto' : termMode === 'auto' ? 'on' : 'off';
       try { localStorage.setItem('usher.term.mode', termMode); } catch { /* private mode */ }
       // Entering auto reveals immediately (click feedback); the auto rules take
