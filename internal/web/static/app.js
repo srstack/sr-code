@@ -27,6 +27,11 @@ let currentES = null;
 // currentES so the detail view's /events stream and the mirror's /screen
 // stream can be open at once and both get torn down on navigation.
 let currentScreenES = null;
+// claude's bottom UI is a fixed 4-row block: input-box top border, input line,
+// bottom border, hint line (verified by capture). The auto preview hides it as
+// furniture; if claude's chrome ever changes, this is the number to revisit.
+const TERM_FURNITURE_ROWS = 4;
+const TERM_AUTO_ROWS = 12; // pane height captured for the auto inline preview
 // Detail-view transcript sync: the SSE renders only turns seen from
 // subprocess.started, so we re-fetch on turn-end and on reconnect to catch the
 // rest. Flags: detailStreaming (gate the reconnect re-fetch off a live turn),
@@ -647,7 +652,7 @@ async function showDetail(id) {
       <section class="send-anchor">
         <div id="term-panel" class="term-panel" hidden>
           <div class="term-screen"><pre id="term-grid" class="term-grid muted">connecting…</pre></div>
-          <div class="term-keys">
+          <div class="term-keys" id="term-keys">
             <button type="button" data-key="escape">esc</button>
             <button type="button" data-key="tab">tab</button>
             <button type="button" data-key="up" aria-label="up">↑</button>
@@ -669,7 +674,7 @@ async function showDetail(id) {
             auto-approve: ${sess.auto_approve ? 'on' : 'off'}
           </button>
           <button id="term-toggle" class="term-toggle" type="button" aria-pressed="false"
-            title="terminal mirror — click to cycle off → auto → on. auto reveals on send and hides when you scroll up into history; on stays pinned open.">
+            title="terminal mirror — click to cycle off → auto → on. auto previews live output inline in the turn bubble (before it lands); on docks an interactive pane.">
             terminal: off
           </button>
         </div>
@@ -717,34 +722,29 @@ async function showDetail(id) {
   // don't poll capture-pane. Soft keys wire once (the grid node is permanent).
   const termToggle = document.getElementById('term-toggle');
   const termPanel = document.getElementById('term-panel');
-  let termMode = (() => { try { return localStorage.getItem('usher.term.mode') || 'off'; } catch { return 'off'; } })();
-  let termAutoShown = false; // auto-mode runtime reveal (set by send, cleared by scroll)
-  let termShown = false;     // whether the panel is currently streaming/visible
-  let termAppliedRows = 0;   // rows last applied — gates needless restreams
+  let termMode = (() => { try { return localStorage.getItem('usher.term.mode') || 'auto'; } catch { return 'auto'; } })();
+  let termShown = false;        // whether the docked panel is currently streaming/visible
+  let termAppliedRows = 0;      // rows last applied — gates needless restreams
   let softKeysWired = false;
-  // Pane/box rows by mode (the client owns this policy; the server just clamps).
-  // auto is a fixed compact glance; on fills half the chat area, bounded so the
-  // input/controls below stay visible. The pane AND the viewer box are both
-  // sized from this one number, so they can't drift.
   const TERM_ROW_PX = 16.25; // .term-grid 13px × line-height 1.25 (keep in sync with CSS)
-  const targetRows = (mode) => {
-    if (mode !== 'on') return 10;
+  // on fills half the chat area, bounded so the input/controls below stay
+  // visible. The pane and the viewer box are both sized from this one number.
+  const onRows = () => {
     const chatH = chatEl.clientHeight;
     const roomRows = Math.floor((chatH - 6 * 16) / TERM_ROW_PX); // leave ~6rem for input
     const halfRows = Math.floor((chatH / 2) / TERM_ROW_PX);
     return Math.max(1, Math.min(halfRows, roomRows));
   };
-  // applyTermVisibility resolves termMode + termAutoShown into the shown/hidden
-  // state and the pane/box size. The /screen restream is what re-applies a new
-  // pane size, so it's skipped when nothing changed (e.g. a send re-asserting an
-  // already-open auto panel) — only a real reveal or size change restreams.
+  // applyTermVisibility drives the docked panel, which now serves on only —
+  // auto's mirror is the inline preview piped into the placeholder bubble during
+  // a turn, not this panel. The /screen restream re-applies pane size, so it's
+  // skipped when the row count hasn't changed.
   const applyTermVisibility = () => {
-    const show = termMode === 'on' || (termMode === 'auto' && termAutoShown);
-    if (!show) {
+    if (termMode !== 'on') {
       if (termShown) { termShown = false; if (termPanel) termPanel.hidden = true; closeScreenES(); }
       return;
     }
-    const rows = targetRows(termMode);
+    const rows = onRows();
     if (termShown && rows === termAppliedRows) return; // already shown at this size
     termShown = true;
     termAppliedRows = rows;
@@ -756,71 +756,38 @@ async function showDetail(id) {
       // content-box: max-height is the content area, so rows×ROW_PX shows exactly
       // `rows` lines (+a few px slack to avoid a sub-pixel scrollbar).
       box.style.maxHeight = Math.ceil(rows * TERM_ROW_PX) + 4 + 'px';
-      openScreenStream(id, gridEl, measureCols(box), rows);
+      // on shows the whole pane (dropTail 0) plus the soft keys — it's the
+      // interactive view for debugging / driving /rewind.
+      openScreenStream(id, gridEl, measureCols(box), rows, 0);
     }
     // The panel grows the sticky anchor; keep the chat pinned if it was.
     if (isNearBottom(chatEl)) chatEl.scrollTop = chatEl.scrollHeight;
   };
-  // applyTermMode reflects termMode onto the button, then resolves visibility.
+  // evStream exposes syncInline so a mode toggle can start/stop auto's inline
+  // preview against the in-flight turn (assigned once openEventStream runs below).
+  let evStream = null;
+  // applyTermMode reflects termMode onto the button, resolves the docked panel,
+  // then reconciles auto's inline preview with the new mode.
   const applyTermMode = () => {
-    if (!termToggle) return;
-    termToggle.setAttribute('data-mode', termMode);
-    termToggle.setAttribute('aria-pressed', termMode === 'off' ? 'false' : 'true');
-    termToggle.textContent = 'terminal: ' + termMode;
+    if (termToggle) {
+      termToggle.setAttribute('data-mode', termMode);
+      termToggle.setAttribute('aria-pressed', termMode === 'off' ? 'false' : 'true');
+      termToggle.textContent = 'terminal: ' + termMode;
+    }
     applyTermVisibility();
+    if (evStream) evStream.syncInline();
   };
   if (termToggle && termPanel) {
     termToggle.addEventListener('click', () => {
-      // When auto is just tucked away (scroll-hidden, or not yet revealed on a
-      // fresh load), a click should bring it back rather than advance the cycle
-      // — otherwise re-showing takes three clicks (auto → on → off → auto). The
-      // mode stays auto, so the next send still auto-reveals as designed.
-      if (termMode === 'auto' && !termShown) {
-        termAutoShown = true;
-        applyTermMode();
-        return;
-      }
+      // off → auto → on → off. off: no mirror. auto: live output streams into
+      // the placeholder bubble during a turn (no docked panel). on: docked,
+      // interactive panel. The mode is a persisted preference.
       termMode = termMode === 'off' ? 'auto' : termMode === 'auto' ? 'on' : 'off';
       try { localStorage.setItem('usher.term.mode', termMode); } catch { /* private mode */ }
-      // Entering auto reveals immediately (click feedback); the auto rules take
-      // over from there. Leaving auto clears the runtime reveal flag.
-      termAutoShown = termMode === 'auto';
       applyTermMode();
     });
-    applyTermMode(); // honour the persisted mode on open ('on' reveals now)
+    applyTermMode(); // honour the persisted mode on open ('on' reveals the panel)
   }
-
-  // Auto-hide on scroll (auto mode only): a deliberate scroll up into history
-  // dismisses the mirror. Listen to wheel/touch *intent*, not the 'scroll' event
-  // — the stick-to-bottom auto-scrolls fire 'scroll' too and would self-hide
-  // mid-stream. Accumulate upward travel; a downward gesture breaks the run.
-  let termUpAccum = 0;
-  const TERM_HIDE_SCROLL = 300; // px of cumulative upward gesture to auto-hide
-  const onTermScroll = (deltaY) => {
-    if (termMode !== 'auto' || !termShown) { termUpAccum = 0; return; }
-    if (deltaY < 0) {
-      termUpAccum += -deltaY;
-      if (termUpAccum >= TERM_HIDE_SCROLL) {
-        termUpAccum = 0;
-        termAutoShown = false;
-        applyTermMode();
-      }
-    } else {
-      termUpAccum = 0;
-    }
-  };
-  // Only count gestures over the chat itself — scrolling inside the terminal
-  // pane (which lives within chat-scroll) must not dismiss it.
-  const inTerm = (e) => termPanel && termPanel.contains(e.target);
-  chatEl.addEventListener('wheel', (e) => { if (!inTerm(e)) onTermScroll(e.deltaY); }, { passive: true });
-  let termTouchY = null;
-  chatEl.addEventListener('touchstart', (e) => { termTouchY = (!inTerm(e) && e.touches[0]) ? e.touches[0].clientY : null; }, { passive: true });
-  chatEl.addEventListener('touchmove', (e) => {
-    if (termTouchY == null || !e.touches[0] || inTerm(e)) return;
-    const y = e.touches[0].clientY;
-    onTermScroll(termTouchY - y); // finger down (y increases) = content scrolls up = negative
-    termTouchY = y;
-  }, { passive: true });
 
   cancelBtn.addEventListener('click', async () => {
     cancelBtn.disabled = true;
@@ -836,16 +803,13 @@ async function showDetail(id) {
   // Shared state between submit and the SSE handlers: lets the exit event
   // canonicalize the optimistic user node's timestamp from server-side ts.
   const turnState = { userNode: null };
-  openEventStream(id, chatEl, sendBtn, cancelBtn, turnState);
+  evStream = openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, () => termMode);
 
   const submit = async () => {
     const text = promptEl.value;
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
-    // Auto mode: the turn is starting, so its un-flushed output is about to
-    // appear — reveal the mirror now (no-op in off/on).
-    if (termMode === 'auto') { termAutoShown = true; applyTermMode(); }
     // Optimistic: show user message immediately. Assistant placeholder is
     // created by openEventStream on subprocess.started. Marked .optimistic so
     // the turn-end reconcile drops it in favor of the canonical user turn.
@@ -896,13 +860,44 @@ function statusDot(status) {
 // token feed) accumulates its text into the placeholder; subprocess.exit
 // finalizes it. Turn errors surface via the 'error' event. Other jsonl lines
 // ('user', 'system', bookkeeping) are dropped as diagnostic noise.
-function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
+function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
 
   let placeholder = null;
   let accum = '';
   let opened = false;
+  // auto mode: while a turn is live, mirror the pane into a dedicated node in the
+  // placeholder bubble, below the accumulated text. It runs the WHOLE turn —
+  // covering every gap incl. tool execution — and is removed at turn end. The
+  // jsonl text renders into .content independently, so there's no handoff and no
+  // contention over one element. Tear down only our own feed: if the user
+  // switched to on mid-turn, the docked panel took over currentScreenES.
+  let inlineES = null;
+  let inlineNode = null;
+  const stopInlineMirror = () => {
+    if (inlineES) {
+      if (inlineES === currentScreenES) closeScreenES();
+      inlineES = null;
+    }
+    if (inlineNode) { inlineNode.remove(); inlineNode = null; }
+  };
+  // syncInline reconciles the mirror with mode + turn state: it runs in auto
+  // whenever a turn is live (placeholder present), torn down otherwise. Called on
+  // turn start AND on every mode toggle, so switching to auto mid-turn brings the
+  // live view back (e.g. on -> auto, where the docked panel just closed).
+  const syncInline = () => {
+    if (getTermMode && getTermMode() === 'auto' && placeholder) {
+      if (!inlineES) {
+        inlineNode = document.createElement('pre');
+        inlineNode.className = 'term-inline';
+        placeholder.appendChild(inlineNode);
+        inlineES = openScreenInline(id, inlineNode, chatEl);
+      }
+    } else {
+      stopInlineMirror();
+    }
+  };
   // On reconnect (not the first connect) re-fetch to fill any gap — but never
   // mid-turn, where the live stream owns the bubble.
   es.onopen = () => {
@@ -926,6 +921,20 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
     if (cancelBtn) cancelBtn.hidden = false;
     setLoadEarlierDisabled(true);
   };
+  // beginTurn stands up the optimistic assistant bubble + running-state UI +
+  // auto preview for a turn. It's the single idempotent entry point for every
+  // way a turn surfaces: subprocess.started (live), turn.active (server snapshot
+  // on a mid-turn connect), and the lazy first-assistant fallback. The guard
+  // makes it safe when two of those race (e.g. connecting in the window between
+  // the session flipping to running and subprocess.started being published).
+  const beginTurn = () => {
+    if (placeholder) return; // already tracking a turn
+    accum = '';
+    placeholder = appendChatMessage({ role: 'assistant', content: '' });
+    if (placeholder) placeholder.classList.add('optimistic');
+    syncInline();
+    onRunning();
+  };
 
   const setRoleText = (el, text) => {
     const roleEl = el && el.querySelector('.role');
@@ -946,12 +955,12 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   };
 
   const handlers = {
-    'subprocess.started': () => {
-      accum = '';
-      placeholder = appendChatMessage({ role: 'assistant', content: '' });
-      if (placeholder) placeholder.classList.add('optimistic');
-      onRunning();
-    },
+    // Sent by the server on connect when the session is already mid-turn (the
+    // started event predates this subscribe). beginTurn is idempotent, so if a
+    // real subprocess.started also lands (connect raced the turn starting) it
+    // won't double the bubble.
+    'turn.active': () => beginTurn(),
+    'subprocess.started': () => beginTurn(),
     'assistant': (d) => {
       // Message granularity: each assistant turn carries its full text blocks
       // (no token deltas). A turn may produce several assistant messages (text
@@ -959,15 +968,12 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       // one placeholder. Tool-only messages have no text and are skipped.
       const text = assistantText(d);
       if (!text) return;
-      // subprocess.started normally creates the bubble, but a session's first
-      // turn begins before this SSE subscribes (StartSession publishes at once
-      // and the broker has no replay), so that event is missed. Create the
-      // bubble lazily on the first assistant text so turn 1 streams like the rest.
-      if (!placeholder) {
-        placeholder = appendChatMessage({ role: 'assistant', content: '' });
-        if (placeholder) placeholder.classList.add('optimistic');
-        onRunning();
-      }
+      // subprocess.started / turn.active normally create the bubble, but if both
+      // were missed (e.g. the very first turn, before any subscribe) stand it up
+      // now — via beginTurn so the auto preview is wired too, not just a bubble.
+      if (!placeholder) beginTurn();
+      // The live mirror is a separate node below .content, so real text just
+      // accumulates here — no handoff. It keeps streaming until turn end.
       // Follow the streaming text only if the reader is at the bottom; check
       // before setContent grows the bubble.
       const stick = isNearBottom(chatEl);
@@ -976,6 +982,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       if (stick) chatEl.scrollTop = chatEl.scrollHeight;
     },
     'subprocess.exit': (d) => {
+      stopInlineMirror(); // loadTranscript below rebuilds from canonical jsonl
       // Canonicalize timestamps from server-persisted jsonl (set by
       // router.enrichExitWithTurnTimestamps). Replaces the optimistic
       // client-side "now" stamps we showed during the turn. The exit payload
@@ -999,6 +1006,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
       refreshSubtitle(id);
     },
     'error': (d) => {
+      stopInlineMirror();
       const msg = d.message || JSON.stringify(d);
       if (placeholder) {
         updateMessageTs(placeholder, new Date().toISOString());
@@ -1033,6 +1041,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
   });
 
   es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
+  return { syncInline };
 }
 
 // ---------- Terminal mirror (read-only) ----------
@@ -1043,12 +1052,11 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState) {
 // menus the curated send path can't reach (arrow navigation, esc, ctrl-c).
 // Read-only otherwise — no arbitrary typing; that's what chat is for.
 
-// openScreenStream subscribes to the pane mirror SSE. Each `screen` event
-// carries the full re-captured frame (server only sends it when it changed);
-// `nopane` means usher holds no live window. EventSource auto-reconnects.
-// Tracked in currentScreenES (not currentES) so it coexists with the detail
-// view's /events stream.
-function openScreenStream(id, screenEl, cols, rows) {
+// openScreenFeed is the shared /screen subscription: it invokes onFrame(text)
+// for each changed (deduped) capture and onNopane when usher holds no live
+// window. Tracked in currentScreenES so a new open or closeScreenES() tears it
+// down. Both the docked mirror (on) and the inline auto preview build on it.
+function openScreenFeed(id, cols, rows, onFrame, onNopane) {
   closeScreenES();
   const params = [];
   if (cols) params.push('cols=' + cols);
@@ -1063,21 +1071,40 @@ function openScreenStream(id, screenEl, cols, rows) {
     try { s = JSON.parse(ev.data); } catch { return; }
     if (s === lastRaw) return;
     lastRaw = s;
+    onFrame(s);
+  });
+  if (onNopane) es.addEventListener('nopane', () => { lastRaw = null; onNopane(); });
+  es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
+  return es;
+}
+
+// openScreenStream drives the docked on-mode panel: it mirrors the whole pane
+// (keys + furniture) into screenEl, pinning to the bottom unless the reader has
+// scrolled up.
+function openScreenStream(id, screenEl, cols, rows, dropTail) {
+  openScreenFeed(id, cols, rows, (s) => {
     const wrap = screenEl.parentElement;
-    // Keep the view pinned to the bottom only if the reader is already there,
-    // so scrolling up to inspect output isn't yanked back on the next frame.
     const atBottom = wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40) : true;
     screenEl.classList.remove('muted');
-    screenEl.innerHTML = ansiToHtml(trimTrailingBlankLines(s));
+    screenEl.innerHTML = ansiToHtml(trimMirrorFrame(s, dropTail));
     if (atBottom && wrap) wrap.scrollTop = wrap.scrollHeight;
-  });
-  es.addEventListener('nopane', () => {
-    lastRaw = null;
+  }, () => {
     screenEl.classList.add('muted');
     screenEl.textContent =
       'no live process for this session — open chat and send a message to start one.';
   });
-  es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
+}
+
+// openScreenInline (auto mode) streams the live pane into a dedicated <pre> node
+// sitting below the assistant message text for the duration of the turn — a live
+// peek at the terminal alongside the (possibly still-empty) jsonl text. Read-only
+// — furniture rows trimmed, no keys.
+function openScreenInline(id, node, chatEl) {
+  return openScreenFeed(id, measureCols(node), TERM_AUTO_ROWS, (s) => {
+    const stick = isNearBottom(chatEl);
+    node.innerHTML = ansiToHtml(trimMirrorFrame(s, TERM_FURNITURE_ROWS));
+    if (stick && chatEl) chatEl.scrollTop = chatEl.scrollHeight;
+  });
 }
 
 // wireSoftKeys POSTs the tapped key to /keys. The server allow-lists key names;
@@ -1121,16 +1148,18 @@ function measureCols(boxEl) {
   return cols > 0 ? cols : 80;
 }
 
-// trimTrailingBlankLines drops empty trailing rows from a capture-pane frame so
-// the mirror isn't padded out to the full pane height. Blankness is tested
-// after stripping SGR escapes so a colour-only-but-empty line still counts.
-function trimTrailingBlankLines(s) {
+// trimMirrorFrame cleans a capture-pane frame for the read-only mirror: it drops
+// the trailing blank pad, then the bottom `dropTail` rows — the input box + hint
+// line, which are furniture, not output (auto hides them; on passes 0 to keep
+// them for debugging / rewind). Blankness is tested after stripping SGR escapes
+// so a colour-only-but-empty line still counts.
+function trimMirrorFrame(s, dropTail) {
   const lines = String(s).split('\n');
   while (lines.length &&
          lines[lines.length - 1].replace(/\x1b\[[0-9;]*m/g, '').trim() === '') {
     lines.pop();
   }
-  return lines.join('\n');
+  return (dropTail ? lines.slice(0, -dropTail) : lines).join('\n');
 }
 
 // Base 16-colour ANSI palette (30-37 normal, 90-97 bright), toned to read on

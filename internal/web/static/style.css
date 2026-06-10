@@ -816,6 +816,25 @@ pre.raw-markdown {
 /* Status messages ("connecting…", "no live process…") wrap within the box and
  * use the page's muted colour instead of the terminal palette. */
 .term-grid.muted { color: var(--text-faint); white-space: pre-wrap; width: auto; max-width: 100%; }
+/* auto inline preview: a live peek at the terminal, rendered in its own node
+ * below the assistant message text for the duration of the turn (removed at
+ * turn end). Dark terminal ground sets it off from the prose above.
+ * overflow-y is pinned hidden: the node auto-heights to its lines, so the only
+ * vertical "overflow" is sub-pixel line-height rounding — without this, the
+ * overflow-x:auto coupling turns that into a spurious scrollbar (a ~half-row). */
+.term-inline {
+  margin: 0.4rem 0 0;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  background: #0d1117;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: pre;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.25;
+  color: #c9d1d9;
+}
 .term-keys {
   display: grid;
   grid-template-columns: repeat(7, 1fr);  /* one row; columns shrink to fit narrow phones */
