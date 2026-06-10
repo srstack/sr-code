@@ -378,6 +378,24 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 type createSessionRequest struct {
 	Cwd            string `json:"cwd"`
 	InitialMessage string `json:"initial_message"`
+	Model          string `json:"model"`
+}
+
+// allowedModels gates the --model the create form may request, keeping
+// arbitrary values out of the spawned claude command. The keys mirror the
+// dropdown in app.js; "" and "default" both mean "no --model flag" (claude's
+// own default). Resumes are unaffected — they keep their original model.
+var allowedModels = map[string]bool{
+	"": true, "default": true,
+	"opus": true, "sonnet": true, "haiku": true,
+	"opusplan": true,
+	// sonnet[1m] is meaningful: plain sonnet defaults to 200K, the suffix opts
+	// into Sonnet's 1M context. No opus[1m] — Opus is already natively 1M, so
+	// the suffix is a no-op there.
+	"sonnet[1m]": true,
+	"fable":      true,
+	// Version-pinned full ID (no short alias; plain "opus" resolves to 4.8).
+	"claude-opus-4-6": true,
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -386,7 +404,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	id, err := s.router.StartSession(req.Cwd, req.InitialMessage)
+	if !allowedModels[req.Model] {
+		writeErr(w, http.StatusBadRequest, "invalid model: "+req.Model)
+		return
+	}
+	model := req.Model
+	if model == "default" {
+		model = ""
+	}
+	id, err := s.router.StartSession(req.Cwd, req.InitialMessage, model)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

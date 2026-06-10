@@ -96,14 +96,15 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 // spawning it as needed) and streams the resulting turn's events. The channel
 // closes when the turn ends or ctx is cancelled.
 func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
-	return s.run(ctx, sessionID, prompt, cwd, true)
+	// Resumes keep their original model, so no model is threaded here.
+	return s.run(ctx, sessionID, prompt, cwd, "", true)
 }
 
 // SendNew is like Send but starts a brand-new session with the given id
 // (`--session-id`). The jsonl is created lazily once claude writes the first
 // turn; the tailer waits for it to appear.
-func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
-	return s.run(ctx, sessionID, prompt, cwd, false)
+func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model string) (<-chan StreamEvent, error) {
+	return s.run(ctx, sessionID, prompt, cwd, model, false)
 }
 
 // Has reports whether usher currently holds a live interactive process for
@@ -141,8 +142,8 @@ func (s *Sender) ResizeCanvas(sessionID string, cols, rows int) error {
 // you do NOT want processes to survive for the next usher run.
 func (s *Sender) Shutdown() { s.pool.shutdown() }
 
-func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd string, resume bool) (<-chan StreamEvent, error) {
-	fresh, err := s.pool.ensure(sessionID, cwd, resume)
+func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, resume bool) (<-chan StreamEvent, error) {
+	fresh, err := s.pool.ensure(sessionID, cwd, model, resume)
 	if err != nil {
 		return nil, err
 	}

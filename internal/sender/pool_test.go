@@ -113,18 +113,66 @@ func idFromTarget(t string) string {
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// spawnCmd returns the claude command string from the most recent
+// new-session/new-window invocation (it is the final argument tmux runs).
+func (f *fakeTmux) spawnCmd(t *testing.T) string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.cmds) - 1; i >= 0; i-- {
+		if c := f.cmds[i]; len(c) > 0 && (c[0] == "new-session" || c[0] == "new-window") {
+			return c[len(c)-1]
+		}
+	}
+	t.Fatal("no spawn command recorded")
+	return ""
+}
+
+func TestPool_SpawnSetsModelOnNewSessionOnly(t *testing.T) {
+	// Brand-new session (--session-id): --model is set.
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+	if _, err := p.ensure("s1", "/tmp", "opus", false); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := f.spawnCmd(t); !strings.Contains(cmd, "--model 'opus'") {
+		t.Fatalf("new session should carry --model 'opus', got: %s", cmd)
+	}
+
+	// Resume (--resume): --model is ignored, since claude keeps the session's
+	// original model on resume.
+	f2 := &fakeTmux{}
+	p2 := newPool(f2, "claude", nil, nil, 8, quietLogger())
+	if _, err := p2.ensure("s2", "/tmp", "opus", true); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := f2.spawnCmd(t); strings.Contains(cmd, "--model") {
+		t.Fatalf("resume should not carry --model, got: %s", cmd)
+	}
+
+	// Empty model: no flag even on a new session.
+	f3 := &fakeTmux{}
+	p3 := newPool(f3, "claude", nil, nil, 8, quietLogger())
+	if _, err := p3.ensure("s3", "/tmp", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := f3.spawnCmd(t); strings.Contains(cmd, "--model") {
+		t.Fatalf("empty model should add no flag, got: %s", cmd)
+	}
+}
+
 func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 	f := &fakeTmux{}
 	p := newPool(f, "claude", nil, nil, 8, quietLogger())
 
-	if _, err := p.ensure("s1", "/tmp", true); err != nil {
+	if _, err := p.ensure("s1", "/tmp", "", true); err != nil {
 		t.Fatal(err)
 	}
 	if !p.has("s1") {
 		t.Fatal("s1 should be live after ensure")
 	}
 	// Second ensure must not create a second window.
-	if _, err := p.ensure("s1", "/tmp", true); err != nil {
+	if _, err := p.ensure("s1", "/tmp", "", true); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.windows) != 1 {
@@ -311,7 +359,7 @@ func TestPool_ResizeCanvasSetsColsAndRestoresLatest(t *testing.T) {
 
 func mustEnsure(t *testing.T, p *pool, id string) {
 	t.Helper()
-	if _, err := p.ensure(id, "/tmp", true); err != nil {
+	if _, err := p.ensure(id, "/tmp", "", true); err != nil {
 		t.Fatal(err)
 	}
 }

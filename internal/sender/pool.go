@@ -115,7 +115,7 @@ func (p *pool) liveSessions() []string {
 // warm window reused) — callers use it to decide whether to dismiss the
 // first-launch trust prompt and how long to let the TUI settle. Safe to call
 // before every send.
-func (p *pool) ensure(sessionID, cwd string, resume bool) (fresh bool, err error) {
+func (p *pool) ensure(sessionID, cwd, model string, resume bool) (fresh bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -142,7 +142,7 @@ func (p *pool) ensure(sessionID, cwd string, resume bool) (fresh bool, err error
 		p.remove(victim)
 	}
 
-	if err := p.spawn(sessionID, cwd, resume); err != nil {
+	if err := p.spawn(sessionID, cwd, model, resume); err != nil {
 		return false, err
 	}
 	p.touch(sessionID)
@@ -153,12 +153,19 @@ func (p *pool) ensure(sessionID, cwd string, resume bool) (fresh bool, err error
 // first-launch "trust this folder" prompt (CR on the default = trust). The
 // trust prompt only appears for not-yet-trusted cwds; the CR is a harmless
 // no-op on an already-trusted resume.
-func (p *pool) spawn(sessionID, cwd string, resume bool) error {
+func (p *pool) spawn(sessionID, cwd, model string, resume bool) error {
 	idFlag := "--session-id"
 	if resume {
 		idFlag = "--resume"
 	}
 	parts := []string{shellQuote(p.claudeCmd), idFlag, shellQuote(sessionID)}
+	// --model applies only at brand-new spawn: claude ignores it on --resume
+	// (a resumed session keeps the model it was created with), so setting it
+	// only on the --session-id path matches that and avoids dead flags. The
+	// model carries through usher's later warm/resume re-spawns for free.
+	if !resume && model != "" {
+		parts = append(parts, "--model", shellQuote(model))
+	}
 	for _, a := range p.extraArgs {
 		parts = append(parts, shellQuote(a))
 	}

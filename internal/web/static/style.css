@@ -999,7 +999,8 @@ pre.raw-markdown {
 }
 .interaction.ask .qsubmit:disabled { opacity: 0.5; cursor: default; }
 
-.new-cwd-field {
+.new-cwd-field,
+.new-model-field {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -1009,6 +1010,20 @@ pre.raw-markdown {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.new-model-field > span {
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+}
+.new-model-field select {
+  font-size: 1rem;  /* >=16px: avoid iOS focus zoom */
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-chrome);
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.new-model-field select:focus { outline: none; border-color: var(--accent); }
 .new-cwd-field input {
   width: 18rem;
   max-width: 100%;  font-size: 1rem;

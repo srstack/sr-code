@@ -454,7 +454,7 @@ func extractErrorMessage(raw json.RawMessage) string {
 // immediately with the generated session id. Stream events flow to broker
 // subscribers — callers that want the first response inline should use
 // CreateSession instead. Registered in activeSend so CancelSend works.
-func (r *Router) StartSession(cwd, initialMsg string) (string, error) {
+func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 	if err := validateCreateInputs(cwd, initialMsg); err != nil {
 		return "", err
 	}
@@ -476,13 +476,13 @@ func (r *Router) StartSession(cwd, initialMsg string) (string, error) {
 	}
 	r.sendMu.Unlock()
 
-	go r.runStart(ctx, sessionID, initialMsg, cwd, tok)
+	go r.runStart(ctx, sessionID, initialMsg, cwd, model, tok)
 	return sessionID, nil
 }
 
-func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
+func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
-	ch, err := r.sender.SendNew(ctx, sessionID, prompt, cwd)
+	ch, err := r.sender.SendNew(ctx, sessionID, prompt, cwd, model)
 	if err != nil {
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
@@ -523,7 +523,7 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ch, err := r.sender.SendNew(waitCtx, sessionID, initialMsg, cwd)
+	ch, err := r.sender.SendNew(waitCtx, sessionID, initialMsg, cwd, "")
 	if err != nil {
 		return "", "", err
 	}

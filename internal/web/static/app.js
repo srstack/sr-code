@@ -463,6 +463,19 @@ async function showNewSession() {
                    placeholder="/absolute/path/to/project">
             <datalist id="new-cwd-list">${options}</datalist>
           </label>
+          <label class="new-model-field">
+            <span class="muted">model</span>
+            <select id="new-model">
+              <option value="default">Default</option>
+              <option value="fable">Fable</option>
+              <option value="opus">Opus</option>
+              <option value="claude-opus-4-6">Opus 4.6</option>
+              <option value="sonnet">Sonnet</option>
+              <option value="haiku">Haiku</option>
+              <option value="opusplan">Opus Plan</option>
+              <option value="sonnet[1m]">Sonnet [1m]</option>
+            </select>
+          </label>
         </div>
         <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
       </section>
@@ -472,6 +485,7 @@ async function showNewSession() {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cwdEl = document.getElementById('new-cwd');
+  const modelEl = document.getElementById('new-model');
   const errEl = document.getElementById('new-session-err');
   cwdEl.focus();
 
@@ -488,6 +502,7 @@ async function showNewSession() {
         body: JSON.stringify({
           cwd: cwdEl.value.trim(),
           initial_message: promptEl.value,
+          model: modelEl.value,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -849,6 +864,7 @@ async function showDetail(id) {
       submit();
     }
   });
+
   promptEl.focus();
 }
 

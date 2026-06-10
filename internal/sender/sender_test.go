@@ -90,7 +90,7 @@ func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
 	f := &fakeTmux{}
 	s, path := testSender(t, f, "new-1")
 
-	ch, err := s.SendNew(context.Background(), "new-1", "hi", "/work")
+	ch, err := s.SendNew(context.Background(), "new-1", "hi", "/work", "")
 	if err != nil {
 		t.Fatal(err)
 	}
