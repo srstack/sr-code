@@ -527,16 +527,19 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ch, cancel := s.router.SubscribeSession(id)
 	defer cancel()
 
-	// Snapshot-on-connect: the broker has no replay, so a turn that began before
-	// this subscribe (a refresh mid-turn, or a reconnect) would be invisible —
-	// the client would show no placeholder/preview until the next text flush.
-	// Emit turn.active now if the session is mid-turn; the client handles it
-	// idempotently (resumeRunning), so a reconnect won't duplicate the bubble.
+	// Snapshot-on-connect: the broker has no replay, so a turn whose start (or
+	// end) happened before this subscribe is invisible to the client. Emit the
+	// current turn state on every connect so a refresh/reconnect can reconcile
+	// either way: turn.active stands the bubble back up; turn.idle lets a client
+	// that still thinks it's mid-turn (its subprocess.exit was dropped on a
+	// dropped connection) finalize. The client handles both idempotently.
+	turnEvent := "turn.idle"
 	if sess, ok := s.router.GetSession(id); ok &&
 		(sess.Status == core.StatusRunning || sess.Status == core.StatusAwaitingPermission) {
-		if _, err := fmt.Fprint(w, "event: turn.active\ndata: {}\n\n"); err == nil {
-			flusher.Flush()
-		}
+		turnEvent = "turn.active"
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: {}\n\n", turnEvent); err == nil {
+		flusher.Flush()
 	}
 
 	heartbeat := time.NewTicker(15 * time.Second)

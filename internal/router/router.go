@@ -275,7 +275,26 @@ func (r *Router) SendKeys(id string, keys ...string) error {
 	if !r.sender.Has(id) {
 		return errors.New("session not live")
 	}
-	return r.sender.SendKeys(id, keys...)
+	if err := r.sender.SendKeys(id, keys...); err != nil {
+		return err
+	}
+	// Esc while a turn is running interrupts claude in the pane, but an
+	// interrupted turn never logs the turn_duration our tailer waits on — so the
+	// turn would stick as "running" forever. Release it the same way the cancel
+	// button does (cancel the tail ctx); the tailer then emits subprocess.exit
+	// and clients recover live. No-op when no turn is in flight.
+	for _, k := range keys {
+		if k == "Escape" {
+			r.sendMu.Lock()
+			tok := r.activeSend[id]
+			r.sendMu.Unlock()
+			if tok != nil {
+				tok.cancel()
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // ResizeCanvas sets the mirror's pane to cols×rows (and repairs any

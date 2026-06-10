@@ -51,6 +51,14 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 
 	go func() {
 		defer close(out)
+		// A turn ends one of two ways: Claude Code logs its turn_duration marker,
+		// or the send is cancelled — the cancel button, or an esc the user pressed
+		// in the mirror, which interrupts claude but (being an interrupt) never
+		// logs turn_duration. Emit subprocess.exit for both so the web UI finalizes
+		// the turn instead of waiting forever on a marker that isn't coming.
+		emitExit := func() {
+			sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+		}
 
 		f, ok := openWhenReady(ctx, path, cfg, out)
 		if !ok {
@@ -94,17 +102,19 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				// trusting it ends the turn before the tool even runs — which
 				// released ownership and sent permission prompts to the pane).
 				if isTurnComplete(line) {
-					sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+					emitExit()
 					return
 				}
 				ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
 				if !sendEvent(ctx, out, ev) {
+					emitExit() // ctx cancelled mid-stream
 					return
 				}
 			}
 
 			select {
 			case <-ctx.Done():
+				emitExit()
 				return
 			case <-ticker.C:
 			}

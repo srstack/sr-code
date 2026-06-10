@@ -40,6 +40,11 @@ const TERM_AUTO_ROWS = 12; // pane height captured for the auto inline preview
 let detailStreaming = false;
 let lastTranscriptSig = '';
 let currentDetailId = null;
+// Bumped on every showDetail entry. showDetail awaits (session fetch, transcript)
+// before opening its /events stream; a newer mount started during those awaits
+// bumps this, so the superseded run bails instead of opening — and orphaning — a
+// second EventSource that would write into the live view.
+let detailEpoch = 0;
 // The committed transcript turns currently in the DOM, as {key, node} in order.
 // Lets loadTranscript reconcile incrementally (append only what's new) instead
 // of wiping and re-rendering all ~100 turns on every turn-end — the latter is
@@ -615,6 +620,7 @@ async function loadList() {
 // ---------- Detail view ----------
 
 async function showDetail(id) {
+  const epoch = ++detailEpoch;
   clearListInterval();
   closeES();
   // Fresh view: reset sync state so a prior session's signature/stream flag
@@ -639,6 +645,7 @@ async function showDetail(id) {
     root.innerHTML = '<div class="err">' + esc(String(e)) + '</div>';
     return;
   }
+  if (epoch !== detailEpoch) return; // a newer mount superseded us mid-fetch
 
   // Show title / cwd / short id in the page header subtitle so it stays
   // visible while transcript / response sections scroll. Mirrors how main
@@ -683,6 +690,7 @@ async function showDetail(id) {
   `;
 
   await loadTranscript(id);
+  if (epoch !== detailEpoch) return; // superseded before we wired the streams
 
   const chatEl = document.getElementById('chat-scroll');
   const promptEl = document.getElementById('prompt');
@@ -960,6 +968,18 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     // real subprocess.started also lands (connect raced the turn starting) it
     // won't double the bubble.
     'turn.active': () => beginTurn(),
+    // Counterpart to turn.active: the server says no turn is running. If we still
+    // think one is — our subprocess.exit was dropped on a broken connection and
+    // the turn ended before we reconnected — finalize now, else send stays
+    // disabled and the preview streams on forever. No-op on a normal idle connect
+    // (detailStreaming already false).
+    'turn.idle': () => {
+      if (!detailStreaming) return;
+      stopInlineMirror();
+      placeholder = null;
+      onIdle();
+      loadTranscript(id);
+    },
     'subprocess.started': () => beginTurn(),
     'assistant': (d) => {
       // Message granularity: each assistant turn carries its full text blocks
