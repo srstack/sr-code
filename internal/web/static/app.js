@@ -32,11 +32,14 @@ let currentScreenES = null;
 // furniture; if claude's chrome ever changes, this is the number to revisit.
 const TERM_FURNITURE_ROWS = 4;
 const TERM_AUTO_ROWS = 12; // pane height captured for the auto inline preview
-// Detail-view transcript sync: the SSE renders only turns seen from
-// subprocess.started, so we re-fetch on turn-end and on reconnect to catch the
-// rest. Flags: detailStreaming (gate the reconnect re-fetch off a live turn),
-// lastTranscriptSig (skip an unchanged rebuild), currentDetailId (ignore a
-// re-fetch that resolves after the user navigated away).
+// Detail-view transcript sync. The live turn streams as server-grouped
+// `part` SSE events (text and tool results alike, rendered into the live
+// bubble as they happen); canonical truth-ups are fetches of /transcript —
+// a 2-turn tail at turn boundaries (refreshTail), the full window on mount /
+// reconnect-while-idle / load-earlier (loadTranscript). Flags: detailStreaming
+// (gate the reconnect re-fetch off a live turn), lastTranscriptSig (skip an
+// unchanged rebuild), currentDetailId (ignore a re-fetch that resolves after
+// the user navigated away).
 let detailStreaming = false;
 let lastTranscriptSig = '';
 let currentDetailId = null;
@@ -53,6 +56,12 @@ let detailEpoch = 0;
 // when untracked client-only bubbles — errors, optimistic placeholders — sit in
 // the same list.
 let renderedTurns = [];
+// The in-flight assistant turn, shared between the SSE part handler and the
+// transcript truth-ups (module level on purpose — a closure-held node was the
+// old detached-DOM trap when a reconcile removed it). parts holds the uuids
+// of parts already rendered, so a streamed part and a backfilled transcript
+// covering the same jsonl line can't both render.
+let liveTurn = null; // { node, parts: Set<uuid> }
 // Transcript window: render the most recent `transcriptLimit` turns; "load
 // earlier" grows it by a page and re-fetches. transcriptTotal is the server's
 // full turn count (X-Transcript-Total), used to show/hide the button.
@@ -643,6 +652,7 @@ async function showDetail(id) {
   currentDetailId = id;
   lastTranscriptSig = '';
   renderedTurns = [];
+  liveTurn = null;
   transcriptLimit = TRANSCRIPT_PAGE;
   transcriptTotal = 0;
   detailStreaming = false;
@@ -759,7 +769,7 @@ async function showDetail(id) {
     return Math.max(1, Math.min(halfRows, roomRows));
   };
   // applyTermVisibility drives the docked panel, which now serves on only —
-  // auto's mirror is the inline preview piped into the placeholder bubble during
+  // auto's mirror is the inline preview piped into the live turn bubble during
   // a turn, not this panel. The /screen restream re-applies pane size, so it's
   // skipped when the row count hasn't changed.
   const applyTermVisibility = () => {
@@ -803,7 +813,7 @@ async function showDetail(id) {
   if (termToggle && termPanel) {
     termToggle.addEventListener('click', () => {
       // off → auto → on → off. off: no mirror. auto: live output streams into
-      // the placeholder bubble during a turn (no docked panel). on: docked,
+      // the live turn bubble during a turn (no docked panel). on: docked,
       // interactive panel. The mode is a persisted preference.
       termMode = termMode === 'off' ? 'auto' : termMode === 'auto' ? 'on' : 'off';
       try { localStorage.setItem('usher.term.mode', termMode); } catch { /* private mode */ }
@@ -823,21 +833,19 @@ async function showDetail(id) {
     }
   });
 
-  // Shared state between submit and the SSE handlers: lets the exit event
-  // canonicalize the optimistic user node's timestamp from server-side ts.
-  const turnState = { userNode: null };
-  evStream = openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, () => termMode);
+  evStream = openEventStream(id, chatEl, sendBtn, cancelBtn, () => termMode);
 
   const submit = async () => {
     const text = promptEl.value;
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
-    // Optimistic: show user message immediately. Assistant placeholder is
+    // Optimistic: show the user message immediately. The live bubble is
     // created by openEventStream on subprocess.started. Marked .optimistic so
-    // the turn-end reconcile drops it in favor of the canonical user turn.
-    turnState.userNode = appendChatMessage({ role: 'user', content: text });
-    if (turnState.userNode) turnState.userNode.classList.add('optimistic');
+    // the turn.user event (or a truth-up fetch) replaces it with the
+    // canonical turn — same text, server timestamp.
+    const userNode = appendChatMessage({ role: 'user', content: text });
+    if (userNode) userNode.classList.add('optimistic');
     try {
       const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
@@ -879,24 +887,24 @@ function statusDot(status) {
 
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
 // in-flight assistant turn renders inline at the bottom of the transcript:
-// subprocess.started appends a placeholder chat-message; each 'assistant'
-// event (message granularity — the session jsonl is tailed, not a stream-json
-// token feed) accumulates its text into the placeholder; subprocess.exit
-// finalizes it. Turn errors surface via the 'error' event. Other jsonl lines
-// ('user', 'system', bookkeeping) are dropped as diagnostic noise.
-function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode) {
+// subprocess.started stands up the live bubble; each 'part' event (one
+// server-grouped TurnPart — assistant text or a rendered tool result, the
+// same shapes /transcript serves) appends into it as it happens; 'turn.user'
+// commits the canonical user prompt (adopting our optimistic echo);
+// subprocess.exit finalizes the turn via the 2-turn truth-up fetch. Turn
+// errors surface via the 'error' event.
+function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   currentES = es;
 
-  let placeholder = null;
-  let accum = '';
   let opened = false;
-  // auto mode: while a turn is live, mirror the pane into a dedicated node in the
-  // placeholder bubble, below the accumulated text. It runs the WHOLE turn —
-  // covering every gap incl. tool execution — and is removed at turn end. The
-  // jsonl text renders into .content independently, so there's no handoff and no
-  // contention over one element. Tear down only our own feed: if the user
-  // switched to on mid-turn, the docked panel took over currentScreenES.
+  // auto mode: while a turn is live, mirror the pane into a dedicated node at
+  // the bottom of the live bubble, below the streamed parts. It runs the
+  // WHOLE turn — covering every gap incl. tool execution — and is removed at
+  // turn end. Streamed parts insert above it independently, so there's no
+  // handoff and no contention over one element. Tear down only our own feed:
+  // if the user switched to on mid-turn, the docked panel took over
+  // currentScreenES.
   let inlineES = null;
   let inlineNode = null;
   const stopInlineMirror = () => {
@@ -907,15 +915,17 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     if (inlineNode) { inlineNode.remove(); inlineNode = null; }
   };
   // syncInline reconciles the mirror with mode + turn state: it runs in auto
-  // whenever a turn is live (placeholder present), torn down otherwise. Called on
-  // turn start AND on every mode toggle, so switching to auto mid-turn brings the
-  // live view back (e.g. on -> auto, where the docked panel just closed).
+  // whenever a turn is live (live bubble present), torn down otherwise. Called
+  // on turn start AND on every mode toggle, so switching to auto mid-turn
+  // brings the live view back (e.g. on -> auto, where the docked panel just
+  // closed). The node docks at the bottom of the live bubble; appendLivePart
+  // inserts streamed parts above it.
   const syncInline = () => {
-    if (getTermMode && getTermMode() === 'auto' && placeholder) {
+    if (getTermMode && getTermMode() === 'auto' && liveTurn) {
       if (!inlineES) {
         inlineNode = document.createElement('pre');
         inlineNode.className = 'term-inline';
-        placeholder.appendChild(inlineNode);
+        liveTurn.node.appendChild(inlineNode);
         inlineES = openScreenInline(id, inlineNode, chatEl);
       }
     } else {
@@ -945,17 +955,15 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     if (cancelBtn) cancelBtn.hidden = false;
     setLoadEarlierDisabled(true);
   };
-  // beginTurn stands up the optimistic assistant bubble + running-state UI +
-  // auto preview for a turn. It's the single idempotent entry point for every
-  // way a turn surfaces: subprocess.started (live), turn.active (server snapshot
-  // on a mid-turn connect), and the lazy first-assistant fallback. The guard
-  // makes it safe when two of those race (e.g. connecting in the window between
-  // the session flipping to running and subprocess.started being published).
+  // beginTurn stands up the live bubble + running-state UI + auto preview for
+  // a turn. It's the single idempotent entry point for every way a turn
+  // surfaces: subprocess.started (live), turn.active (server snapshot on a
+  // mid-turn connect), and the lazy first-part fallback. The guard makes it
+  // safe when two of those race (e.g. connecting in the window between the
+  // session flipping to running and subprocess.started being published).
   const beginTurn = () => {
-    if (placeholder) return; // already tracking a turn
-    accum = '';
-    placeholder = appendChatMessage({ role: 'assistant', content: '' });
-    if (placeholder) placeholder.classList.add('optimistic');
+    if (liveTurn) return; // already tracking a turn
+    ensureLiveTurn();
     syncInline();
     onRunning();
   };
@@ -964,26 +972,18 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     const roleEl = el && el.querySelector('.role');
     if (roleEl && roleEl.firstChild) roleEl.firstChild.textContent = text;
   };
-  const setContent = (el, raw) => {
-    const contentEl = el && el.querySelector('.content');
-    if (!contentEl) return;
-    contentEl.dataset.raw = raw;
-    contentEl.innerHTML = renderMarkdown(raw);
-  };
-  // assistantText joins the text blocks of an 'assistant' jsonl event's
-  // message, skipping thinking / tool_use blocks.
-  const assistantText = (d) => {
-    const content = d && d.message && d.message.content;
-    if (!Array.isArray(content)) return '';
-    return content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
-  };
 
   const handlers = {
     // Sent by the server on connect when the session is already mid-turn (the
     // started event predates this subscribe). beginTurn is idempotent, so if a
     // real subprocess.started also lands (connect raced the turn starting) it
-    // won't double the bubble.
-    'turn.active': () => beginTurn(),
+    // won't double the bubble. The adopt-mode truth-up backfills the parts the
+    // stream missed before this subscribe (deduped by uuid against any that
+    // race in while the fetch is in flight).
+    'turn.active': () => {
+      beginTurn();
+      refreshTail(id, { adopt: true });
+    },
     // Counterpart to turn.active: the server says no turn is running. If we still
     // think one is — our subprocess.exit was dropped on a broken connection and
     // the turn ended before we reconnected — finalize now, else send stays
@@ -992,56 +992,59 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     'turn.idle': () => {
       if (!detailStreaming) return;
       stopInlineMirror();
-      placeholder = null;
+      liveTurn = null;
       onIdle();
       loadTranscript(id);
     },
     'subprocess.started': () => beginTurn(),
-    'assistant': (d) => {
-      // Message granularity: each assistant turn carries its full text blocks
-      // (no token deltas). A turn may produce several assistant messages (text
-      // before a tool call, then more after); accumulate their text into the
-      // one placeholder. Tool-only messages have no text and are skipped.
-      const text = assistantText(d);
-      if (!text) return;
-      // subprocess.started / turn.active normally create the bubble, but if both
-      // were missed (e.g. the very first turn, before any subscribe) stand it up
-      // now — via beginTurn so the auto preview is wired too, not just a bubble.
-      if (!placeholder) beginTurn();
-      const model = d && d.message && d.message.model;
-      if (model && placeholder) {
-        const roleEl = placeholder.querySelector('.role');
-        if (roleEl) roleEl.title = model;
-      }
-      // The live mirror is a separate node below .content, so real text just
-      // accumulates here — no handoff. It keeps streaming until turn end.
-      // Follow the streaming text only if the reader is at the bottom; check
-      // before setContent grows the bubble.
-      const stick = isNearBottom(chatEl);
-      accum += (accum ? '\n' : '') + text;
-      setContent(placeholder, accum);
-      if (stick) chatEl.scrollTop = chatEl.scrollHeight;
+    // One server-grouped TurnPart (assistant text or a rendered tool result)
+    // appended to the in-progress turn. subprocess.started / turn.active
+    // normally create the bubble, but if both were missed stand it up now —
+    // via beginTurn so the auto preview is wired too, not just a bubble.
+    'part': (d) => {
+      if (!liveTurn) beginTurn();
+      appendLivePart(d);
     },
-    'subprocess.exit': (d) => {
-      stopInlineMirror(); // loadTranscript below rebuilds from canonical jsonl
-      // Canonicalize timestamps from server-persisted jsonl (set by
-      // router.enrichExitWithTurnTimestamps). Replaces the optimistic
-      // client-side "now" stamps we showed during the turn. The exit payload
-      // carries {stop_reason, user_ts, assistant_ts} — turn errors arrive via
-      // the separate 'error' event, so exit always means a clean finish here.
-      if (turnState && turnState.userNode) {
-        updateMessageTs(turnState.userNode, d.user_ts);
-        turnState.userNode = null;
+    // The canonical user prompt hit the jsonl. Adopt our optimistic echo
+    // (stamp the persisted ts, commit it); without an echo the prompt came
+    // from elsewhere (mid-turn steering, another frontend) — append it and
+    // restart the live bubble below it, since a user prompt closes the
+    // in-progress assistant turn server-side.
+    'turn.user': (d) => {
+      if (!d || !d.content) return;
+      const el = document.getElementById('chat-scroll');
+      if (!el) return;
+      const t = { role: 'user', content: d.content, ts: d.ts };
+      const echo = [...el.querySelectorAll(':scope > .chat-message.user.optimistic')]
+        .reverse()
+        .find(n => {
+          const c = n.querySelector('.content');
+          return c && c.dataset.raw === d.content;
+        });
+      if (echo) {
+        updateMessageTs(echo, d.ts);
+        echo.classList.remove('optimistic');
+        renderedTurns.push({ key: turnKey(t), node: echo });
+        return;
       }
-      if (placeholder) {
-        updateMessageTs(placeholder, d.assistant_ts || new Date().toISOString());
-        placeholder = null;
+      if (liveTurn) {
+        stopInlineMirror();
+        // An empty shell (no parts yet) would be stranded above the prompt
+        // that started the turn; drop it and let beginTurn re-create below.
+        if (!liveTurn.parts.size) liveTurn.node.remove();
+        liveTurn = null;
       }
+      const node = appendChatMessage(t);
+      if (node) renderedTurns.push({ key: turnKey(t), node });
+      if (detailStreaming) beginTurn();
+    },
+    'subprocess.exit': () => {
+      stopInlineMirror();
+      // The truth-up below replaces the live bubble with the canonical turn
+      // (server timestamps included) and fills any gap from broker drops.
+      liveTurn = null;
       onIdle();
-      // Reconcile to the canonical transcript: the live stream shows only
-      // assistant text, so this pulls in tool calls/results and any turn the
-      // SSE didn't witness from the start.
-      loadTranscript(id);
+      refreshTail(id);
       // A just-created session opened as "(untitled)"; by now the server has
       // its real title/cwd, so refresh the header too.
       refreshSubtitle(id);
@@ -1049,22 +1052,25 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
     'error': (d) => {
       stopInlineMirror();
       const msg = d.message || JSON.stringify(d);
-      if (placeholder) {
-        updateMessageTs(placeholder, new Date().toISOString());
+      if (liveTurn) {
+        updateMessageTs(liveTurn.node, new Date().toISOString());
         // Keep .optimistic: an error isn't a canonical transcript turn, so the
-        // next reconcile should clear it (matching the old full-rebuild).
-        placeholder.className = 'chat-message error optimistic';
-        setRoleText(placeholder, 'error');
-        setContent(placeholder, msg);
-        placeholder = null;
+        // next reconcile should clear it. Streamed parts stay visible above
+        // the error text until then (they're canonical in the jsonl anyway).
+        liveTurn.node.className = 'chat-message error optimistic';
+        setRoleText(liveTurn.node, 'error');
+        const div = document.createElement('div');
+        div.className = 'content';
+        div.dataset.raw = msg;
+        div.innerHTML = renderMarkdown(msg);
+        liveTurn.node.appendChild(div);
+        liveTurn = null;
       } else {
         const n = appendChatMessage({ role: 'error', content: msg, ts: new Date().toISOString() });
         if (n) n.classList.add('optimistic');
       }
       onIdle();
     },
-    // Dropped (diagnostic noise): 'user' (our own prompt / tool results),
-    // 'system' init/status, and other jsonl bookkeeping lines.
   };
 
   Object.entries(handlers).forEach(([name, fn]) => {
@@ -1387,6 +1393,149 @@ async function refreshSubtitle(id) {
   } catch {/* ignore */}
 }
 
+// ----- live turn (streamed parts) -----
+
+// ensureLiveTurn stands up the optimistic assistant bubble the streamed parts
+// render into. Parts-shaped from birth (empty parts array → role header only)
+// so it matches the structure of a committed turn.
+function ensureLiveTurn() {
+  if (liveTurn) return liveTurn;
+  const node = appendChatMessage({ role: 'assistant', parts: [] });
+  if (!node) return null;
+  node.classList.add('optimistic');
+  liveTurn = { node, parts: new Set() };
+  return liveTurn;
+}
+
+// appendLivePart renders one streamed "part" SSE event into the live bubble,
+// using the same renderers committed turns use (renderToolPart / markdown) —
+// the server grouped and rendered the content, so live and canonical views
+// can't diverge.
+function appendLivePart(d) {
+  const p = d && d.part;
+  if (!p) return;
+  const lt = ensureLiveTurn();
+  if (!lt) return;
+  if (p.uuid) {
+    if (lt.parts.has(p.uuid)) return; // a backfill already rendered this line
+    lt.parts.add(p.uuid);
+  }
+  const chat = document.getElementById('chat-scroll');
+  const stick = chat && isNearBottom(chat);
+  if (d.model) {
+    const roleEl = lt.node.querySelector('.role');
+    if (roleEl) roleEl.title = d.model;
+  }
+  const tmpl = document.createElement('template');
+  tmpl.innerHTML = p.type === 'tool'
+    ? renderToolPart(p)
+    : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
+  // The auto-mode inline mirror docks at the bottom of the bubble; parts stay
+  // above it. insertBefore(_, null) is plain append when there's no mirror.
+  lt.node.insertBefore(tmpl.content, lt.node.querySelector(':scope > .term-inline'));
+  if (stick && chat) chat.scrollTop = chat.scrollHeight;
+}
+
+// seedLiveTurn backfills the live bubble from the partial canonical turn a
+// mid-turn reconnect fetched. Parts already streamed are skipped by uuid; the
+// backfilled (strictly older) parts slot in above them.
+function seedLiveTurn(t) {
+  const lt = ensureLiveTurn();
+  if (!lt) return;
+  if (t.model) {
+    const roleEl = lt.node.querySelector('.role');
+    if (roleEl) roleEl.title = t.model;
+  }
+  updateMessageTs(lt.node, t.ts);
+  const fresh = (t.parts || []).filter(p => !p.uuid || !lt.parts.has(p.uuid));
+  for (const p of t.parts || []) if (p.uuid) lt.parts.add(p.uuid);
+  if (!fresh.length) return;
+  const tmpl = document.createElement('template');
+  tmpl.innerHTML = renderAssistantParts(fresh);
+  const roleEl = lt.node.querySelector(':scope > .role');
+  lt.node.insertBefore(tmpl.content, roleEl ? roleEl.nextSibling : lt.node.firstChild);
+}
+
+// refreshTail fetches the last two canonical turns and reconciles them into
+// the rendered tail — the turn-boundary truth-up of the part-streaming
+// protocol, kept deliberately tiny on the wire (mobile-first: the SSE already
+// delivered the turn's parts; this swaps optimistic nodes for canonical ones,
+// fills any gap left by broker drops, and stamps server timestamps). The
+// full-window loadTranscript still owns mount / reconnect-while-idle /
+// load-earlier. opts.adopt: mid-turn backfill (reconnect during a turn) — the
+// partial last assistant turn seeds the live bubble instead of committing, so
+// later part events keep appending to it.
+async function refreshTail(id, opts) {
+  opts = opts || {};
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=2');
+    if (!res.ok) return;
+    const turns = (await res.json()) || [];
+    if (id !== currentDetailId) return;
+    const total = parseInt(res.headers.get('X-Transcript-Total') || '', 10);
+    if (Number.isFinite(total)) transcriptTotal = total;
+    const el = document.getElementById('chat-scroll');
+    if (!el) return;
+    const wasAtBottom = isNearBottom(el);
+
+    let commit = turns;
+    let seed = null;
+    if (opts.adopt && turns.length && turns[turns.length - 1].role === 'assistant') {
+      seed = turns[turns.length - 1];
+      commit = turns.slice(0, -1);
+    }
+
+    // Optimistic nodes (finished live bubble, un-adopted user echo, stale
+    // error bubbles) are superseded by the canonical turns below. In adopt
+    // mode the live bubble survives — it's mid-turn and about to be seeded.
+    el.querySelectorAll(':scope > .chat-message.optimistic').forEach(n => {
+      if (opts.adopt && liveTurn && n === liveTurn.node) return;
+      n.remove();
+    });
+    if (!opts.adopt) liveTurn = null;
+
+    for (const t of commit) {
+      const k = turnKey(t);
+      // Already committed (this tail overlaps earlier-rendered turns)?
+      if (renderedTurns.slice(-(commit.length + 2)).some(r => r.key === k)) continue;
+      const last = renderedTurns[renderedTurns.length - 1];
+      if (last && sameTurnIdentity(last.key, k)) {
+        // Same turn, new content (it was in-progress at the last fetch):
+        // replace in place. A mutating turn is by definition the final
+        // rendered one, so append-then-swap keeps order.
+        const node = appendChatMessage(t);
+        if (node) {
+          last.node.remove();
+          renderedTurns[renderedTurns.length - 1] = { key: k, node };
+        }
+        continue;
+      }
+      const node = appendChatMessage(t);
+      if (node) renderedTurns.push({ key: k, node });
+    }
+
+    // Committed turns belong above the live bubble; move it back to the
+    // bottom if the appends above leapfrogged it.
+    if (opts.adopt && liveTurn && liveTurn.node.parentNode) {
+      el.insertBefore(liveTurn.node, el.querySelector(':scope > .send-anchor'));
+    }
+    if (seed) seedLiveTurn(seed);
+
+    if (wasAtBottom) el.scrollTop = el.scrollHeight;
+    // The tail diverged from whatever full-window signature we had; make the
+    // next full fetch actually reconcile.
+    lastTranscriptSig = '';
+    updateLoadEarlier(id);
+  } catch {/* transient — the next truth-up or full fetch retries */}
+}
+
+// sameTurnIdentity reports whether two turnKeys denote the same turn (same
+// role + timestamp) regardless of content — i.e. a mutated in-progress turn.
+function sameTurnIdentity(a, b) {
+  const pa = a.split('\x00'), pb = b.split('\x00');
+  return pa[0] === pb[0] && pa[1] === pb[1];
+}
+
 async function loadTranscript(id, opts) {
   opts = opts || {};
   try {
@@ -1588,8 +1737,10 @@ function appendChatMessage(m) {
   const ts = m.ts ? `<span class="ts">${esc(new Date(m.ts).toLocaleString())}</span>` : '';
   const modelAttr = m.model ? ` title="${esc(m.model)}"` : '';
 
-  if (role === 'assistant' && m.parts && m.parts.length) {
-    // Grouped assistant turn: role header + structured parts.
+  if (role === 'assistant' && m.parts) {
+    // Grouped assistant turn: role header + structured parts. An EMPTY parts
+    // array is the live-turn shell — header only; streamed parts append into
+    // it (a flat .content div here would misrender the first tool part).
     div.innerHTML =
       `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
       renderAssistantParts(m.parts);

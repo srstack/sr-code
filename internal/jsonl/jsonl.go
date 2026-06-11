@@ -168,6 +168,10 @@ type TurnPart struct {
 	Content    string `json:"content"`              // rendered markdown (text) or tool output
 	ToolName   string `json:"toolName,omitempty"`   // for type=="tool": Edit, Bash, Read, …
 	ToolTarget string `json:"toolTarget,omitempty"` // file path, command, or pattern
+	// UUID is the jsonl line the part came from (one line yields at most one
+	// part). It gives streamed parts a stable identity so a client can dedupe
+	// a live "part" event against a transcript fetch covering the same line.
+	UUID string `json:"uuid,omitempty"`
 }
 
 // Turn is a grouped, display-ready projection of one conversational exchange.
@@ -179,6 +183,107 @@ type Turn struct {
 	Parts   []TurnPart `json:"parts,omitempty"`   // assistant turns only
 	Time    time.Time  `json:"ts"`
 	Model   string     `json:"model,omitempty"` // assistant turns: model id
+}
+
+// Assembler is the single grouping engine behind both transcript reads and
+// the live event stream: feed it user/assistant events in file order and it
+// yields the same turns/parts ReadTurns serves in batch. ReadTurns is itself
+// built on an Assembler, so a part streamed live and the same turn fetched
+// later from /transcript can never disagree on grouping or rendering.
+type Assembler struct {
+	toolMap map[string]toolInfo
+	cur     *Turn
+}
+
+func NewAssembler() *Assembler {
+	return &Assembler{toolMap: map[string]toolInfo{}}
+}
+
+// Feed consumes one session event. completed holds turns this event finished
+// (a real user prompt first flushes the in-progress assistant turn, then
+// commits itself as a user turn). part is set when the event appended a part
+// to the in-progress assistant turn — the per-event increment a live stream
+// publishes (it is a copy; later Feeds don't mutate it). Events that are not
+// user/assistant lines are ignored.
+func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
+	if ev.Type != "user" && ev.Type != "assistant" {
+		return nil, nil
+	}
+
+	if ev.Type == "user" && !hasToolResult(ev.Message) {
+		// Real user prompt — flush any in-progress assistant turn.
+		if t := a.Flush(); t != nil {
+			completed = append(completed, *t)
+		}
+		if text := extractUserText(ev.Message); text != "" {
+			completed = append(completed, Turn{
+				Role:    "user",
+				Content: text,
+				Time:    ev.Timestamp,
+			})
+		}
+		return completed, nil
+	}
+
+	// Start a new assistant turn if needed (tool_result lines carry no model;
+	// messageModel simply yields "" for them).
+	if a.cur == nil {
+		a.cur = &Turn{
+			Role:  "assistant",
+			Time:  ev.Timestamp,
+			Model: messageModel(ev.Message),
+		}
+	} else if m := messageModel(ev.Message); m != "" && a.cur.Model == "" {
+		a.cur.Model = m
+	}
+
+	if ev.Type == "assistant" {
+		// Collect tool_use id→info for later matching.
+		collectToolUses(ev.Message, a.toolMap)
+		// Append a text part (skip tool_use/thinking-only messages).
+		if text := extractAssistantText(ev.Message); text != "" {
+			p := TurnPart{Type: "text", Content: text, UUID: ev.UUID}
+			a.cur.Parts = append(a.cur.Parts, p)
+			return nil, &p
+		}
+		return nil, nil
+	}
+
+	// user event carrying a tool_result: append as a "tool" part.
+	content := renderToolResult(ev)
+	if content == "" {
+		return nil, nil
+	}
+	ti := matchToolInfo(ev.Message, a.toolMap)
+	p := TurnPart{
+		Type:       "tool",
+		Content:    content,
+		ToolName:   ti.name,
+		ToolTarget: ti.target,
+		UUID:       ev.UUID,
+	}
+	a.cur.Parts = append(a.cur.Parts, p)
+	return nil, &p
+}
+
+// Model returns the model id of the in-progress assistant turn ("" if none).
+func (a *Assembler) Model() string {
+	if a.cur == nil {
+		return ""
+	}
+	return a.cur.Model
+}
+
+// Flush commits and returns the in-progress assistant turn, or nil when there
+// is none (or it gathered no parts). Call at end-of-input; a real user prompt
+// flushes implicitly via Feed.
+func (a *Assembler) Flush() *Turn {
+	t := a.cur
+	a.cur = nil
+	if t == nil || len(t.Parts) == 0 {
+		return nil
+	}
+	return t
 }
 
 // ReadTurns returns the user/assistant turns of the session at path, grouped
@@ -196,93 +301,18 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
-	toolMap := map[string]toolInfo{}
-
-	// Accumulator for the current assistant turn being built.
-	var cur *Turn
-
-	flush := func() {
-		if cur == nil {
-			return
-		}
-		if len(cur.Parts) > 0 {
-			turns = append(turns, *cur)
-		}
-		cur = nil
-	}
-
+	asm := NewAssembler()
 	for sc.Scan() {
 		ev, err := ParseLine(sc.Bytes())
 		if err != nil {
 			continue
 		}
-		if ev.Type != "user" && ev.Type != "assistant" {
-			continue
-		}
-
-		isToolResult := ev.Type == "user" && hasToolResult(ev.Message)
-
-		if ev.Type == "user" && !isToolResult {
-			// Real user prompt — flush any in-progress assistant turn.
-			flush()
-			text := extractUserText(ev.Message)
-			if text != "" {
-				turns = append(turns, Turn{
-					Role:    "user",
-					Content: text,
-					Time:    ev.Timestamp,
-				})
-			}
-			continue
-		}
-
-		if ev.Type == "assistant" {
-			// Start a new assistant turn if needed.
-			if cur == nil {
-				cur = &Turn{
-					Role:  "assistant",
-					Time:  ev.Timestamp,
-					Model: messageModel(ev.Message),
-				}
-			} else if m := messageModel(ev.Message); m != "" && cur.Model == "" {
-				cur.Model = m
-			}
-
-			// Collect tool_use id→info for later matching.
-			collectToolUses(ev.Message, toolMap)
-
-			// Append text parts (skip tool_use-only messages).
-			if text := extractAssistantText(ev.Message); text != "" {
-				cur.Parts = append(cur.Parts, TurnPart{
-					Type:    "text",
-					Content: text,
-				})
-			}
-			continue
-		}
-
-		// tool_result: append as a "tool" part to the current assistant turn.
-		if isToolResult {
-			if cur == nil {
-				cur = &Turn{
-					Role: "assistant",
-					Time: ev.Timestamp,
-				}
-			}
-			content := renderToolResult(ev)
-			if content == "" {
-				continue
-			}
-			ti := matchToolInfo(ev.Message, toolMap)
-			cur.Parts = append(cur.Parts, TurnPart{
-				Type:       "tool",
-				Content:    content,
-				ToolName:   ti.name,
-				ToolTarget: ti.target,
-			})
-		}
+		completed, _ := asm.Feed(ev)
+		turns = append(turns, completed...)
 	}
-	flush()
+	if t := asm.Flush(); t != nil {
+		turns = append(turns, *t)
+	}
 
 	if err := sc.Err(); err != nil {
 		return nil, 0, err

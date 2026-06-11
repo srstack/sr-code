@@ -1,6 +1,12 @@
 package web
 
-import "testing"
+import (
+	"compress/gzip"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestFocusSwitchBanner(t *testing.T) {
 	full := "0af0c1d2-3e4f-5678-9abc-def012345678"
@@ -30,4 +36,83 @@ func TestFocusSwitchBanner(t *testing.T) {
 	if got := focusSwitchBanner("", full, ""); got != "↪ Routing to [0af0c1d2](#/s/"+full+")\n\n" {
 		t.Errorf("untitled banner = %q", got)
 	}
+}
+
+func TestGzipMiddleware(t *testing.T) {
+	json200 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "26")
+		_, _ = w.Write([]byte(`{"hello":"compressed-yes"}`))
+	})
+	sse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("wrapper must still satisfy http.Flusher")
+		}
+		_, _ = w.Write([]byte("event: x\ndata: {}\n\n"))
+	})
+	notFound := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"nope"}`))
+	})
+
+	t.Run("compresses json 200", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/x", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		gzipMiddleware(json200).ServeHTTP(rec, req)
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("Content-Encoding = %q, want gzip", got)
+		}
+		if rec.Header().Get("Content-Length") != "" {
+			t.Error("identity Content-Length must be dropped on a gzipped body")
+		}
+		zr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatalf("body is not gzip: %v", err)
+		}
+		body, _ := io.ReadAll(zr)
+		if string(body) != `{"hello":"compressed-yes"}` {
+			t.Errorf("decompressed body = %q", body)
+		}
+	})
+
+	t.Run("skips without accept-encoding", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		gzipMiddleware(json200).ServeHTTP(rec, httptest.NewRequest("GET", "/api/x", nil))
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("must not compress when the client didn't ask")
+		}
+		if rec.Body.String() != `{"hello":"compressed-yes"}` {
+			t.Errorf("body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("leaves SSE untouched", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/s/events", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		gzipMiddleware(sse).ServeHTTP(rec, req)
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("event-stream must never be compressed")
+		}
+		if rec.Body.String() != "event: x\ndata: {}\n\n" {
+			t.Errorf("body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("leaves non-200 untouched", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/x", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		gzipMiddleware(notFound).ServeHTTP(rec, req)
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("non-200 must not be compressed")
+		}
+		if rec.Body.String() != `{"error":"nope"}` {
+			t.Errorf("body = %q", rec.Body.String())
+		}
+	})
 }

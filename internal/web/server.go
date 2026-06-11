@@ -134,7 +134,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	webSrv := &http.Server{
 		Addr:              s.addr,
-		Handler:           s.authMiddleware(webMux),
+		Handler:           gzipMiddleware(s.authMiddleware(webMux)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	hookSrv := &http.Server{
@@ -530,6 +530,20 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, turns)
 }
 
+// sseForward is the event vocabulary the web client consumes. Raw jsonl
+// lines ("user", "assistant", "system", bookkeeping types) are deliberately
+// NOT forwarded: the client renders live turns from the derived "part" /
+// "turn.user" events (server-side grouped, see router.publishStream), and
+// the raw lines — thinking blocks, usage stats, file-history snapshots —
+// would only burn mobile bandwidth.
+var sseForward = map[string]bool{
+	"subprocess.started": true,
+	"subprocess.exit":    true,
+	"error":              true,
+	"part":               true,
+	"turn.user":          true,
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.router.GetSession(id); !ok {
@@ -583,6 +597,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case ev, ok := <-ch:
 			if !ok {
 				return
+			}
+			if !sseForward[ev.Type] {
+				continue
 			}
 			payload := ev.Raw
 			if len(payload) == 0 {

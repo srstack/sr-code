@@ -311,3 +311,74 @@ func TestReadTurns_ToolTarget(t *testing.T) {
 		t.Errorf("got toolName=%q target=%q", p.ToolName, p.ToolTarget)
 	}
 }
+
+// TestAssembler_MatchesReadTurns feeds the sample fixtures line-by-line
+// through an Assembler and checks the streamed view (completed turns + the
+// final flush, with every emitted part) reproduces exactly what ReadTurns
+// returns in batch — the invariant the live "part" stream relies on.
+func TestAssembler_MatchesReadTurns(t *testing.T) {
+	for _, fixture := range []string{"testdata/sample.jsonl", "testdata/no-title.jsonl"} {
+		batch, _, err := ReadTurns(fixture, 0)
+		if err != nil {
+			t.Fatalf("%s: ReadTurns: %v", fixture, err)
+		}
+
+		data, err := os.ReadFile(fixture)
+		if err != nil {
+			t.Fatalf("%s: read: %v", fixture, err)
+		}
+		asm := NewAssembler()
+		var stream []Turn
+		var parts []TurnPart
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			ev, err := ParseLine([]byte(line))
+			if err != nil {
+				continue
+			}
+			completed, part := asm.Feed(ev)
+			stream = append(stream, completed...)
+			if part != nil {
+				parts = append(parts, *part)
+			}
+		}
+		if final := asm.Flush(); final != nil {
+			stream = append(stream, *final)
+		}
+
+		if len(stream) != len(batch) {
+			t.Fatalf("%s: stream %d turns, batch %d", fixture, len(stream), len(batch))
+		}
+		for i := range batch {
+			a, b := batch[i], stream[i]
+			if a.Role != b.Role || a.Content != b.Content || !a.Time.Equal(b.Time) ||
+				a.Model != b.Model || len(a.Parts) != len(b.Parts) {
+				t.Errorf("%s: turn %d differs:\n batch %+v\nstream %+v", fixture, i, a, b)
+				continue
+			}
+			for j := range a.Parts {
+				if a.Parts[j] != b.Parts[j] {
+					t.Errorf("%s: turn %d part %d differs:\n batch %+v\nstream %+v",
+						fixture, i, j, a.Parts[j], b.Parts[j])
+				}
+			}
+		}
+
+		// Every part emitted during streaming must appear in some assistant
+		// turn, in order — concat(parts of assistant turns) == emitted parts.
+		var want []TurnPart
+		for _, tu := range batch {
+			want = append(want, tu.Parts...)
+		}
+		if len(want) != len(parts) {
+			t.Fatalf("%s: emitted %d parts, turns hold %d", fixture, len(parts), len(want))
+		}
+		for i := range want {
+			if want[i] != parts[i] {
+				t.Errorf("%s: part %d differs:\n turn %+v\nemitted %+v", fixture, i, want[i], parts[i])
+			}
+		}
+	}
+}

@@ -183,12 +183,64 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
+	asm := jsonl.NewAssembler()
 	for ev := range ch {
-		if ev.Type == "subprocess.exit" {
-			ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw)
-		}
-		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
+		r.publishStream(sessionID, asm, ev)
 	}
+}
+
+// publishStream forwards one tail event to broker subscribers, deriving the
+// display-ready turn events alongside the raw line:
+//
+//   - the raw event keeps flowing under its jsonl type ("user", "assistant",
+//     "system", …) for non-web consumers (other frontends consume these); the
+//     web SSE layer filters them out in favour of the derived events, which
+//     are far smaller on the wire (no thinking blocks, usage stats, or file
+//     snapshots).
+//   - "part": one TurnPart appended to the in-progress assistant turn,
+//     grouped/rendered server-side by jsonl.Assembler — the same engine
+//     behind ReadTurns, so a part streamed live and the same turn fetched
+//     later from /transcript can never disagree.
+//   - "turn.user": a canonical user turn hit the jsonl (the prompt usher just
+//     injected, or one queued from another frontend mid-turn). Carries the
+//     persisted timestamp, so clients can stamp their optimistic echo.
+//
+// Returns the appended part (nil otherwise) so callers that accumulate the
+// turn's text (CreateSession) don't re-parse the payload.
+func (r *Router) publishStream(sessionID string, asm *jsonl.Assembler, ev sender.StreamEvent) *jsonl.TurnPart {
+	if ev.Type == "subprocess.exit" {
+		ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw)
+	}
+	r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
+
+	if ev.Type != "user" && ev.Type != "assistant" {
+		return nil
+	}
+	jev, err := jsonl.ParseLine(ev.Raw)
+	if err != nil {
+		return nil
+	}
+	completed, part := asm.Feed(jev)
+	for _, t := range completed {
+		if t.Role != "user" {
+			// Assistant turns are finalized client-side by the turn-end
+			// transcript truth-up; no event needed.
+			continue
+		}
+		raw, mErr := json.Marshal(map[string]any{"role": "user", "content": t.Content, "ts": t.Time})
+		if mErr == nil {
+			r.broker.Publish(broker.Event{SessionID: sessionID, Type: "turn.user", Raw: raw})
+		}
+	}
+	if part != nil {
+		raw, mErr := json.Marshal(map[string]any{
+			"role": "assistant", "ts": jev.Timestamp, "model": asm.Model(), "part": part,
+		})
+		if mErr == nil {
+			r.broker.Publish(broker.Event{SessionID: sessionID, Type: "part", Raw: raw})
+		}
+	}
+	return part
 }
 
 // enrichExitWithTurnTimestamps reads the last two user/assistant turns from
@@ -391,11 +443,11 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 				return buf.String(), nil
 			}
 			switch ev.Type {
-			case "assistant":
-				// Message granularity now (interactive claude emits no
-				// stream-json token deltas): each assistant event carries its
-				// full text blocks. Accumulate them across the turn.
-				if t := extractAssistantText(ev.Raw); t != "" {
+			case "part":
+				// Message granularity (interactive claude emits no stream-json
+				// token deltas): each text part carries one assistant message's
+				// text blocks. Accumulate them across the turn.
+				if t := partText(ev.Raw); t != "" {
 					if buf.Len() > 0 {
 						buf.WriteString("\n")
 					}
@@ -415,28 +467,23 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 	}
 }
 
-// extractAssistantText concatenates the text blocks of an "assistant" jsonl
-// line's message. Non-text blocks (thinking, tool_use) are skipped, so an
-// assistant turn that only calls a tool yields "".
-func extractAssistantText(raw json.RawMessage) string {
+// partText returns the text content of a "part" broker event — assistant
+// text parts only; tool parts and malformed payloads yield "".
+func partText(raw json.RawMessage) string {
 	var o struct {
-		Message struct {
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"message"`
+		Role string `json:"role"`
+		Part struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"part"`
 	}
 	if err := json.Unmarshal(raw, &o); err != nil {
 		return ""
 	}
-	var b strings.Builder
-	for _, c := range o.Message.Content {
-		if c.Type == "text" {
-			b.WriteString(c.Text)
-		}
+	if o.Role != "assistant" || o.Part.Type != "text" {
+		return ""
 	}
-	return b.String()
+	return o.Part.Content
 }
 
 func extractErrorMessage(raw json.RawMessage) string {
@@ -488,8 +535,9 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model str
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
+	asm := jsonl.NewAssembler()
 	for ev := range ch {
-		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
+		r.publishStream(sessionID, asm, ev)
 	}
 }
 
@@ -529,17 +577,16 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 	}
 
 	var buf strings.Builder
+	asm := jsonl.NewAssembler()
 	for ev := range ch {
-		// Forward to broker so any session-detail subscriber that opens
-		// the new tab sees the live stream too.
-		r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
-		if ev.Type == "assistant" {
-			if t := extractAssistantText(ev.Raw); t != "" {
-				if buf.Len() > 0 {
-					buf.WriteString("\n")
-				}
-				buf.WriteString(t)
+		// Forward to broker (raw + derived part/turn.user events) so any
+		// session-detail subscriber that opens the new tab sees the live
+		// stream too.
+		if p := r.publishStream(sessionID, asm, ev); p != nil && p.Type == "text" {
+			if buf.Len() > 0 {
+				buf.WriteString("\n")
 			}
+			buf.WriteString(p.Content)
 		}
 	}
 
