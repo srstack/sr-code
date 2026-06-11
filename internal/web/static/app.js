@@ -1008,6 +1008,11 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, turnState, getTermMode)
       // were missed (e.g. the very first turn, before any subscribe) stand it up
       // now — via beginTurn so the auto preview is wired too, not just a bubble.
       if (!placeholder) beginTurn();
+      const model = d && d.message && d.message.model;
+      if (model && placeholder) {
+        const roleEl = placeholder.querySelector('.role');
+        if (roleEl) roleEl.title = model;
+      }
       // The live mirror is a separate node below .content, so real text just
       // accumulates here — no handoff. It keeps streaming until turn end.
       // Follow the streaming text only if the reader is at the bottom; check
@@ -1559,9 +1564,23 @@ function appendChatMessage(m) {
   // pass it explicitly; the SSE/POST path later fills it in via
   // updateMessageTs once the server confirms the persisted ts.
   const ts = m.ts ? `<span class="ts">${esc(new Date(m.ts).toLocaleString())}</span>` : '';
-  div.innerHTML =
-    `<div class="role">${esc(role)}${ts}</div>` +
-    `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
+  const modelAttr = m.model ? ` title="${esc(m.model)}"` : '';
+  const isTool = role === 'tool';
+  const toolName = m.toolName || '';
+  const expandByDefault = /^(Edit|Write)$/i.test(toolName);
+  if (isTool) {
+    const openAttr = expandByDefault ? ' open' : '';
+    const summary = toolName || 'tool result';
+    div.innerHTML =
+      `<details class="tool-details"${openAttr}>` +
+      `<summary class="role">${esc(summary)}${ts}</summary>` +
+      `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>` +
+      `</details>`;
+  } else {
+    div.innerHTML =
+      `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
+      `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
+  }
   // send-anchor lives inside chat-scroll (sticky at bottom). Insert
   // new messages before it so it stays the last child.
   const sendAnchor = list.querySelector(':scope > .send-anchor');

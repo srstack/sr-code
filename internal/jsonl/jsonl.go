@@ -109,6 +109,64 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 	return meta, sc.Err()
 }
 
+// collectToolUseNames records tool_use id→name mappings from an assistant message.
+func collectToolUseNames(msg json.RawMessage, dst map[string]string) {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_use" && b.ID != "" && b.Name != "" {
+			dst[b.ID] = b.Name
+		}
+	}
+}
+
+// matchToolName finds the tool name for a tool_result turn by looking up its
+// tool_use_id in the accumulated mapping.
+func matchToolName(msg json.RawMessage, names map[string]string) string {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return ""
+	}
+	var blocks []struct {
+		Type      string `json:"type"`
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" && b.ToolUseID != "" {
+			return names[b.ToolUseID]
+		}
+	}
+	return ""
+}
+
+// messageModel extracts the model id from a message body (assistant events).
+func messageModel(msg json.RawMessage) string {
+	var m struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return ""
+	}
+	return m.Model
+}
+
 // extractUserContent pulls a representative text from a user message body. The
 // body's content can be either a plain string or an array of content blocks.
 func extractUserContent(msg json.RawMessage) string {
@@ -146,9 +204,11 @@ func truncate(s string, n int) string {
 
 // Turn is a flattened, display-ready projection of a session jsonl line.
 type Turn struct {
-	Role    string    `json:"role"`    // "user" | "assistant" | "tool"
-	Content string    `json:"content"` // human-readable text (tool calls inlined)
-	Time    time.Time `json:"ts"`
+	Role     string    `json:"role"`               // "user" | "assistant" | "tool"
+	Content  string    `json:"content"`             // human-readable text (tool calls inlined)
+	Time     time.Time `json:"ts"`
+	Model    string    `json:"model,omitempty"`
+	ToolName string    `json:"toolName,omitempty"` // for role=="tool": which tool produced this result
 }
 
 // ReadTurns returns the user/assistant turns of the session at path,
@@ -165,6 +225,7 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	toolNames := map[string]string{} // tool_use id → tool name
 	for sc.Scan() {
 		ev, err := ParseLine(sc.Bytes())
 		if err != nil {
@@ -172,6 +233,9 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 		}
 		if ev.Type != "user" && ev.Type != "assistant" {
 			continue
+		}
+		if ev.Type == "assistant" {
+			collectToolUseNames(ev.Message, toolNames)
 		}
 		role := turnRole(ev.Type, ev.Message)
 		var content string
@@ -183,7 +247,14 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 		if content == "" {
 			continue
 		}
-		turns = append(turns, Turn{Role: role, Content: content, Time: ev.Timestamp})
+		t := Turn{Role: role, Content: content, Time: ev.Timestamp}
+		if role == "assistant" {
+			t.Model = messageModel(ev.Message)
+		}
+		if role == "tool" {
+			t.ToolName = matchToolName(ev.Message, toolNames)
+		}
+		turns = append(turns, t)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, 0, err

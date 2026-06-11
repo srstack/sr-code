@@ -674,9 +674,25 @@ pre.raw-markdown {
 .chat-message.agent .role { color: var(--purple); }
 .chat-message.error .role { color: var(--danger); }
 /* Tool output (tool_result) — recorded as a user-role jsonl message but shown
-   as its own muted role so it doesn't read as something the user typed. */
+   as its own muted role so it doesn't read as something the user typed.
+   Collapsed by default via <details>; Edit/Write expand automatically. */
 .chat-message.tool .role { color: var(--text-faint); }
 .chat-message.tool .content { color: var(--text-muted); }
+.chat-message.tool .tool-details summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  list-style: disclosure-closed;
+}
+.chat-message.tool .tool-details[open] summary { list-style: disclosure-open; }
+.chat-message.tool .tool-details summary .ts {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
 .chat-message.placeholder .content { color: var(--text-disabled); font-style: italic; }
 .chat-message .content { margin: 0; }
 /* "Load earlier" sits at the top of the transcript when older turns exist
