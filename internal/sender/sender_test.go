@@ -44,9 +44,9 @@ func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
 			spawnSettle:   10 * time.Millisecond,
 			trustToInject: 5 * time.Millisecond,
 			warmSettle:    5 * time.Millisecond,
+			resumeReady:   100 * time.Millisecond,
 			confirm:       1 * time.Second,
 			poll:          10 * time.Millisecond,
-			attempts:      2,
 		},
 		tail: tailConfig{poll: 10 * time.Millisecond, appearWait: 2 * time.Second},
 	}
@@ -60,7 +60,8 @@ var turnLines = []string{
 }
 
 func TestSend_ResumeStreamsTurn(t *testing.T) {
-	f := &fakeTmux{}
+	// Pane already at the idle input box: no resume chooser to answer.
+	f := &fakeTmux{captureOut: "  " + inputReadyMarker + " · ← for agents\n"}
 	s, path := testSender(t, f, "sess-1")
 	// Pre-existing history so this is a resume with a non-zero offset.
 	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
@@ -120,23 +121,27 @@ func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
 	}
 }
 
-func TestSend_RetriesWhenPromptMissed(t *testing.T) {
-	f := &fakeTmux{}
-	s, path := testSender(t, f, "retry-1")
-	s.t.confirm = 200 * time.Millisecond // make the first attempt time out fast
+func TestSend_ResumeAnswersChooserWithFullSession(t *testing.T) {
+	// A long resume opens the chooser with the "summary" option highlighted;
+	// usher must move to "full session as-is" (Down) and confirm (Enter), never
+	// a bare Enter (which would pick the highlighted summary).
+	f := &fakeTmux{captureOut: "❯ 1. Resume from summary (recommended)\n" +
+		"  2. " + resumeChooserMarker + "\n  3. Don't ask me again\n"}
+	s, path := testSender(t, f, "resume-1")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	ch, err := s.Send(context.Background(), "retry-1", "hi", "/work")
+	ch, err := s.Send(context.Background(), "resume-1", "hi", "/work")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Only write the turn after the SECOND inject (second paste-buffer),
-	// forcing the retry path.
+	// Write the turn only after the prompt is injected, as claude would — so the
+	// pre-inject offset is captured before these lines (the chooser wait delays
+	// the inject, which would otherwise race the turn past the offset).
 	go func() {
-		for f.countCmd("paste-buffer") < 2 {
-			time.Sleep(5 * time.Millisecond)
+		for f.countCmd("paste-buffer") < 1 {
+			time.Sleep(2 * time.Millisecond)
 		}
 		appendLines(path, 10*time.Millisecond, turnLines...)
 	}()
@@ -145,8 +150,34 @@ func TestSend_RetriesWhenPromptMissed(t *testing.T) {
 	if !eq(types(got), []string{"subprocess.started", "user", "assistant", "subprocess.exit"}) {
 		t.Fatalf("got %v", types(got))
 	}
-	if n := f.countCmd("paste-buffer"); n != 2 {
-		t.Fatalf("expected 2 inject attempts, got %d", n)
+	// Down is unique to the chooser path (inject never sends it), so its
+	// presence proves the chooser was detected and answered toward full-session.
+	if !cmdMatches(f, "send-keys", "Down") {
+		t.Fatalf("resume chooser should be answered with Down then Enter; cmds=%v", f.cmds)
+	}
+}
+
+func TestSend_InjectsOnceNoRetry(t *testing.T) {
+	// The landed-oracle/re-inject loop is gone: exactly one paste per send, even
+	// when the user turn lands slowly (here, after a delay).
+	f := &fakeTmux{captureOut: "  " + inputReadyMarker + "\n"}
+	s, path := testSender(t, f, "once-1")
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch, err := s.Send(context.Background(), "once-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go appendLines(path, 120*time.Millisecond, turnLines...)
+
+	got := collect(t, ch, 6*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "user", "assistant", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
+	}
+	if n := f.countCmd("paste-buffer"); n != 1 {
+		t.Fatalf("expected exactly one inject, got %d", n)
 	}
 }
 

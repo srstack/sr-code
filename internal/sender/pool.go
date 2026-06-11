@@ -250,6 +250,12 @@ func (p *pool) capturePane(sessionID string) (string, error) {
 	return p.runner.run("capture-pane", "-p", "-e", "-t", target(sessionID))
 }
 
+// paneText returns the pane's rendered text without colour escapes, for
+// substring-matching TUI state (capturePane keeps the escapes for the mirror).
+func (p *pool) paneText(sessionID string) (string, error) {
+	return p.runner.run("capture-pane", "-p", "-t", target(sessionID))
+}
+
 // sendKeys forwards tmux key names (e.g. "Up", "Enter", "C-c") to the
 // session's pane. Used by the terminal mirror's soft keys to drive claude's
 // TUI menus that the curated send path can't reach. No paste-buffer here —

@@ -149,52 +149,6 @@ func openWhenReady(ctx context.Context, path string, cfg tailConfig, out chan<- 
 	}
 }
 
-// waitForUserTurn polls path for a new "user" line appended after byteOffset,
-// returning true once one appears. This is the inject-landed oracle: driving
-// the TUI by fixed delays is fragile (a long-history resume settles slowly),
-// so after pasting a prompt we confirm it actually registered before tailing.
-// Returns false on timeout or ctx cancel.
-func waitForUserTurn(ctx context.Context, path string, byteOffset int64, timeout, poll time.Duration) bool {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-
-	for {
-		if newLineOfType(path, byteOffset, "user") {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-deadline.C:
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
-// newLineOfType reports whether any complete line after byteOffset has the
-// given top-level "type". Best-effort: a missing file just yields false.
-func newLineOfType(path string, byteOffset int64, typ string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
-		return false
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		if lineType(sc.Bytes()) == typ {
-			return true
-		}
-	}
-	return false
-}
-
 func lineType(line []byte) string {
 	var head struct {
 		Type string `json:"type"`

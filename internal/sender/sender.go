@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -40,9 +41,9 @@ type timing struct {
 	spawnSettle   time.Duration // after spawning a fresh window, before first keystroke (claude boot)
 	trustToInject time.Duration // after the trust-accept Enter, before pasting the prompt
 	warmSettle    time.Duration // before pasting into an already-running window
-	confirm       time.Duration // how long to wait for the injected user turn to land
-	poll          time.Duration // file poll interval for confirm + tail
-	attempts      int           // inject attempts before giving up
+	resumeReady   time.Duration // max wait for a fresh resume's input box (incl. answering the resume chooser)
+	confirm       time.Duration // how long to wait for a brand-new session's jsonl to appear
+	poll          time.Duration // pane/file poll interval
 }
 
 type Sender struct {
@@ -84,9 +85,9 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 			spawnSettle:   5 * time.Second,
 			trustToInject: 1500 * time.Millisecond,
 			warmSettle:    400 * time.Millisecond,
+			resumeReady:   30 * time.Second,
 			confirm:       8 * time.Second,
 			poll:          150 * time.Millisecond,
-			attempts:      2,
 		},
 		tail: tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second},
 	}
@@ -160,9 +161,15 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			return
 		}
 
-		// Let a freshly-spawned window boot and dismiss the trust prompt; a
-		// warm window only needs a brief beat.
-		if fresh {
+		// Get the TUI ready to receive the prompt: a fresh resume answers the
+		// long-session chooser; a fresh new session dismisses the trust prompt;
+		// a warm window just needs a brief beat.
+		switch {
+		case fresh && resume:
+			if !s.waitResumeReady(ctx, sessionID) {
+				return
+			}
+		case fresh:
 			if !sleepCtx(ctx, s.t.spawnSettle) {
 				return
 			}
@@ -170,8 +177,10 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			if !sleepCtx(ctx, s.t.trustToInject) {
 				return
 			}
-		} else if !sleepCtx(ctx, s.t.warmSettle) {
-			return
+		default:
+			if !sleepCtx(ctx, s.t.warmSettle) {
+				return
+			}
 		}
 
 		// Resolve the jsonl path and capture the pre-inject size so the tailer
@@ -186,25 +195,20 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			}
 		}
 
-		// Inject, confirming the prompt landed (re-inject on a missed paste).
-		landed := false
-		for attempt := 0; attempt < s.t.attempts; attempt++ {
-			if err := s.pool.inject(sessionID, prompt); err != nil {
-				emitError(ctx, out, "inject prompt: "+err.Error())
+		// Inject once, then tail — no re-inject-on-miss: the old "did a user line
+		// appear in time" oracle false-negatived on a slow flush and
+		// double-submitted. A missed paste now shows in the live mirror instead.
+		if err := s.pool.inject(sessionID, prompt); err != nil {
+			emitError(ctx, out, "inject prompt: "+err.Error())
+			return
+		}
+		if path == "" {
+			// Brand-new session: jsonl is created on first write; resolve its
+			// path now so the tailer has one (discovery, not a retry).
+			if path = s.locateWait(ctx, sessionID, s.t.confirm); path == "" {
+				emitError(ctx, out, "session jsonl did not appear after prompt")
 				return
 			}
-			if path == "" {
-				path = s.locateWait(ctx, sessionID, s.t.confirm)
-			}
-			if path != "" && waitForUserTurn(ctx, path, offset, s.t.confirm, s.t.poll) {
-				landed = true
-				break
-			}
-			s.logger.Warn("injected prompt did not land; retrying", "session", sessionID, "attempt", attempt+1)
-		}
-		if !landed {
-			emitError(ctx, out, "prompt did not register in session (TUI not ready?)")
-			return
 		}
 
 		for ev := range tailTurn(ctx, path, offset, s.logger, s.tail) {
@@ -215,6 +219,44 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 	}()
 
 	return out, nil
+}
+
+// Markers for matching TUI states in a plain pane capture: the long-resume
+// chooser's "full session" option line, and the idle input box's footer.
+const (
+	resumeChooserMarker = "Resume full session as-is"
+	inputReadyMarker    = "? for shortcuts"
+)
+
+// waitResumeReady polls the pane until the input box is ready, answering the
+// long-resume chooser on the way. usher keeps the full context ("Resume full
+// session as-is"): it's not the default highlight, so Down then Enter — a bare
+// Enter would pick the summary. Bounded by s.t.resumeReady (inject anyway on
+// timeout; the mirror surfaces anything odd); returns false only on ctx cancel.
+func (s *Sender) waitResumeReady(ctx context.Context, sessionID string) bool {
+	deadline := time.NewTimer(s.t.resumeReady)
+	defer deadline.Stop()
+	ticker := time.NewTicker(s.t.poll)
+	defer ticker.Stop()
+	answered := false
+	for {
+		text, _ := s.pool.paneText(sessionID)
+		switch {
+		case !answered && strings.Contains(text, resumeChooserMarker):
+			_ = s.pool.sendKeys(sessionID, "Down")  // move off the summary default…
+			_ = s.pool.sendKeys(sessionID, "Enter") // …to "full session", confirm.
+			answered = true
+		case strings.Contains(text, inputReadyMarker):
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return true
+		case <-ticker.C:
+		}
+	}
 }
 
 // locate finds the session jsonl by its globally unique id, sidestepping the
