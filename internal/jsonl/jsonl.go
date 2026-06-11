@@ -109,53 +109,6 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 	return meta, sc.Err()
 }
 
-// collectToolUseNames records tool_use id→name mappings from an assistant message.
-func collectToolUseNames(msg json.RawMessage, dst map[string]string) {
-	var m struct {
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal(msg, &m); err != nil {
-		return
-	}
-	var blocks []struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(m.Content, &blocks); err != nil {
-		return
-	}
-	for _, b := range blocks {
-		if b.Type == "tool_use" && b.ID != "" && b.Name != "" {
-			dst[b.ID] = b.Name
-		}
-	}
-}
-
-// matchToolName finds the tool name for a tool_result turn by looking up its
-// tool_use_id in the accumulated mapping.
-func matchToolName(msg json.RawMessage, names map[string]string) string {
-	var m struct {
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal(msg, &m); err != nil {
-		return ""
-	}
-	var blocks []struct {
-		Type      string `json:"type"`
-		ToolUseID string `json:"tool_use_id"`
-	}
-	if err := json.Unmarshal(m.Content, &blocks); err != nil {
-		return ""
-	}
-	for _, b := range blocks {
-		if b.Type == "tool_result" && b.ToolUseID != "" {
-			return names[b.ToolUseID]
-		}
-	}
-	return ""
-}
-
 // messageModel extracts the model id from a message body (assistant events).
 func messageModel(msg json.RawMessage) string {
 	var m struct {
@@ -202,20 +155,37 @@ func truncate(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-// Turn is a flattened, display-ready projection of a session jsonl line.
-type Turn struct {
-	Role     string    `json:"role"`               // "user" | "assistant" | "tool"
-	Content  string    `json:"content"`             // human-readable text (tool calls inlined)
-	Time     time.Time `json:"ts"`
-	Model    string    `json:"model,omitempty"`
-	ToolName string    `json:"toolName,omitempty"` // for role=="tool": which tool produced this result
+// ---------- Turn (grouped, display-ready projection) ----------
+
+type toolInfo struct {
+	name   string
+	target string
 }
 
-// ReadTurns returns the user/assistant turns of the session at path,
-// projecting tool uses and tool results into bracketed inline annotations
-// so the transcript reads top-to-bottom in chronological order. limit > 0
-// keeps only the most recent N turns. total is the turn count before that
-// trim, so callers can tell whether older turns exist beyond the window.
+// TurnPart is one segment within a grouped assistant turn.
+type TurnPart struct {
+	Type       string `json:"type"`                 // "text" | "tool"
+	Content    string `json:"content"`              // rendered markdown (text) or tool output
+	ToolName   string `json:"toolName,omitempty"`   // for type=="tool": Edit, Bash, Read, …
+	ToolTarget string `json:"toolTarget,omitempty"` // file path, command, or pattern
+}
+
+// Turn is a grouped, display-ready projection of one conversational exchange.
+// User turns carry Content; assistant turns carry Parts (text interleaved with
+// tool calls/results, in chronological order).
+type Turn struct {
+	Role    string     `json:"role"`              // "user" | "assistant"
+	Content string     `json:"content,omitempty"` // user turns only
+	Parts   []TurnPart `json:"parts,omitempty"`   // assistant turns only
+	Time    time.Time  `json:"ts"`
+	Model   string     `json:"model,omitempty"` // assistant turns: model id
+}
+
+// ReadTurns returns the user/assistant turns of the session at path, grouped
+// so that each assistant turn is a single Turn with Parts (text blocks
+// interleaved with tool call/result pairs). limit > 0 keeps only the most
+// recent N turns. total is the turn count before that trim, so callers can
+// tell whether older turns exist beyond the window.
 func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -225,7 +195,22 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	toolNames := map[string]string{} // tool_use id → tool name
+
+	toolMap := map[string]toolInfo{}
+
+	// Accumulator for the current assistant turn being built.
+	var cur *Turn
+
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		if len(cur.Parts) > 0 {
+			turns = append(turns, *cur)
+		}
+		cur = nil
+	}
+
 	for sc.Scan() {
 		ev, err := ParseLine(sc.Bytes())
 		if err != nil {
@@ -234,28 +219,71 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 		if ev.Type != "user" && ev.Type != "assistant" {
 			continue
 		}
-		if ev.Type == "assistant" {
-			collectToolUseNames(ev.Message, toolNames)
-		}
-		role := turnRole(ev.Type, ev.Message)
-		var content string
-		if role == "tool" {
-			content = renderToolResult(ev)
-		} else {
-			content = extractTextContent(ev.Message)
-		}
-		if content == "" {
+
+		isToolResult := ev.Type == "user" && hasToolResult(ev.Message)
+
+		if ev.Type == "user" && !isToolResult {
+			// Real user prompt — flush any in-progress assistant turn.
+			flush()
+			text := extractUserText(ev.Message)
+			if text != "" {
+				turns = append(turns, Turn{
+					Role:    "user",
+					Content: text,
+					Time:    ev.Timestamp,
+				})
+			}
 			continue
 		}
-		t := Turn{Role: role, Content: content, Time: ev.Timestamp}
-		if role == "assistant" {
-			t.Model = messageModel(ev.Message)
+
+		if ev.Type == "assistant" {
+			// Start a new assistant turn if needed.
+			if cur == nil {
+				cur = &Turn{
+					Role:  "assistant",
+					Time:  ev.Timestamp,
+					Model: messageModel(ev.Message),
+				}
+			} else if m := messageModel(ev.Message); m != "" && cur.Model == "" {
+				cur.Model = m
+			}
+
+			// Collect tool_use id→info for later matching.
+			collectToolUses(ev.Message, toolMap)
+
+			// Append text parts (skip tool_use-only messages).
+			if text := extractAssistantText(ev.Message); text != "" {
+				cur.Parts = append(cur.Parts, TurnPart{
+					Type:    "text",
+					Content: text,
+				})
+			}
+			continue
 		}
-		if role == "tool" {
-			t.ToolName = matchToolName(ev.Message, toolNames)
+
+		// tool_result: append as a "tool" part to the current assistant turn.
+		if isToolResult {
+			if cur == nil {
+				cur = &Turn{
+					Role: "assistant",
+					Time: ev.Timestamp,
+				}
+			}
+			content := renderToolResult(ev)
+			if content == "" {
+				continue
+			}
+			ti := matchToolInfo(ev.Message, toolMap)
+			cur.Parts = append(cur.Parts, TurnPart{
+				Type:       "tool",
+				Content:    content,
+				ToolName:   ti.name,
+				ToolTarget: ti.target,
+			})
 		}
-		turns = append(turns, t)
 	}
+	flush()
+
 	if err := sc.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -266,15 +294,111 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 	return turns, total, nil
 }
 
-// turnRole maps a jsonl event type to a transcript role. user/assistant keep
-// their type, except a "user" event whose content is a tool_result: Claude
-// Code records tool output as a user-role message, so without this it would
-// render as something the user typed. Reclassify it as "tool".
-func turnRole(eventType string, msg json.RawMessage) string {
-	if eventType == "user" && hasToolResult(msg) {
-		return "tool"
+// collectToolUses records tool_use id→name+target from an assistant message.
+func collectToolUses(msg json.RawMessage, dst map[string]toolInfo) {
+	var m struct {
+		Content json.RawMessage `json:"content"`
 	}
-	return eventType
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return
+	}
+	var blocks []struct {
+		Type  string          `json:"type"`
+		ID    string          `json:"id"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_use" && b.ID != "" && b.Name != "" {
+			dst[b.ID] = toolInfo{
+				name:   b.Name,
+				target: toolTarget(b.Input),
+			}
+		}
+	}
+}
+
+// matchToolInfo looks up the tool name+target for the first tool_result block.
+func matchToolInfo(msg json.RawMessage, names map[string]toolInfo) toolInfo {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return toolInfo{}
+	}
+	var blocks []struct {
+		Type      string `json:"type"`
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return toolInfo{}
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" && b.ToolUseID != "" {
+			return names[b.ToolUseID]
+		}
+	}
+	return toolInfo{}
+}
+
+// extractUserText gets the text content from a real user message (not tool_result).
+func extractUserText(msg json.RawMessage) string {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// extractAssistantText extracts only the text blocks from an assistant message,
+// skipping tool_use and thinking blocks.
+func extractAssistantText(msg json.RawMessage) string {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func hasToolResult(msg json.RawMessage) bool {
@@ -298,92 +422,9 @@ func hasToolResult(msg json.RawMessage) bool {
 	return false
 }
 
-// extractTextContent flattens a message body (string OR array of blocks) into
-// a single readable string. Tool uses become "`tool: Name arg`" annotations
-// (the call/req, shown inline in the assistant turn) so transcripts read
-// top-to-bottom even when the assistant turn was mostly tool-driven; the tool's
-// result is a separate "tool" turn rendered by renderToolResult.
-func extractTextContent(msg json.RawMessage) string {
-	var m struct {
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal(msg, &m); err != nil {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(m.Content, &s); err == nil {
-		return s
-	}
-	var blocks []struct {
-		Type    string          `json:"type"`
-		Text    string          `json:"text"`
-		Name    string          `json:"name"`
-		Input   json.RawMessage `json:"input"`
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal(m.Content, &blocks); err != nil {
-		return ""
-	}
-	var parts []string
-	for _, b := range blocks {
-		switch b.Type {
-		case "text":
-			if b.Text != "" {
-				parts = append(parts, b.Text)
-			}
-		case "tool_use":
-			// The call (req) shown inline in the assistant turn, with its key
-			// argument (path / command / pattern) appended so it reads like
-			// "tool: Read /repo/foo.go". Wrapped in backticks so the markdown
-			// renderer treats it as inline code, not a malformed reference link.
-			if b.Name != "" {
-				label := "tool: " + b.Name
-				if t := toolTarget(b.Input); t != "" {
-					label += " " + t
-				}
-				parts = append(parts, "`"+strings.ReplaceAll(label, "`", "'")+"`")
-			}
-		case "tool_result":
-			if txt := flattenToolResult(b.Content); txt != "" {
-				if len([]rune(txt)) > 200 {
-					txt = string([]rune(txt)[:200]) + "…"
-				}
-				// Strip backticks from the inner text so wrapping survives.
-				txt = strings.ReplaceAll(txt, "`", "'")
-				parts = append(parts, "`result: "+txt+"`")
-			}
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func flattenToolResult(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &blocks); err == nil {
-		var parts []string
-		for _, b := range blocks {
-			if b.Type == "text" {
-				parts = append(parts, b.Text)
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-	return ""
-}
-
 // renderToolResult produces the display body for a tool_result ("tool") turn.
 // It is built from the line-level toolUseResult, which carries the rich payload
-// (Edit/Write diff, Read file content, Bash output) that the inline
+// (Edit/Write diff, Read file content, Bash stdout/stderr) that the inline
 // message.content does not; tools whose shape we do not special-case fall back
 // to the inline tool_result text.
 func renderToolResult(ev Event) string {
@@ -419,6 +460,30 @@ func firstToolResultContent(msg json.RawMessage) json.RawMessage {
 		}
 	}
 	return nil
+}
+
+func flattenToolResult(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "text" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
 }
 
 // patchHunk is one hunk of a Claude Code structuredPatch. Its Lines already

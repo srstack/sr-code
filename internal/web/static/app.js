@@ -1506,13 +1506,15 @@ async function loadEarlier(id) {
   await loadTranscript(id, { anchorTop, anchorHeight });
 }
 
-// turnKey identifies a transcript turn for incremental reconcile. Append-only
-// turns are stable, so role + timestamp + a content fingerprint (length plus a
-// short prefix) is enough to spot the divergence point cheaply, without
-// stringifying every turn's (potentially 32KB) body on each reconcile.
+// turnKey identifies a transcript turn for incremental reconcile. For user turns
+// it uses content; for assistant turns it fingerprints the parts array.
 function turnKey(t) {
+  if (t.parts && t.parts.length) {
+    const fp = t.parts.map(p => (p.type || '') + (p.toolName || '') + (p.content || '').length).join('|');
+    return (t.role || '') + '\x00' + (t.ts || '') + '\x00' + fp;
+  }
   const c = t.content || '';
-  return (t.role || '') + '' + (t.ts || '') + '' + c.length + '' + c.slice(0, 48);
+  return (t.role || '') + '\x00' + (t.ts || '') + '\x00' + c.length + '\x00' + c.slice(0, 48);
 }
 
 async function loadChatMessages(id) {
@@ -1551,6 +1553,30 @@ function renderFocus(focus) {
     `<a href="#/s/${esc(focus.session_id)}" class="subtitle-focus">focus: ${sid}</a>`;
 }
 
+// ---------- Rendering turns ----------
+
+// renderToolPart renders a single tool part as a collapsible <details> element.
+// Edit/Write expand by default; others collapse.
+function renderToolPart(p) {
+  const name = p.toolName || 'tool';
+  const target = p.toolTarget || '';
+  const expandByDefault = /^(Edit|Write)$/i.test(name);
+  const openAttr = expandByDefault ? ' open' : '';
+  const label = target ? esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' : esc(name);
+  return `<details class="tool-details"${openAttr}>` +
+    `<summary>${label}</summary>` +
+    `<div class="tool-body" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>` +
+    `</details>`;
+}
+
+// renderAssistantParts renders the parts array of a grouped assistant turn.
+function renderAssistantParts(parts) {
+  return (parts || []).map(p => {
+    if (p.type === 'tool') return renderToolPart(p);
+    return `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
+  }).join('');
+}
+
 function appendChatMessage(m) {
   const list = document.getElementById('chat-scroll');
   if (!list) return null;
@@ -1559,24 +1585,16 @@ function appendChatMessage(m) {
   const div = document.createElement('div');
   const role = m.role || 'agent';
   div.className = 'chat-message ' + role + (m._placeholder ? ' placeholder' : '');
-  // No client-side default: omitting ts shows no stamp. Callers that
-  // already have an authoritative time (server messages, client errors)
-  // pass it explicitly; the SSE/POST path later fills it in via
-  // updateMessageTs once the server confirms the persisted ts.
   const ts = m.ts ? `<span class="ts">${esc(new Date(m.ts).toLocaleString())}</span>` : '';
   const modelAttr = m.model ? ` title="${esc(m.model)}"` : '';
-  const isTool = role === 'tool';
-  const toolName = m.toolName || '';
-  const expandByDefault = /^(Edit|Write)$/i.test(toolName);
-  if (isTool) {
-    const openAttr = expandByDefault ? ' open' : '';
-    const summary = toolName || 'tool result';
+
+  if (role === 'assistant' && m.parts && m.parts.length) {
+    // Grouped assistant turn: role header + structured parts.
     div.innerHTML =
-      `<details class="tool-details"${openAttr}>` +
-      `<summary class="role">${esc(summary)}${ts}</summary>` +
-      `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>` +
-      `</details>`;
+      `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
+      renderAssistantParts(m.parts);
   } else {
+    // User, error, agent, or streaming placeholder (flat content).
     div.innerHTML =
       `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
       `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;

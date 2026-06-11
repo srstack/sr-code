@@ -673,25 +673,55 @@ pre.raw-markdown {
 .chat-message.user .role { color: var(--accent); }
 .chat-message.agent .role { color: var(--purple); }
 .chat-message.error .role { color: var(--danger); }
-/* Tool output (tool_result) — recorded as a user-role jsonl message but shown
-   as its own muted role so it doesn't read as something the user typed.
-   Collapsed by default via <details>; Edit/Write expand automatically. */
-.chat-message.tool .role { color: var(--text-faint); }
-.chat-message.tool .content { color: var(--text-muted); }
-.chat-message.tool .tool-details summary {
+/* Grouped assistant turn: tool parts render as collapsible <details> within the
+   single assistant card. Edit/Write expand by default; others collapse. */
+.chat-message.assistant .tool-details {
+  margin: 0.4rem 0;
+  border: 1px solid var(--border-muted);
+  border-radius: 4px;
+  background: var(--bg-subtle);
+}
+.chat-message.assistant .tool-details summary {
   cursor: pointer;
   color: var(--text-faint);
   font-size: 0.8rem;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  list-style: disclosure-closed;
+  list-style-type: disclosure-closed;
+  list-style-position: inside;
+  padding: 0.3rem 0.5rem;
 }
-.chat-message.tool .tool-details[open] summary { list-style: disclosure-open; }
-.chat-message.tool .tool-details summary .ts {
+.chat-message.assistant .tool-details[open] summary { list-style-type: disclosure-open; }
+.chat-message.assistant .tool-details .tool-target {
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
+  color: var(--text-muted);
+}
+.chat-message.assistant .tool-details .tool-body {
+  padding: 0 0.5rem 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  overflow-x: auto;
+  min-width: 0;
+}
+.chat-message.assistant .tool-details .tool-body pre {
+  background: var(--code-block-bg);
+  color: var(--code-block-text);
+  padding: 0.6rem 0.75rem;
+  border-radius: 5px;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+.chat-message.assistant .tool-details .tool-body pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
 }
 .chat-message.placeholder .content { color: var(--text-disabled); font-style: italic; }
 .chat-message .content { margin: 0; }

@@ -116,27 +116,30 @@ func TestReadTurns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// sample.jsonl has 2 user prompts and 1 assistant response.
+	// sample.jsonl has 2 user prompts and 1 assistant response → 3 grouped turns.
 	if len(turns) != 3 {
 		t.Fatalf("got %d turns, want 3: %+v", len(turns), turns)
 	}
 	if turns[0].Role != "user" || turns[0].Content != "first prompt" {
 		t.Errorf("turns[0] = %+v", turns[0])
 	}
-	if turns[1].Role != "assistant" || turns[1].Content != "first response" {
+	if turns[1].Role != "assistant" || len(turns[1].Parts) == 0 {
 		t.Errorf("turns[1] = %+v", turns[1])
+	}
+	if turns[1].Parts[0].Type != "text" || turns[1].Parts[0].Content != "first response" {
+		t.Errorf("turns[1].Parts[0] = %+v", turns[1].Parts[0])
 	}
 	if turns[2].Role != "user" || turns[2].Content != "second prompt" {
 		t.Errorf("turns[2] = %+v", turns[2])
 	}
 }
 
-func TestReadTurns_ToolResultRole(t *testing.T) {
+func TestReadTurns_Grouped(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "s.jsonl")
 	lines := []string{
 		`{"type":"user","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"user","content":"run ls"}}`,
-		`{"type":"assistant","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]}}`,
 		`{"type":"user","timestamp":"2026-04-26T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"file1.txt"}]}}`,
 		`{"type":"assistant","timestamp":"2026-04-26T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}`,
 	}
@@ -147,14 +150,31 @@ func TestReadTurns_ToolResultRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"user", "assistant", "tool", "assistant"}
-	if len(turns) != len(want) {
-		t.Fatalf("got %d turns, want %d: %+v", len(turns), len(want), turns)
+	// Should produce 2 turns: user + assistant (with tool + text parts).
+	if len(turns) != 2 {
+		t.Fatalf("got %d turns, want 2: %+v", len(turns), turns)
 	}
-	for i, w := range want {
-		if turns[i].Role != w {
-			t.Errorf("turns[%d].Role = %q, want %q (content=%q)", i, turns[i].Role, w, turns[i].Content)
-		}
+	if turns[0].Role != "user" || turns[0].Content != "run ls" {
+		t.Errorf("turns[0] = %+v", turns[0])
+	}
+	at := turns[1]
+	if at.Role != "assistant" {
+		t.Fatalf("turns[1].Role = %q", at.Role)
+	}
+	if at.Model != "claude-opus-4-6" {
+		t.Errorf("Model = %q", at.Model)
+	}
+	if len(at.Parts) != 2 {
+		t.Fatalf("got %d parts, want 2: %+v", len(at.Parts), at.Parts)
+	}
+	if at.Parts[0].Type != "tool" || at.Parts[0].ToolName != "Bash" {
+		t.Errorf("parts[0] = %+v", at.Parts[0])
+	}
+	if at.Parts[0].ToolTarget != "ls" {
+		t.Errorf("parts[0].ToolTarget = %q, want ls", at.Parts[0].ToolTarget)
+	}
+	if at.Parts[1].Type != "text" || at.Parts[1].Content != "done" {
+		t.Errorf("parts[1] = %+v", at.Parts[1])
 	}
 }
 
@@ -179,17 +199,28 @@ func TestReadTurns_RichToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var tools []Turn
-	for _, tn := range turns {
-		if tn.Role == "tool" {
-			tools = append(tools, tn)
+	// All events belong to one assistant turn with 3 tool parts.
+	if len(turns) != 1 {
+		t.Fatalf("got %d turns, want 1: %+v", len(turns), turns)
+	}
+	at := turns[0]
+	if at.Role != "assistant" {
+		t.Fatalf("Role = %q", at.Role)
+	}
+	var tools []TurnPart
+	for _, p := range at.Parts {
+		if p.Type == "tool" {
+			tools = append(tools, p)
 		}
 	}
 	if len(tools) != 3 {
-		t.Fatalf("got %d tool turns, want 3: %+v", len(tools), turns)
+		t.Fatalf("got %d tool parts, want 3: %+v", len(tools), at.Parts)
 	}
 
 	edit := tools[0]
+	if edit.ToolName != "Edit" {
+		t.Errorf("edit.ToolName = %q", edit.ToolName)
+	}
 	if !strings.Contains(edit.Content, "```diff") || !strings.Contains(edit.Content, "@@ -1,1 +1,2 @@") {
 		t.Errorf("edit content missing diff fence/hunk: %q", edit.Content)
 	}
@@ -198,11 +229,20 @@ func TestReadTurns_RichToolResults(t *testing.T) {
 	}
 
 	read := tools[1]
+	if read.ToolName != "Read" {
+		t.Errorf("read.ToolName = %q", read.ToolName)
+	}
 	if !strings.Contains(read.Content, "package bar") || strings.Contains(read.Content, "```diff") {
 		t.Errorf("read content = %q", read.Content)
 	}
 
 	bash := tools[2]
+	if bash.ToolName != "Bash" {
+		t.Errorf("bash.ToolName = %q", bash.ToolName)
+	}
+	if bash.ToolTarget != "go test ./..." {
+		t.Errorf("bash.ToolTarget = %q", bash.ToolTarget)
+	}
 	if !strings.Contains(bash.Content, "ok  usher  0.01s") {
 		t.Errorf("bash content = %q", bash.Content)
 	}
@@ -249,44 +289,25 @@ func TestReadTurns_Missing(t *testing.T) {
 	}
 }
 
-func TestExtractTextContent_ToolUseAndResult(t *testing.T) {
-	msg := []byte(`{"role":"assistant","content":[
-		{"type":"text","text":"running ls"},
-		{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}
-	]}`)
-	// tool_use is inlined as "tool: Name arg" alongside the assistant's prose.
-	got := extractTextContent(msg)
-	if !strings.Contains(got, "running ls") || !strings.Contains(got, "`tool: Bash ls`") {
-		t.Errorf("got %q", got)
+func TestReadTurns_ToolTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lines := []string{
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/repo/foo.go"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"ok"}]}}`,
 	}
-
-	// tool_use with a file_path arg shows the path beside the tool name.
-	msgEdit := []byte(`{"role":"assistant","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/repo/foo.go"}}]}`)
-	if got := extractTextContent(msgEdit); !strings.Contains(got, "`tool: Edit /repo/foo.go`") {
-		t.Errorf("edit tool_use got %q", got)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-
-	// tool_result with string content
-	msg2 := []byte(`{"role":"user","content":[
-		{"type":"tool_result","tool_use_id":"tu1","content":"file1.txt\nfile2.txt"}
-	]}`)
-	if got := extractTextContent(msg2); !strings.Contains(got, "`result: file1.txt") {
-		t.Errorf("string result got %q", got)
+	turns, _, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// tool_result with block content
-	msg3 := []byte(`{"role":"user","content":[
-		{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"some output"}]}
-	]}`)
-	if got := extractTextContent(msg3); !strings.Contains(got, "`result: some output") {
-		t.Errorf("block result got %q", got)
+	if len(turns) != 1 || len(turns[0].Parts) != 1 {
+		t.Fatalf("unexpected turns: %+v", turns)
 	}
-
-	// backticks in tool result are sanitized so the wrapping ` survives
-	msg4 := []byte(`{"role":"user","content":[
-		{"type":"tool_result","content":"echo ` + "`hi`" + `"}
-	]}`)
-	if got := extractTextContent(msg4); strings.Count(got, "`") != 2 {
-		t.Errorf("backtick sanitization failed: %q", got)
+	p := turns[0].Parts[0]
+	if p.ToolName != "Edit" || p.ToolTarget != "/repo/foo.go" {
+		t.Errorf("got toolName=%q target=%q", p.ToolName, p.ToolTarget)
 	}
 }
