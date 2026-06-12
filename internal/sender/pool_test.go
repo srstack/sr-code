@@ -161,6 +161,31 @@ func TestPool_SpawnSetsModelOnNewSessionOnly(t *testing.T) {
 	}
 }
 
+func TestPool_SpawnScrubsNestedClaudeEnv(t *testing.T) {
+	// The window command must unset claude's per-session context markers
+	// before exec'ing claude: with any of them inherited (usher or the tmux
+	// server started from inside a claude session), the spawned claude runs
+	// but silently persists nothing, blinding the jsonl tailer.
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+	if _, err := p.ensure("s1", "/tmp", "", true); err != nil {
+		t.Fatal(err)
+	}
+	cmd := f.spawnCmd(t)
+	if !strings.HasPrefix(cmd, "env ") {
+		t.Fatalf("spawn command should start with env -u scrub, got: %s", cmd)
+	}
+	for _, v := range []string{"CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID"} {
+		if !strings.Contains(cmd, "-u "+v+" ") {
+			t.Fatalf("spawn command should unset %s, got: %s", v, cmd)
+		}
+	}
+	// The scrub must come BEFORE the claude invocation, not swallow it.
+	if !strings.Contains(cmd, " 'claude' --resume 's1'") {
+		t.Fatalf("claude invocation should follow the scrub, got: %s", cmd)
+	}
+}
+
 func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 	f := &fakeTmux{}
 	p := newPool(f, "claude", nil, nil, 8, quietLogger())

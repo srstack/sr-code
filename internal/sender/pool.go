@@ -149,6 +149,26 @@ func (p *pool) ensure(sessionID, cwd, model string, resume bool) (fresh bool, er
 	return true, nil
 }
 
+// nestedClaudeEnv lists the per-session context markers claude exports into
+// processes it spawns. A claude started with any of these inherited runs
+// normally but SILENTLY PERSISTS NOTHING — no jsonl chain lines, no
+// ~/.claude/sessions registration — which blinds usher's tailer and loses the
+// conversation (verified 2026-06-13 on 2.1.175). They leak in when usher (or
+// the tmux server, which freezes its env at first start) is launched from
+// inside a claude session. Deliberate config vars (CLAUDE_CONFIG_DIR, ...)
+// are not scrubbed.
+var nestedClaudeEnv = []string{
+	"CLAUDECODE",
+	"CLAUDE_CODE_CHILD_SESSION",
+	"CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_ENTRYPOINT",
+	"CLAUDE_CODE_EXECPATH",
+	"CLAUDE_CODE_SSE_PORT",
+	"CLAUDE_EFFORT",
+	"CLAUDE_KEY",
+	"AI_AGENT",
+}
+
 // spawn creates the window running interactive claude and dismisses the
 // first-launch "trust this folder" prompt (CR on the default = trust). The
 // trust prompt only appears for not-yet-trusted cwds; the CR is a harmless
@@ -158,7 +178,15 @@ func (p *pool) spawn(sessionID, cwd, model string, resume bool) error {
 	if resume {
 		idFlag = "--resume"
 	}
-	parts := []string{shellQuote(p.claudeCmd), idFlag, shellQuote(sessionID)}
+	// The env -u prefix unsets nested-claude markers inside the window itself,
+	// so it covers both pollution sources (usher's environ and the tmux
+	// server's frozen env) without tracking either. Unsetting an absent var is
+	// a no-op.
+	parts := []string{"env"}
+	for _, v := range nestedClaudeEnv {
+		parts = append(parts, "-u", v)
+	}
+	parts = append(parts, shellQuote(p.claudeCmd), idFlag, shellQuote(sessionID))
 	// --model applies only at brand-new spawn: claude ignores it on --resume
 	// (a resumed session keeps the model it was created with), so setting it
 	// only on the --session-id path matches that and avoids dead flags. The
