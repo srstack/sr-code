@@ -168,10 +168,6 @@ type TurnPart struct {
 	Content    string `json:"content"`              // rendered markdown (text) or tool output
 	ToolName   string `json:"toolName,omitempty"`   // for type=="tool": Edit, Bash, Read, …
 	ToolTarget string `json:"toolTarget,omitempty"` // file path, command, or pattern
-	// UUID is the jsonl line the part came from (one line yields at most one
-	// part). It gives streamed parts a stable identity so a client can dedupe
-	// a live "part" event against a transcript fetch covering the same line.
-	UUID string `json:"uuid,omitempty"`
 }
 
 // Turn is a grouped, display-ready projection of one conversational exchange.
@@ -242,7 +238,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		collectToolUses(ev.Message, a.toolMap)
 		// Append a text part (skip tool_use/thinking-only messages).
 		if text := extractAssistantText(ev.Message); text != "" {
-			p := TurnPart{Type: "text", Content: text, UUID: ev.UUID}
+			p := TurnPart{Type: "text", Content: text}
 			a.cur.Parts = append(a.cur.Parts, p)
 			return nil, &p
 		}
@@ -260,7 +256,6 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		Content:    content,
 		ToolName:   ti.name,
 		ToolTarget: ti.target,
-		UUID:       ev.UUID,
 	}
 	a.cur.Parts = append(a.cur.Parts, p)
 	return nil, &p
