@@ -691,6 +691,12 @@ pre.raw-markdown {
   list-style-type: disclosure-closed;
   list-style-position: inside;
   padding: 0.3rem 0.5rem;
+  /* The tool target is a raw command/path with no spaces to break on (e.g. a
+   * grep with a long quoted pattern). Without this it stays one unbreakable
+   * line: harmless on a wide desktop column, but on a narrow viewport iOS
+   * Safari lets the overflow widen the whole page (its overflow:hidden on an
+   * ancestor doesn't constrain the layout viewport). Match .content's wrap. */
+  overflow-wrap: anywhere;
 }
 .chat-message.assistant .tool-details[open] summary { list-style-type: disclosure-open; }
 .chat-message.assistant .tool-details .tool-target {
