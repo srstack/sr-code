@@ -110,28 +110,33 @@ function esc(s) {
 // autolinks). marked deliberately ships without HTML sanitization, so two
 // of our own layers keep things safe:
 //
-//   1. We HTML-escape the input before parsing, then re-allow `>` so
-//      blockquotes still work. A stray `>` can't form an opening tag
-//      because `<` stays escaped, so any raw `<script>` in user content
-//      lands as literal text.
+//   1. We let marked do all entity-escaping (it correctly escapes both text
+//      and code content) and only neutralize the one thing it would pass
+//      through verbatim — raw HTML — by escaping every block/inline `html`
+//      token via the renderer hook. A raw `<script>` thus lands as literal
+//      text. (The old approach pre-escaped the whole input instead, which
+//      double-escaped entities inside code spans/fences because marked
+//      re-encodes code content — so `don't` rendered as `don&#39;t`.)
 //
 //   2. We strip risky URL schemes (javascript:/data:/vbscript:) from any
 //      <a>/<img> in marked's output before handing it to the DOM.
 //
 // Newlines follow CommonMark: single \n = space, blank line = paragraph
 // break. Users who want a visible break hit Enter twice.
-window.marked.setOptions({ gfm: true, breaks: false, silent: true });
+window.marked.use({
+  gfm: true,
+  breaks: false,
+  silent: true,
+  renderer: {
+    html(token) { return esc(typeof token === 'string' ? token : token.text); },
+  },
+});
 
 function renderMarkdown(md) {
   if (renderMode === 'raw') {
     return '<pre class="raw-markdown">' + esc(md || '') + '</pre>';
   }
-  let s = String(md || '');
-  s = s.replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  }[c]));
-  s = s.replace(/&gt;/g, '>');
-  let html = window.marked.parse(s);
+  let html = window.marked.parse(String(md || ''));
   html = html.replace(
     /(<(?:a|img)\b[^>]*?\b(?:href|src)=")\s*(?:javascript|data|vbscript)\s*:[^"]*"/gi,
     '$1#unsafe"',
