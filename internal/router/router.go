@@ -163,6 +163,15 @@ func (r *Router) SendToSession(id, text string) error {
 	if !ok {
 		return errors.New("session not found")
 	}
+	// A '!'-prefixed message is not a model turn: Claude Code runs it as a TUI
+	// bash command. That is a feature claude already has — usher is not adding
+	// command execution, only keeping such a message (which bracketed paste
+	// can't neutralize, unlike a leading '/' or '@') from wedging the turn
+	// tailer, since bash mode logs no turn_duration for it to wait on.
+	if strings.HasPrefix(text, "!") {
+		go r.injectDirect(sess.ID, text, sess.Cwd)
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	tok := &sendToken{cancel: cancel}
 
@@ -172,6 +181,25 @@ func (r *Router) SendToSession(id, text string) error {
 
 	go r.runSend(ctx, sess.ID, text, sess.Cwd, tok)
 	return nil
+}
+
+// injectDirect pastes text without turn tracking (see the '!' note in
+// SendToSession), then emits the turn.user + subprocess.exit events a normal
+// turn would, so the web client adopts the echo and returns to idle with no
+// special-casing. No activeSend: nothing to cancel, and the session stays
+// "live" rather than "running". The 45s budget covers a cold window's resume.
+func (r *Router) injectDirect(sessionID, text, cwd string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	if err := r.sender.Inject(ctx, sessionID, text, cwd); err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+		return
+	}
+	uraw, _ := json.Marshal(map[string]any{"role": "user", "content": text, "ts": time.Now().UTC()})
+	r.broker.Publish(broker.Event{SessionID: sessionID, Type: "turn.user", Raw: uraw})
+	r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
 }
 
 func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {

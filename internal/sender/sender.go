@@ -108,6 +108,21 @@ func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model stri
 	return s.run(ctx, sessionID, prompt, cwd, model, false)
 }
 
+// Inject readies the session's window (resuming if cold) and pastes prompt
+// without tailing a turn — for input that drives the TUI directly instead of
+// starting a model turn (a leading '!', claude's own bash mode), which logs no
+// turn_duration and would otherwise wedge the tailer. Never starts a session.
+func (s *Sender) Inject(ctx context.Context, sessionID, prompt, cwd string) error {
+	fresh, err := s.pool.ensure(sessionID, cwd, "", true)
+	if err != nil {
+		return err
+	}
+	if !s.readyForInject(ctx, sessionID, fresh, true) {
+		return ctx.Err()
+	}
+	return s.pool.inject(sessionID, prompt)
+}
+
 // Has reports whether usher currently holds a live interactive process for
 // sessionID.
 func (s *Sender) Has(sessionID string) bool { return s.pool.has(sessionID) }
@@ -161,26 +176,9 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			return
 		}
 
-		// Get the TUI ready to receive the prompt: a fresh resume answers the
-		// long-session chooser; a fresh new session dismisses the trust prompt;
-		// a warm window just needs a brief beat.
-		switch {
-		case fresh && resume:
-			if !s.waitResumeReady(ctx, sessionID) {
-				return
-			}
-		case fresh:
-			if !sleepCtx(ctx, s.t.spawnSettle) {
-				return
-			}
-			_ = s.pool.acceptTrust(sessionID)
-			if !sleepCtx(ctx, s.t.trustToInject) {
-				return
-			}
-		default:
-			if !sleepCtx(ctx, s.t.warmSettle) {
-				return
-			}
+		// Get the TUI ready to receive the prompt.
+		if !s.readyForInject(ctx, sessionID, fresh, resume) {
+			return
 		}
 
 		// Resolve the jsonl path and capture the pre-inject size so the tailer
@@ -219,6 +217,25 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 	}()
 
 	return out, nil
+}
+
+// readyForInject prepares the TUI to receive a pasted prompt: a fresh resume
+// answers the long-session chooser, a fresh new window dismisses the trust
+// prompt, a warm window just needs a beat. Returns false on ctx cancel. Shared
+// by the tracked (run) and untracked (Inject) paths so both prep identically.
+func (s *Sender) readyForInject(ctx context.Context, sessionID string, fresh, resume bool) bool {
+	switch {
+	case fresh && resume:
+		return s.waitResumeReady(ctx, sessionID)
+	case fresh:
+		if !sleepCtx(ctx, s.t.spawnSettle) {
+			return false
+		}
+		_ = s.pool.acceptTrust(sessionID)
+		return sleepCtx(ctx, s.t.trustToInject)
+	default:
+		return sleepCtx(ctx, s.t.warmSettle)
+	}
 }
 
 // Markers for matching TUI states in a plain pane capture: the long-resume
