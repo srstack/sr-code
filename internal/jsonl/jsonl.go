@@ -21,6 +21,7 @@ import (
 // raw payload is retained for type-specific decoding by callers.
 type Event struct {
 	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype,omitempty"` // e.g. "turn_duration" on type=system
 	SessionID string          `json:"sessionId,omitempty"`
 	Timestamp time.Time       `json:"timestamp,omitempty"`
 	Cwd       string          `json:"cwd,omitempty"`
@@ -179,6 +180,10 @@ type Turn struct {
 	Parts   []TurnPart `json:"parts,omitempty"`   // assistant turns only
 	Time    time.Time  `json:"ts"`
 	Model   string     `json:"model,omitempty"` // assistant turns: model id
+
+	// UUID is the uuid of the last jsonl event folded into an assistant
+	// turn — the fork point ForkCopy expects. User turns carry none.
+	UUID string `json:"uuid,omitempty"`
 }
 
 // Assembler is the single grouping engine behind both transcript reads and
@@ -231,6 +236,11 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		}
 	} else if m := messageModel(ev.Message); m != "" && a.cur.Model == "" {
 		a.cur.Model = m
+	}
+	// Track the turn's last event — its fork point — even when the event
+	// contributes no visible part.
+	if ev.UUID != "" {
+		a.cur.UUID = ev.UUID
 	}
 
 	if ev.Type == "assistant" {

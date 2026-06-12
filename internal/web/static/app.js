@@ -1481,6 +1481,11 @@ function finalizeTurn(id, d) {
   // fall back to the first part's ts.
   const ts = (d && d.assistant_ts) || lt.ts;
   updateMessageTs(lt.node, ts);
+  // The promote path renders no fork control of its own; arm it from the
+  // exit payload's fork point (a transcript refetch would deliver the same).
+  if (d && d.assistant_uuid && !lt.node.querySelector('.turn-fork')) {
+    lt.node.insertAdjacentHTML('beforeend', forkBtnHTML(d.assistant_uuid));
+  }
   lt.node.classList.remove('optimistic');
   renderedTurns.push({ key: turnKey({ role: 'assistant', ts, parts: lt.parts }), node: lt.node });
   transcriptTotal++;
@@ -1669,6 +1674,14 @@ function renderToolPart(p) {
     `</details>`;
 }
 
+// forkBtnHTML is the fork control at the foot of a completed assistant turn —
+// the fork keeps everything above the divider and drops everything below (on
+// the last turn: fork the current state). data-uuid is the fork point the
+// server expects; clicks are handled by a document-level delegate.
+function forkBtnHTML(uuid) {
+  return `<button class="turn-fork" type="button" data-uuid="${esc(uuid)}" title="Fork: branch a new session from this point">⑂ fork</button>`;
+}
+
 // renderAssistantParts renders the parts array of a grouped assistant turn.
 function renderAssistantParts(parts) {
   return (parts || []).map(p => {
@@ -1692,9 +1705,11 @@ function appendChatMessage(m) {
     // Grouped assistant turn: role header + structured parts. An EMPTY parts
     // array is the live-turn shell — header only; streamed parts append into
     // it (a flat .content div here would misrender the first tool part).
+    // Completed turns close with the fork control at the card's bottom edge.
     div.innerHTML =
       `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
-      renderAssistantParts(m.parts);
+      renderAssistantParts(m.parts) +
+      (m.uuid ? forkBtnHTML(m.uuid) : '');
   } else {
     // User, error, agent, or streaming placeholder (flat content).
     div.innerHTML =
@@ -1709,6 +1724,32 @@ function appendChatMessage(m) {
   if (stick) list.scrollTop = list.scrollHeight;
   return div;
 }
+
+// Fork click delegate. No confirmation: the fork is a pure server-side file
+// copy (the source session is untouched) — success navigates into the branch.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.turn-fork');
+  if (!btn || !currentDetailId) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(currentDetailId) + '/fork', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ after_uuid: btn.dataset.uuid }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      appendChatMessage({ role: 'error', content: 'fork failed: ' + (err.error || ('HTTP ' + res.status)), ts: new Date().toISOString() });
+      return;
+    }
+    const data = await res.json();
+    location.hash = '#/s/' + data.id;
+  } catch (e2) {
+    appendChatMessage({ role: 'error', content: 'fork failed: ' + String(e2), ts: new Date().toISOString() });
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // updateMessageTs sets (or inserts) the timestamp span on an existing
 // chat-message node. Used to canonicalize optimistic messages once the

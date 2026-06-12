@@ -755,6 +755,25 @@ pre.raw-markdown {
   text-transform: none;
   letter-spacing: 0;
 }
+/* Fork control: quiet text pinned to the turn card's bottom-right, flush with
+   the divider where the branch happens. Out of flow so it adds no height (a
+   full-width last content line may run under it — accepted). Always visible:
+   touch devices have no hover to reveal it. */
+.chat-message.assistant { position: relative; }
+.chat-message .turn-fork {
+  position: absolute;
+  right: 0.25rem;
+  bottom: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-disabled);
+  font-size: 0.75rem; /* matches the sidebar's "show archived" tier */
+  line-height: 1.4;
+  cursor: pointer;
+}
+.chat-message .turn-fork:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
+.chat-message .turn-fork:disabled { opacity: 0.5; cursor: default; }
 
 /* Session status dot. "live" (warm process, idle) is a DIM solid green dot —
    present but quiet, so a row of idle sessions doesn't shout and full

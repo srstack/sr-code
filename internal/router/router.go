@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,27 @@ func sliceToSet(xs []string) map[string]bool {
 
 func (r *Router) SessionPath(id string) (string, bool) {
 	return r.discovery.Path(id)
+}
+
+// ForkSession branches the conversation of srcID into a brand-new session:
+// a prefix copy of its jsonl through the turn containing afterUUID (see
+// jsonl.ForkCopy), under a fresh id in the same project dir. Pure file
+// operation — no process is spawned; the fork is resumed lazily by the pool
+// on its first send, like any idle session. Returns the new session id.
+func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
+	path, ok := r.discovery.Path(srcID)
+	if !ok {
+		return "", errors.New("session not found")
+	}
+	newID := newUUIDv4()
+	dstPath := filepath.Join(filepath.Dir(path), newID+".jsonl")
+	if err := jsonl.ForkCopy(path, dstPath, afterUUID, newID); err != nil {
+		return "", err
+	}
+	// Ingest synchronously so the id resolves the moment the client navigates
+	// to it, instead of racing the fsnotify watcher.
+	r.discovery.Upsert(dstPath)
+	return newID, nil
 }
 
 // IsArchived reports whether sessionID is archived in the default
@@ -294,6 +316,9 @@ func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMess
 	}
 	if turns[len(turns)-1].Role == "assistant" {
 		payload["assistant_ts"] = turns[len(turns)-1].Time
+		// Fork point of the turn that just finished, so the client can arm the
+		// fork control on the promoted-in-place bubble without a refetch.
+		payload["assistant_uuid"] = turns[len(turns)-1].UUID
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

@@ -114,6 +114,11 @@ func (d *Discovery) addWatches() error {
 	})
 }
 
+// Upsert synchronously ingests the session file at path. fsnotify would pick
+// it up anyway; callers that are about to hand out the session id (fork) call
+// this so the id resolves immediately instead of racing the watcher.
+func (d *Discovery) Upsert(path string) { d.upsert(path) }
+
 // upsert reads a jsonl file's metadata if unknown, or just bumps the
 // last-event timestamp from file mtime if already known. The full jsonl is
 // scanned once at first sight; subsequent writes during streaming only touch

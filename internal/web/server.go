@@ -106,6 +106,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
+	webMux.HandleFunc("POST /api/sessions/{id}/fork", s.handleFork)
 	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
@@ -471,6 +472,31 @@ func (s *Server) handleAutoApprove(w http.ResponseWriter, r *http.Request) {
 	}
 	s.router.SetAutoApprove(id, req.Enabled)
 	writeJSON(w, http.StatusOK, map[string]bool{"enabled": req.Enabled})
+}
+
+type forkRequest struct {
+	AfterUUID string `json:"after_uuid"` // fork point: the uuid a transcript turn carries
+}
+
+// handleFork branches a session at a past turn into a new session (a prefix
+// copy of its jsonl — conversation only). Responds with the new session id.
+func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req forkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.AfterUUID == "" {
+		writeErr(w, http.StatusBadRequest, "after_uuid is required")
+		return
+	}
+	newID, err := s.router.ForkSession(id, req.AfterUUID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": newID})
 }
 
 type sendRequest struct {
