@@ -80,9 +80,11 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	if permissionMode != "" {
 		extra = []string{"--permission-mode", permissionMode}
 	}
-	var env []string
+	// Suppress claude's post-turn feedback survey: left on the pane it eats the
+	// next send's keystrokes. Disabling at spawn beats per-send detection.
+	env := []string{"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"}
 	if hookSock != "" {
-		env = []string{"USHER_HOOK_SOCK=" + hookSock}
+		env = append(env, "USHER_HOOK_SOCK="+hookSock)
 	}
 	runner := execRunner{bin: "tmux", socket: socket}
 	s := &Sender{
@@ -279,33 +281,51 @@ func (s *Sender) readyForInject(ctx context.Context, sessionID string, fresh, re
 	}
 }
 
-// Markers for matching TUI states in a plain pane capture: the long-resume
-// chooser's "full session" option line, and the idle input box's footer.
+// Markers for matching TUI states in a plain pane capture: the resume chooser's
+// two option lines, the idle input box's footer, and the chooser's arrow.
 const (
-	resumeChooserMarker = "Resume full session as-is"
+	resumeChooserMarker = "Resume full session as-is" // the option usher wants
+	resumeSummaryMarker = "Resume from summary"        // the highlighted default
 	inputReadyMarker    = "? for shortcuts"
+	chooserArrow        = "❯"
 )
 
-// waitResumeReady polls the pane until the input box is ready, answering the
-// long-resume chooser on the way. usher keeps the full context ("Resume full
-// session as-is"): it's not the default highlight, so Down then Enter — a bare
-// Enter would pick the summary. Bounded by s.t.resumeReady (inject anyway on
-// timeout; the mirror surfaces anything odd); returns false only on ctx cancel.
+// chooserArrowOn reports whether the chooser's selection arrow sits on `option`
+// — arrow and option text on the SAME line. A loose Contains(option) also
+// matches that string replayed in a transcript, which fired keys into the
+// prompt box during the boot frames before the input footer rendered.
+func chooserArrowOn(text, option string) bool {
+	for _, ln := range strings.Split(text, "\n") {
+		if strings.Contains(ln, chooserArrow) && strings.Contains(ln, option) {
+			return true
+		}
+	}
+	return false
+}
+
+// waitResumeReady answers the long-resume chooser ("full session") and waits
+// for the input box, tracking the selection arrow each tick: claude swallows
+// keys aimed at the select before it mounts, so a swallowed Down must self-retry
+// (the arrow hasn't moved). Bounded by s.t.resumeReady; false only on ctx cancel.
 func (s *Sender) waitResumeReady(ctx context.Context, sessionID string) bool {
 	deadline := time.NewTimer(s.t.resumeReady)
 	defer deadline.Stop()
 	ticker := time.NewTicker(s.t.poll)
 	defer ticker.Stop()
-	answered := false
 	for {
 		text, _ := s.pool.paneText(sessionID)
 		switch {
-		case !answered && strings.Contains(text, resumeChooserMarker):
-			_ = s.pool.sendKeys(sessionID, "Down")  // move off the summary default…
-			_ = s.pool.sendKeys(sessionID, "Enter") // …to "full session", confirm.
-			answered = true
 		case strings.Contains(text, inputReadyMarker):
-			return true
+			// Box ready. Settle first or the Enter after inject's paste races
+			// the still-settling TUI and is dropped (the "lost Enter" on resume).
+			return sleepCtx(ctx, s.t.trustToInject)
+		case chooserArrowOn(text, resumeChooserMarker):
+			// Arrow on "full session": confirm.
+			_ = s.pool.sendKeys(sessionID, "Enter")
+		case chooserArrowOn(text, resumeSummaryMarker):
+			// Arrow on the summary default: step down (a leaked Down is harmless,
+			// unlike a digit or Enter); re-read next tick.
+			_ = s.pool.sendKeys(sessionID, "Down")
 		}
 		select {
 		case <-ctx.Done():

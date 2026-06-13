@@ -123,8 +123,8 @@ func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
 
 func TestSend_ResumeAnswersChooserWithFullSession(t *testing.T) {
 	// A long resume opens the chooser with the "summary" option highlighted;
-	// usher must move to "full session as-is" (Down) and confirm (Enter), never
-	// a bare Enter (which would pick the highlighted summary).
+	// usher must step the arrow down to "full session as-is", never a bare
+	// Enter (which would pick the highlighted summary default).
 	f := &fakeTmux{captureOut: "❯ 1. Resume from summary (recommended)\n" +
 		"  2. " + resumeChooserMarker + "\n  3. Don't ask me again\n"}
 	s, path := testSender(t, f, "resume-1")
@@ -153,7 +153,28 @@ func TestSend_ResumeAnswersChooserWithFullSession(t *testing.T) {
 	// Down is unique to the chooser path (inject never sends it), so its
 	// presence proves the chooser was detected and answered toward full-session.
 	if !cmdMatches(f, "send-keys", "Down") {
-		t.Fatalf("resume chooser should be answered with Down then Enter; cmds=%v", f.cmds)
+		t.Fatalf("resume chooser should be answered by stepping to full-session; cmds=%v", f.cmds)
+	}
+}
+
+func TestChooserArrowOn(t *testing.T) {
+	// The chooser's option strings appear verbatim in a session's own
+	// transcript; a loose Contains(marker) match fired keystrokes into the
+	// prompt box during the boot frames before the input footer rendered. The
+	// arrow-row match must require the selection arrow on the SAME line.
+	transcript := "  we replaced the blind Down with Resume full session as-is handling\n" +
+		"❯ \n" + // the idle prompt's own arrow, on its own line
+		"  ? for shortcuts"
+	if chooserArrowOn(transcript, resumeChooserMarker) {
+		t.Fatal("must not match option text in transcript that lacks the arrow on its line")
+	}
+	chooser := "❯ 1. Resume from summary (recommended)\n" +
+		"  2. Resume full session as-is\n  3. Don't ask me again"
+	if !chooserArrowOn(chooser, resumeSummaryMarker) {
+		t.Fatal("must match the arrow on the highlighted summary default")
+	}
+	if chooserArrowOn(chooser, resumeChooserMarker) {
+		t.Fatal("must not report full-session selected while the arrow is on summary")
 	}
 }
 
