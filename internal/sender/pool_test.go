@@ -205,6 +205,44 @@ func TestPool_EnsureSpawnsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestPool_KillRemovesWindowAndLRU(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+
+	mustEnsure(t, p, "a")
+	mustEnsure(t, p, "b")
+
+	if err := p.kill("a"); err != nil {
+		t.Fatal(err)
+	}
+	if p.has("a") {
+		t.Fatal("a should be gone after kill")
+	}
+	if !p.has("b") {
+		t.Fatal("kill must not touch other sessions")
+	}
+	if contains(p.lru, "a") {
+		t.Fatalf("a should be dropped from lru, got %v", p.lru)
+	}
+	if f.countCmd("kill-window") != 1 {
+		t.Fatalf("expected one kill-window, got %d", f.countCmd("kill-window"))
+	}
+}
+
+func TestPool_KillUnknownSessionIsNoop(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 8, quietLogger())
+
+	// No live window for "ghost": kill must not issue a kill-window (which would
+	// error against tmux) and must not fail.
+	if err := p.kill("ghost"); err != nil {
+		t.Fatal(err)
+	}
+	if f.countCmd("kill-window") != 0 {
+		t.Fatalf("expected no kill-window for an absent session, got %d", f.countCmd("kill-window"))
+	}
+}
+
 func TestPool_LRUEviction(t *testing.T) {
 	f := &fakeTmux{}
 	p := newPool(f, "claude", nil, nil, 2, quietLogger())

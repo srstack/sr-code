@@ -175,6 +175,43 @@ func (r *Router) Unarchive(sessionID string) {
 	r.archive.Unarchive(sessionID, sess.LastEventAt, time.Now())
 }
 
+// DeleteSession permanently removes a session: it cancels any in-flight turn,
+// kills usher's live window for it (if any), deletes the session jsonl from
+// disk, and forgets all per-session state (archive decision, auto-approve,
+// remembered permission rules). Irreversible — the conversation is gone with
+// the file. Errors if the session is unknown or the file delete fails; the
+// live-process teardown is best-effort. Unlike Archive (a reversible sidebar
+// hide), this is destructive.
+func (r *Router) DeleteSession(id string) error {
+	path, ok := r.discovery.Path(id)
+	if !ok {
+		return errors.New("session not found")
+	}
+	// Release any in-flight turn first so its tail goroutine stops before the
+	// file is pulled out from under it.
+	r.sendMu.Lock()
+	tok := r.activeSend[id]
+	r.sendMu.Unlock()
+	if tok != nil {
+		tok.cancel()
+	}
+	if err := r.sender.Kill(id); err != nil {
+		slog.Warn("kill session window on delete", "session", id, "err", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session file: %w", err)
+	}
+	// Forget it synchronously so the id stops resolving immediately instead of
+	// racing the fsnotify Remove event (mirror of fork's Upsert).
+	r.discovery.Remove(id)
+	if r.archive != nil {
+		r.archive.Forget(id)
+	}
+	r.hooks.SetAutoApprove(id, false)
+	r.hooks.ForgetSessionRules(id)
+	return nil
+}
+
 // --- session writes ------------------------------------------------------
 
 // SendToSession spawns a fire-and-forget subprocess for the session. Stream

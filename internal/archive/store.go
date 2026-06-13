@@ -152,6 +152,20 @@ func (s *Store) Unarchive(id string, lastEventAt time.Time, now time.Time) {
 	s.persist()
 }
 
+// Forget drops any manual decision for id, for when the session is deleted
+// outright. Without it a deleted session's entry would linger in archived.json
+// forever (harmless, since ids never recur, but it accumulates). A no-op when
+// there is no entry.
+func (s *Store) Forget(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.manual[id]; !ok {
+		return
+	}
+	delete(s.manual, id)
+	s.persist()
+}
+
 // IsArchived reports whether a session should be archived in the
 // default view. Manual decisions win; otherwise the session is
 // archived iff auto-archive is enabled and the session has been

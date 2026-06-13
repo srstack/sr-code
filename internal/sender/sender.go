@@ -172,6 +172,10 @@ func (s *Sender) LiveSessions() []string { return s.pool.liveSessions() }
 // process (Ctrl-C into the pane).
 func (s *Sender) Interrupt(sessionID string) error { return s.pool.interrupt(sessionID) }
 
+// Kill tears down usher's live window for sessionID, if any (its claude
+// exits). Used when deleting a session; a no-op when nothing is live.
+func (s *Sender) Kill(sessionID string) error { return s.pool.kill(sessionID) }
+
 // CapturePane returns the current rendered contents (with colour escapes) of
 // the session's interactive pane, for the read-only terminal mirror. Errors
 // if usher holds no live window for sessionID.
@@ -285,7 +289,7 @@ func (s *Sender) readyForInject(ctx context.Context, sessionID string, fresh, re
 // two option lines, the idle input box's footer, and the chooser's arrow.
 const (
 	resumeChooserMarker = "Resume full session as-is" // the option usher wants
-	resumeSummaryMarker = "Resume from summary"        // the highlighted default
+	resumeSummaryMarker = "Resume from summary"       // the highlighted default
 	inputReadyMarker    = "? for shortcuts"
 	chooserArrow        = "❯"
 )

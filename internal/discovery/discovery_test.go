@@ -86,6 +86,29 @@ func TestDiscovery_GetAndPath(t *testing.T) {
 	}
 }
 
+func TestDiscovery_Remove(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "-tmp-x", "abc.jsonl")
+	writeJSONL(t, path, "abc", "/tmp/x", "hi")
+
+	d := newTestDiscovery(t, tmp)
+	if err := d.scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := d.Get("abc"); !ok {
+		t.Fatal("precondition: abc should be known")
+	}
+
+	d.Remove("abc")
+	if _, ok := d.Get("abc"); ok {
+		t.Error("Get returned ok after Remove")
+	}
+	if _, ok := d.Path("abc"); ok {
+		t.Error("Path returned ok after Remove")
+	}
+	d.Remove("abc") // idempotent / unknown id is a no-op
+}
+
 func TestDiscovery_WatchPicksUpNewFile(t *testing.T) {
 	tmp := t.TempDir()
 	d := newTestDiscovery(t, tmp)

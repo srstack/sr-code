@@ -185,7 +185,16 @@ func (d *Discovery) upsert(path string) {
 }
 
 func (d *Discovery) remove(path string) {
-	id := sessionIDFromPath(path)
+	d.Remove(sessionIDFromPath(path))
+}
+
+// Remove forgets a session by id. fsnotify would pick a file deletion up
+// anyway; callers that delete the jsonl themselves call this so the id stops
+// resolving immediately instead of racing the watcher (mirror of Upsert).
+func (d *Discovery) Remove(id string) {
+	if id == "" {
+		return
+	}
 	d.mu.Lock()
 	delete(d.sessions, id)
 	delete(d.paths, id)

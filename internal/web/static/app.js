@@ -383,8 +383,10 @@ function openKebabPopover(btn) {
   const id = btn.dataset.id;
   const archived = btn.dataset.archived === '1';
   const action = archived ? 'unarchive' : 'archive';
+  const label = archived ? 'Unarchive' : 'Archive';
   kebabPopover.innerHTML =
-    `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${action}</button>`;
+    `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
+    `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`;
   kebabPopover.hidden = false;
   // Position below-right of the button; clamp to viewport edges so the
   // menu stays fully visible on narrow screens.
@@ -448,6 +450,10 @@ if (sidebarEl) sidebarEl.addEventListener('scroll', closeKebabPopover, { passive
 
 async function handleKebabAction(action, id) {
   closeKebabPopover();
+  if (action === 'delete') {
+    deleteSession(id);
+    return;
+  }
   const method = action === 'archive' ? 'POST' : 'DELETE';
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/archive', { method });
@@ -456,6 +462,27 @@ async function handleKebabAction(action, id) {
     loadList(); // no-op unless the list view is open
   } catch (e) {
     console.warn('archive/unarchive failed', e);
+  }
+}
+
+// deleteSession permanently removes a session (and its transcript) after a
+// confirm — irreversible, unlike archive. If the deleted session is the one on
+// screen, route home so the detail view doesn't sit on a now-404 id.
+async function deleteSession(id) {
+  if (!confirm('Delete this session permanently? Its conversation transcript will be removed and cannot be recovered.')) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (location.hash === '#/s/' + encodeURIComponent(id)) {
+      location.hash = '#/';
+    }
+    loadSidebar();
+    loadList(); // no-op unless the list view is open
+  } catch (e) {
+    console.warn('delete failed', e);
+    alert('Failed to delete session.');
   }
 }
 

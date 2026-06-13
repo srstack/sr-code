@@ -277,6 +277,20 @@ func (p *pool) interrupt(sessionID string) error {
 	return err
 }
 
+// kill tears down the session's window (its claude exits) and drops it from
+// the LRU. Unlike LRU eviction this is unconditional — the caller is deleting
+// the session, so the busy guard doesn't apply. A no-op if no window is live.
+func (p *pool) kill(sessionID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.remove(sessionID)
+	if !contains(p.liveWindows(), sessionID) {
+		return nil
+	}
+	_, err := p.runner.run("kill-window", "-t", target(sessionID))
+	return err
+}
+
 // capturePane returns the current rendered contents of the session's pane,
 // including SGR colour/attribute escapes (-e) so a viewer can reproduce the
 // TUI's selection highlight. Powers the read-only terminal mirror. Errors if

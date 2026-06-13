@@ -249,7 +249,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   box-shadow: 0 4px 12px var(--shadow-modal);
-  min-width: 7rem;
+  min-width: 5rem;
   padding: 0.25rem;
 }
 #kebab-popover .kebab-item {
@@ -266,6 +266,7 @@ body {
   font-family: inherit;
 }
 #kebab-popover .kebab-item:hover { background: var(--bg-hover); }
+#kebab-popover .kebab-item.kebab-danger { color: var(--danger-text); }
 .sidebar-empty {
   padding: 0.4rem 0.5rem;
   color: var(--text-disabled);

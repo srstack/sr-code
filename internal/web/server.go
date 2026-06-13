@@ -105,6 +105,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
+	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
 	webMux.HandleFunc("POST /api/sessions/{id}/fork", s.handleFork)
 	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
@@ -433,6 +434,18 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		AutoApprove: s.router.IsAutoApprove(id),
 		Archived:    s.router.IsArchived(id),
 	})
+}
+
+// handleDeleteSession permanently deletes a session and its jsonl. Destructive
+// and irreversible — distinct from archive (DELETE .../archive), which only
+// un-hides. Returns 404 for an unknown id.
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.router.DeleteSession(id); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
 func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
