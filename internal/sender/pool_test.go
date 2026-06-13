@@ -227,6 +227,50 @@ func TestPool_LRUEviction(t *testing.T) {
 	}
 }
 
+func TestPool_EvictionSkipsBusy(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 2, quietLogger())
+
+	mustEnsure(t, p, "a")
+	mustEnsure(t, p, "b")
+	// a is the LRU (b was touched last), but a is mid-turn: eviction must skip
+	// it and take b instead.
+	busy := map[string]bool{"a": true}
+	p.isBusy = func(id string) bool { return busy[id] }
+
+	mustEnsure(t, p, "c")
+
+	if !p.has("a") {
+		t.Fatal("busy session a must not be evicted")
+	}
+	if p.has("b") {
+		t.Fatal("b (next-oldest, idle) should have been evicted")
+	}
+	if !p.has("c") {
+		t.Fatalf("c should be live, windows=%v", f.windows)
+	}
+}
+
+func TestPool_AllBusySpawnsOverCap(t *testing.T) {
+	f := &fakeTmux{}
+	p := newPool(f, "claude", nil, nil, 2, quietLogger())
+
+	mustEnsure(t, p, "a")
+	mustEnsure(t, p, "b")
+	// Both live sessions are mid-turn: nothing is evictable, so c spawns over
+	// the cap rather than killing a running turn (soft limit).
+	p.isBusy = func(id string) bool { return id == "a" || id == "b" }
+
+	mustEnsure(t, p, "c")
+
+	if !p.has("a") || !p.has("b") || !p.has("c") {
+		t.Fatalf("all three should be live (over cap), windows=%v", f.windows)
+	}
+	if len(f.windows) != 3 {
+		t.Fatalf("expected 3 windows over the cap of 2, got %v", f.windows)
+	}
+}
+
 func TestPool_AdoptExistingWindows(t *testing.T) {
 	f := &fakeTmux{exists: true, windows: []string{"old1", "old2"}}
 	p := newPool(f, "claude", nil, nil, 8, quietLogger())

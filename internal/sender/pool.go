@@ -60,6 +60,13 @@ type pool struct {
 	max       int
 	logger    *slog.Logger
 
+	// isBusy reports whether a session has an in-flight turn and so must not be
+	// LRU-evicted (killing it mid-turn would drop the running turn's output
+	// before it reaches the jsonl). Set by the Sender after construction; nil
+	// means "nothing is ever busy". Read under mu via oldestLive; the callee's
+	// own lock is always taken after mu, never before — no lock-order cycle.
+	isBusy func(string) bool
+
 	mu  sync.Mutex
 	lru []string // session ids, least-recently-used first
 }
@@ -133,7 +140,7 @@ func (p *pool) ensure(sessionID, cwd, model string, resume bool) (fresh bool, er
 		}
 		victim := p.oldestLive(live)
 		if victim == "" {
-			break // LRU desynced from reality; allow the spawn anyway
+			break // every live window is busy: spawn over the cap (soft limit)
 		}
 		p.logger.Info("evicting LRU session window", "session", victim)
 		if _, err := p.runner.run("kill-window", "-t", target(victim)); err != nil {
@@ -340,17 +347,25 @@ func (p *pool) liveWindows() []string {
 	return names
 }
 
-// oldestLive returns the least-recently-used id that still has a live window.
+// oldestLive returns the least-recently-used id that still has a live window
+// and is not mid-turn. Busy sessions are skipped so a running turn is never
+// killed under it; if every live window is busy it returns "" — ensure then
+// spawns over capacity (a soft cap), and the excess is reclaimed on a later
+// ensure once a turn finishes. No live-but-untracked fallback: an id present
+// on the socket yet absent from the LRU is only reachable here right after
+// adopt(), and adopt() already seeds every such id into the LRU.
 func (p *pool) oldestLive(live []string) string {
 	for _, id := range p.lru {
-		if contains(live, id) {
+		if contains(live, id) && !p.busy(id) {
 			return id
 		}
 	}
-	if len(live) > 0 {
-		return live[0]
-	}
 	return ""
+}
+
+// busy reports whether sessionID has an in-flight turn (nil-safe).
+func (p *pool) busy(sessionID string) bool {
+	return p.isBusy != nil && p.isBusy(sessionID)
 }
 
 func (p *pool) touch(sessionID string) {

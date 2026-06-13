@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,13 @@ type Sender struct {
 	logger      *slog.Logger
 	t           timing
 	tail        tailConfig
+
+	// busy holds session ids with an in-flight turn. The pool consults it
+	// (via isBusy) so LRU eviction never kills a session mid-turn. Marked
+	// synchronously in run() before the turn goroutine starts and cleared when
+	// that goroutine exits (any path), so the flag can't leak.
+	busyMu sync.Mutex
+	busy   map[string]struct{}
 }
 
 // New builds a Sender. claudeCmd is the claude binary; permissionMode (if
@@ -77,10 +85,11 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		env = []string{"USHER_HOOK_SOCK=" + hookSock}
 	}
 	runner := execRunner{bin: "tmux", socket: socket}
-	return &Sender{
+	s := &Sender{
 		pool:        newPool(runner, claudeCmd, extra, env, maxLive, logger),
 		projectsDir: projectsDir,
 		logger:      logger,
+		busy:        make(map[string]struct{}),
 		t: timing{
 			spawnSettle:   5 * time.Second,
 			trustToInject: 1500 * time.Millisecond,
@@ -91,6 +100,32 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		},
 		tail: tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second},
 	}
+	s.pool.isBusy = s.isBusy
+	return s
+}
+
+// isBusy reports whether sessionID has an in-flight turn (the pool's eviction
+// guard). markBusy/clearBusy bracket a tracked turn in run().
+func (s *Sender) isBusy(sessionID string) bool {
+	s.busyMu.Lock()
+	defer s.busyMu.Unlock()
+	_, ok := s.busy[sessionID]
+	return ok
+}
+
+func (s *Sender) markBusy(sessionID string) {
+	s.busyMu.Lock()
+	defer s.busyMu.Unlock()
+	if s.busy == nil {
+		s.busy = make(map[string]struct{})
+	}
+	s.busy[sessionID] = struct{}{}
+}
+
+func (s *Sender) clearBusy(sessionID string) {
+	s.busyMu.Lock()
+	defer s.busyMu.Unlock()
+	delete(s.busy, sessionID)
 }
 
 // Send injects prompt into the session's live interactive claude (resuming /
@@ -164,9 +199,15 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 		return nil, err
 	}
 
+	// Protect this session from LRU eviction for the duration of the turn.
+	// Marked here (not inside the goroutine) so a concurrent ensure for another
+	// session can't pick it as a victim in the gap before the goroutine runs.
+	s.markBusy(sessionID)
+
 	out := make(chan StreamEvent, 64)
 	go func() {
 		defer close(out)
+		defer s.clearBusy(sessionID)
 
 		started, _ := json.Marshal(struct {
 			Cwd   string `json:"cwd"`
