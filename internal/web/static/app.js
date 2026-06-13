@@ -31,7 +31,7 @@ let currentScreenES = null;
 // bottom border, hint line (verified by capture). The auto preview hides it as
 // furniture; if claude's chrome ever changes, this is the number to revisit.
 const TERM_FURNITURE_ROWS = 4;
-const TERM_AUTO_ROWS = 12; // pane height captured for the auto inline preview
+const TERM_AUTO_ROWS = 14; // pane height captured for the auto inline preview
 // Detail-view transcript sync. The live turn streams as server-grouped
 // `part` SSE events (text and tool results alike, rendered into the live
 // bubble as they happen). At turn end the bubble is promoted in place —
@@ -94,6 +94,19 @@ let lastSidebarHtml = '';
 let lastListRowsHtml = '';
 let lastCwdSig = ''; // distinct-cwd set the list's cwd <select> was built from
 let renderMode = localStorage.getItem('usher.renderMode') === 'raw' ? 'raw' : 'md';
+
+// growPrompt sizes the textarea to its content (CSS min/max-height clamp it to
+// 1–3 lines). The delegated input listener covers every view; call it directly
+// after a programmatic clear, which fires no input event.
+function growPrompt(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = el.scrollHeight + 'px';
+}
+
+document.addEventListener('input', (e) => {
+  if (e.target && e.target.id === 'prompt') growPrompt(e.target);
+});
 // Per-cwd archived-disclosure expansion state. Session-only — refresh
 // collapses everything, matching the assumption that browsing archived
 // sessions is a rare action.
@@ -121,11 +134,11 @@ function esc(s) {
 //   2. We strip risky URL schemes (javascript:/data:/vbscript:) from any
 //      <a>/<img> in marked's output before handing it to the DOM.
 //
-// Newlines follow CommonMark: single \n = space, blank line = paragraph
-// break. Users who want a visible break hit Enter twice.
+// breaks:true: a single \n becomes <br> so replies keep their line breaks
+// (CommonMark would fold a lone \n to a space). Blank line = new paragraph.
 window.marked.use({
   gfm: true,
-  breaks: false,
+  breaks: true,
   silent: true,
   renderer: {
     html(token) { return esc(typeof token === 'string' ? token : token.text); },
@@ -280,7 +293,7 @@ function renderSidebarSessions(allSessions) {
     const href = '#/s/' + encodeURIComponent(s.id);
     const dot = statusDot(s.status);
     const auto = s.auto_approve
-      ? '<span class="auto-dot" title="auto-approve enabled">⚡</span>'
+      ? '<span class="auto-dot" title="auto-approve enabled">ϟ</span>'
       : '';
     const title = s.title || '(untitled)';
     const liClass = s.archived ? 'sidebar-item archived-row' : 'sidebar-item';
@@ -475,9 +488,23 @@ async function showNewSession() {
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
-        <div class="input-row">
-          <textarea id="prompt" placeholder="message…"></textarea>
-          <button id="send">send</button>
+        <div class="composer">
+          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <select id="new-model" class="composer-model" aria-label="model">
+                <option value="default">Default</option>
+                <option value="fable">Fable</option>
+                <option value="opus">Opus</option>
+                <option value="claude-opus-4-6">Opus 4.6</option>
+                <option value="sonnet">Sonnet</option>
+                <option value="haiku">Haiku</option>
+                <option value="opusplan">Opus Plan</option>
+                <option value="sonnet[1m]">Sonnet [1m]</option>
+              </select>
+            </div>
+            <div class="composer-send"><button id="send">send</button></div>
+          </div>
         </div>
         <div class="send-controls">
           <label class="new-cwd-field">
@@ -485,19 +512,6 @@ async function showNewSession() {
             <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
                    placeholder="/absolute/path/to/project">
             <datalist id="new-cwd-list">${options}</datalist>
-          </label>
-          <label class="new-model-field">
-            <span class="muted">model</span>
-            <select id="new-model">
-              <option value="default">Default</option>
-              <option value="fable">Fable</option>
-              <option value="opus">Opus</option>
-              <option value="claude-opus-4-6">Opus 4.6</option>
-              <option value="sonnet">Sonnet</option>
-              <option value="haiku">Haiku</option>
-              <option value="opusplan">Opus Plan</option>
-              <option value="sonnet[1m]">Sonnet [1m]</option>
-            </select>
           </label>
         </div>
         <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
@@ -511,6 +525,17 @@ async function showNewSession() {
   const modelEl = document.getElementById('new-model');
   const errEl = document.getElementById('new-session-err');
   cwdEl.focus();
+
+  // Restore the last-picked model so it carries across new sessions (the
+  // <select> defaults to "default" in markup; an unknown stored value just
+  // leaves that default in place). Persist on change.
+  try {
+    const saved = localStorage.getItem('usher.newModel');
+    if (saved && [...modelEl.options].some(o => o.value === saved)) modelEl.value = saved;
+  } catch {/* private mode → keep default */}
+  modelEl.addEventListener('change', () => {
+    try { localStorage.setItem('usher.newModel', modelEl.value); } catch {/* private mode */}
+  });
 
   const submit = async () => {
     if (sendBtn.disabled) return; // re-entrancy guard during in-flight submit
@@ -709,21 +734,25 @@ async function showDetail(id) {
             <button type="button" data-key="enter">⏎</button>
           </div>
         </div>
-        <div class="input-row">
-          <textarea id="prompt" placeholder="message…"></textarea>
-          <button id="send">send</button>
-          <button id="cancel" class="cancel" hidden>cancel</button>
-        </div>
-        <div class="send-controls">
-          <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
-            aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
-            title="when on, every PreToolUse hook for this session is allowed without prompting">
-            auto-approve: ${sess.auto_approve ? 'on' : 'off'}
-          </button>
-          <button id="term-toggle" class="term-toggle" type="button" aria-pressed="false"
-            title="terminal mirror — click to cycle off → auto → on. auto previews live output inline in the turn bubble (before it lands); on docks an interactive pane.">
-            terminal: off
-          </button>
+        <div class="composer">
+          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
+                aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
+                title="when on, every PreToolUse hook for this session is allowed without prompting">
+                <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
+              </button>
+              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="false"
+                title="terminal mirror — click to cycle off → auto → on. auto previews live output inline in the turn bubble (before it lands); on docks an interactive pane.">
+                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">off</span>
+              </button>
+            </div>
+            <div class="composer-send">
+              <button id="send">send</button>
+              <button id="cancel" class="cancel" hidden>cancel</button>
+            </div>
+          </div>
         </div>
       </section>
     </div>
@@ -750,7 +779,7 @@ async function showDetail(id) {
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         autoBtn.setAttribute('aria-pressed', next ? 'true' : 'false');
-        autoBtn.textContent = 'auto-approve: ' + (next ? 'on' : 'off');
+        autoBtn.querySelector('.toggle-val').textContent = next ? 'auto' : 'ask';
         loadSidebar(); // refresh sidebar marker immediately
       } catch (e) {
         appendChatMessage({ role: 'error', content: 'auto-approve toggle failed: ' + String(e), ts: new Date().toISOString() });
@@ -820,7 +849,7 @@ async function showDetail(id) {
     if (termToggle) {
       termToggle.setAttribute('data-mode', termMode);
       termToggle.setAttribute('aria-pressed', termMode === 'off' ? 'false' : 'true');
-      termToggle.textContent = 'terminal: ' + termMode;
+      termToggle.querySelector('.toggle-val').textContent = termMode;
     }
     applyTermVisibility();
     if (evStream) evStream.syncInline();
@@ -855,6 +884,7 @@ async function showDetail(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    growPrompt(promptEl); // shrink back; programmatic clear fires no input event
     // Optimistic: show the user message immediately. The live bubble is
     // created by openEventStream on subprocess.started. Marked .optimistic so
     // the turn.user event (or a truth-up fetch) replaces it with the
@@ -1203,7 +1233,7 @@ function measureCols(boxEl) {
   ruler.textContent = '0'.repeat(100);
   ruler.style.cssText =
     'position:absolute;visibility:hidden;white-space:pre;' +
-    'font:13px ui-monospace,"SF Mono",Menlo,monospace';
+    'font-size:13px;font-family:var(--term-font)'; // match the grid's font, or cols mis-measure
   document.body.appendChild(ruler);
   const charPx = ruler.getBoundingClientRect().width / 100;
   ruler.remove();
@@ -1326,9 +1356,11 @@ async function showMainChat(id) {
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
-        <div class="input-row">
-          <textarea id="prompt" placeholder="message… (try /help)"></textarea>
-          <button id="send">send</button>
+        <div class="composer">
+          <textarea id="prompt" rows="1" placeholder="message… (try /help)"></textarea>
+          <div class="composer-bar">
+            <div class="composer-send"><button id="send">send</button></div>
+          </div>
         </div>
       </section>
     </div>
@@ -1345,6 +1377,7 @@ async function showMainChat(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    growPrompt(promptEl); // shrink back; programmatic clear fires no input event
     // Optimistic: show the user's message immediately and a "thinking" placeholder
     // since LLM agents may take 5–30s before any response comes back.
     const userNode = appendChatMessage({ role: 'user', content: text });

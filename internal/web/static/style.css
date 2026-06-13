@@ -38,10 +38,19 @@
   /* Agent purple */
   --purple: #6e40c9;
 
+  /* Claude brand coral — used for the model picker (tweak to taste). */
+  --claude: #bd5b3d;
+
   /* Code */
   --inline-code-bg: #e4e7eb;
   --code-block-bg: #1f2328;
   --code-block-text: #e6edf3;
+
+  /* Terminal mirror font. Sarasa Term leads: one font for Latin + CJK with
+   * CJK == 2× the cell, and box-drawing kept half-width (unlike Mono/Noto,
+   * which draw it full-width and overflow divider rules). Absent → plain
+   * monospace and CJK text misaligns; install Sarasa Term to fix. */
+  --term-font: "Sarasa Term SC", ui-monospace, "SF Mono", Menlo, monospace;
 
   /* Semantic */
   --danger: #cf222e;
@@ -566,28 +575,53 @@ td.cwd { font-size: 0.82rem; }
 .content th { background: var(--bg-subtle); font-weight: 600; }
 .content del { color: var(--text-faint); }
 
-.input-row { display: flex; gap: 0.5rem; align-items: stretch; margin-top: 0.5rem; }
-.input-row textarea {
-  flex: 1;
-  padding: 0.5rem;
+/* Composer: one bordered card, textarea above a toolbar (tools left, send
+ * right). Shared by every send-area variant; align-items:center keeps all
+ * controls on one baseline so their heights read as consistent. */
+.composer {
+  margin-top: 0.5rem;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  font: inherit;  font-size: 1rem;
-  resize: vertical;
-  min-height: 4rem;
+  border-radius: 8px;
   background: var(--bg-chrome);
-  color: var(--text);
 }
-.input-row button {
-  padding: 0 1.25rem;
+.composer:focus-within { border-color: var(--accent); }
+.composer textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.55rem 0.6rem;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;  font-size: 1rem;
+  line-height: 1.5;
+  resize: none;            /* height tracks content via growPrompt() */
+  /* 1.1rem = 0.55rem padding top+bottom (no border — the card owns it). */
+  min-height: calc(1.5rem + 1.1rem);  /* 1 line at rest */
+  max-height: calc(4.5rem + 1.1rem);  /* grows to 3 lines, then scrolls */
+  overflow-y: auto;
+}
+.composer textarea:focus { outline: none; }
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.4rem 0.4rem;
+}
+.composer-tools { display: flex; align-items: center; gap: 0.5rem; }
+.composer-send { margin-left: auto; display: flex; gap: 0.35rem; }
+.composer-send button {
+  padding: 0.32rem 0.8rem;
   border: 1px solid var(--accent);
   background: var(--accent);
   color: white;
   border-radius: 6px;
   cursor: pointer;
   font: inherit;
+  font-size: 0.85rem;
+  line-height: 1.2;
 }
-.input-row button:disabled {
+.composer-send button:disabled {
   background: var(--border-strong);
   border-color: var(--border-strong);
   cursor: not-allowed;
@@ -810,45 +844,29 @@ pre.raw-markdown {
   gap: 0.75rem;
   margin-top: 0.4rem;
 }
-.auto-approve-toggle {
-  font-size: 0.78rem;
-  padding: 0.25rem 0.6rem;
-  border: 1px solid var(--border);
-  background: var(--bg-chrome);
-  border-radius: 4px;
-  cursor: pointer;
-  color: var(--text-muted);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-}
-.auto-approve-toggle:hover { background: var(--bg-subtle); }
-.auto-approve-toggle[aria-pressed="true"] {
-  background: var(--warning-bg);
-  border-color: var(--warning-border);
-  color: var(--warning-text);
-}
-.auto-approve-toggle:disabled { opacity: 0.6; cursor: progress; }
-
+/* Secondary controls — ghost style (no border/fill) so they recede beside the
+ * accent send button. State shows via text color: muted off, amber when
+ * auto-approve is armed, accent for the terminal mirror. */
+.auto-approve-toggle,
 .term-toggle {
   font-size: 0.78rem;
-  padding: 0.25rem 0.6rem;
-  border: 1px solid var(--border);
-  background: var(--bg-chrome);
+  padding: 0.25rem 0.4rem;
+  border: none;
+  background: transparent;
   border-radius: 4px;
   cursor: pointer;
-  color: var(--text-muted);
+  color: var(--text-faint);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
+.auto-approve-toggle:hover,
 .term-toggle:hover { background: var(--bg-subtle); }
-.term-toggle[aria-pressed="true"] {  /* auto: subtle accent */
-  background: var(--bg-accent);
-  border-color: var(--accent-border);
-  color: var(--accent);
-}
-.term-toggle[data-mode="on"] {       /* on: solid, pinned-open */
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
+.auto-approve-toggle:disabled { opacity: 0.6; cursor: progress; }
+.auto-approve-toggle[aria-pressed="true"] { color: var(--warning-text); }
+.term-toggle[aria-pressed="true"] { color: var(--accent); }
+/* Glyph shows at every width; the full word (.t-full) is a desktop bonus,
+ * dropped on phones. Always-on glyph = no breakpoint toggle, no cascade trap. */
+.t-icon { margin-right: 0.3rem; }
+@media (max-width: 720px) { .t-full { display: none; } }
 
 /* ----- Terminal mirror (read-only, inline above the input) ------------- */
 .term-panel {
@@ -879,7 +897,7 @@ pre.raw-markdown {
   margin: 0;
   width: max-content;
   white-space: pre;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--term-font);
   font-size: 13px;
   line-height: 1.25;
   color: #c9d1d9;
@@ -901,7 +919,7 @@ pre.raw-markdown {
   overflow-x: auto;
   overflow-y: hidden;
   white-space: pre;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--term-font);
   font-size: 13px;
   line-height: 1.25;
   color: #c9d1d9;
@@ -926,11 +944,11 @@ pre.raw-markdown {
 .term-keys button:active { background: var(--bg-hover); }
 .term-keys button.term-key-err { background: var(--danger); border-color: var(--danger); color: #fff; }
 
-.input-row button.cancel {
+.composer-send button.cancel {
   border-color: var(--danger);
   background: var(--danger);
 }
-.input-row button.cancel:disabled {
+.composer-send button.cancel:disabled {
   background: var(--border-strong);
   border-color: var(--border-strong);
 }
@@ -1070,8 +1088,7 @@ pre.raw-markdown {
 }
 .interaction.ask .qsubmit:disabled { opacity: 0.5; cursor: default; }
 
-.new-cwd-field,
-.new-model-field {
+.new-cwd-field {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -1081,20 +1098,24 @@ pre.raw-markdown {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
-.new-model-field > span {
-  font-size: 0.85rem;
-  letter-spacing: 0.05em;
-}
-.new-model-field select {
-  font-size: 1rem;  /* >=16px: avoid iOS focus zoom */
-  padding: 0.25rem 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg-chrome);
-  color: var(--text);
+/* Model picker — ghost like the session toggles (no border/fill, Claude coral).
+ * Font stays 1rem: a <select> triggers iOS focus-zoom below 16px (unlike the
+ * <button> toggles). appearance:none drops the native arrow — no caret at all;
+ * the coral text carries the affordance. */
+.composer-model {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--claude);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 1rem;
+  padding: 0.25rem 0.3rem;
+  border-radius: 4px;
+  cursor: pointer;
 }
-.new-model-field select:focus { outline: none; border-color: var(--accent); }
+.composer-model:hover { background: var(--bg-subtle); }
+.composer-model:focus { outline: none; }
 .new-cwd-field input {
   width: 18rem;
   max-width: 100%;  font-size: 1rem;
@@ -1106,6 +1127,12 @@ pre.raw-markdown {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 .new-cwd-field input:focus { outline: none; border-color: var(--accent); }
+/* Phones: cwd (a path) wants the whole row, so stack the two fields rather
+ * than cram them side by side. (send-controls is the new-session view only.) */
+@media (max-width: 720px) {
+  .send-controls { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+  .new-cwd-field input { flex: 1; width: auto; min-width: 0; }
+}
 
 /* ----- Dark mode -------------------------------------------------------- */
 /* Palette is GitHub-Primer-inspired: warm-neutral surfaces (#0d1117 base,
@@ -1144,6 +1171,7 @@ pre.raw-markdown {
     --accent-border: rgba(56, 139, 253, 0.4);
 
     --purple: #bc8cff;
+    --claude: #e0916f;
 
     --inline-code-bg: rgba(110, 118, 129, 0.3);
     --code-block-bg: #0a0d12;
