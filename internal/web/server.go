@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,10 @@ type Server struct {
 	main         *mainchat.Store
 	agent        usheragent.Agent
 	logger       *slog.Logger
+	// codexModelsPath is ~/.codex/models_cache.json (codex's per-account model
+	// catalog). "" when codex isn't enabled. Read per request so a plan change
+	// (cache refetch) shows up without restarting usher.
+	codexModelsPath string
 }
 
 func NewServer(
@@ -74,20 +79,112 @@ func NewServer(
 	r *router.Router,
 	main *mainchat.Store,
 	agent usheragent.Agent,
+	codexModelsPath string,
 	logger *slog.Logger,
 ) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Server{
-		addr:         addr,
-		hookSockPath: hookSockPath,
-		auth:         authStore,
-		router:       r,
-		main:         main,
-		agent:        agent,
-		logger:       logger,
+		addr:            addr,
+		hookSockPath:    hookSockPath,
+		auth:            authStore,
+		router:          r,
+		main:            main,
+		agent:           agent,
+		logger:          logger,
+		codexModelsPath: codexModelsPath,
 	}
+}
+
+// modelOption is one entry for the new-session model picker.
+type modelOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// codexModels returns the user-selectable Codex models from codex's own
+// per-account catalog (models_cache.json) — so the picker matches whatever the
+// account's plan (free/Plus/Pro) actually offers, with no hardcoded list.
+// Empty when codex isn't enabled or the cache is unreadable. Ordered as codex's
+// own picker (lowest priority number first).
+func (s *Server) codexModels() []modelOption {
+	if s.codexModelsPath == "" {
+		return nil // codex backend not enabled
+	}
+	out := s.codexCatalog()
+	if len(out) == 0 {
+		// Codex is enabled but its catalog is missing/unreadable (cache not yet
+		// written, deleted, …). Fall back to the current named models so a session
+		// can still be created; codex retires old models slowly, so these stay
+		// valid well past any new release, and a present cache supersedes them.
+		return []modelOption{
+			{Value: "gpt-5.5", Label: "GPT-5.5"},
+			{Value: "gpt-5.4-mini", Label: "GPT-5.4 Mini"},
+		}
+	}
+	return out
+}
+
+// codexCatalog reads codex's per-account model catalog (models_cache.json),
+// returning the user-listable models ordered as codex's own picker. Empty when
+// the cache is unreadable or has no listable models.
+func (s *Server) codexCatalog() []modelOption {
+	raw, err := os.ReadFile(s.codexModelsPath)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Models []struct {
+			Slug        string `json:"slug"`
+			DisplayName string `json:"display_name"`
+			Visibility  string `json:"visibility"`
+			Priority    int    `json:"priority"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil
+	}
+	picks := doc.Models[:0:0]
+	for _, m := range doc.Models {
+		if m.Visibility == "list" && m.Slug != "" { // "hide" = internal (e.g. auto-review)
+			picks = append(picks, m)
+		}
+	}
+	// Lower priority number = higher up in codex's own picker.
+	sort.SliceStable(picks, func(i, j int) bool { return picks[i].Priority < picks[j].Priority })
+	out := make([]modelOption, 0, len(picks))
+	for _, m := range picks {
+		label := m.DisplayName
+		if label == "" {
+			label = m.Slug
+		}
+		out = append(out, modelOption{Value: m.Slug, Label: label})
+	}
+	return out
+}
+
+// handleModels feeds the new-session model picker: which backends are installed
+// (so it drops an unavailable one) and Codex's per-account model catalog (Claude's
+// list is static in the page markup).
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, struct {
+		Backends []string      `json:"backends"`
+		Codex    []modelOption `json:"codex"`
+	}{
+		Backends: s.router.Backends(),
+		Codex:    s.codexModels(),
+	})
+}
+
+// codexModelAllowed reports whether slug is in the account's Codex catalog.
+func (s *Server) codexModelAllowed(slug string) bool {
+	for _, m := range s.codexModels() {
+		if m.Value == slug {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -104,6 +201,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
+	webMux.HandleFunc("GET /api/models", s.handleModels)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
@@ -398,6 +496,9 @@ var allowedModels = map[string]bool{
 	"fable":      true,
 	// Version-pinned full ID (no short alias; plain "opus" resolves to 4.8).
 	"claude-opus-4-6": true,
+	// Codex models are NOT listed here — they're validated per request against
+	// the account's live catalog (see codexModelAllowed), so the picker supports
+	// whatever the plan offers without a hardcoded list.
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -406,7 +507,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	if !allowedModels[req.Model] {
+	// Codex models are validated against the account's live catalog (no hardcoded
+	// list — supports whatever the plan offers); Claude models against the static
+	// allowlist.
+	if router.BackendForModel(req.Model) == "codex" {
+		if !s.codexModelAllowed(req.Model) {
+			writeErr(w, http.StatusBadRequest, "invalid model: "+req.Model)
+			return
+		}
+	} else if !allowedModels[req.Model] {
 		writeErr(w, http.StatusBadRequest, "invalid model: "+req.Model)
 		return
 	}
@@ -544,18 +653,17 @@ func (s *Server) handleCancelSend(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	path, ok := s.router.SessionPath(id)
-	if !ok {
-		writeErr(w, http.StatusNotFound, "session not found")
-		return
-	}
 	limit := 0
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
-	turns, total, err := jsonl.ReadTurns(path, limit)
+	turns, total, err := s.router.ReadTurns(id, limit)
+	if errors.Is(err, router.ErrSessionNotFound) {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1066,6 +1174,24 @@ type hookPayload struct {
 	TranscriptPath string          `json:"transcript_path"`
 }
 
+// codexPermissionDecision builds Codex's PermissionRequest hook reply:
+// {"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":
+// {"behavior":"allow"|"deny","message":"…"}}}. message is included only on a
+// deny with a reason. An empty/allow reply lets the tool proceed; deny blocks it
+// (Codex's built-in approval flow is skipped because the hook decided).
+func codexPermissionDecision(behavior, reason string) map[string]any {
+	dec := map[string]any{"behavior": behavior}
+	if behavior == "deny" && reason != "" {
+		dec["message"] = reason
+	}
+	return map[string]any{
+		"hookSpecificOutput": map[string]any{
+			"hookEventName": "PermissionRequest",
+			"decision":      dec,
+		},
+	}
+}
+
 func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	eventName := r.PathValue("event")
 
@@ -1081,7 +1207,10 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 		ev.HookEventName = eventName
 	}
 
-	if eventName != "PreToolUse" {
+	// PreToolUse is Claude Code's tool-approval hook; PermissionRequest is
+	// Codex's. The request payload (snake_case session_id/tool_name/tool_input/
+	// cwd) is identical for both — only the decision the hook must emit differs.
+	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
@@ -1103,6 +1232,15 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	if decision == "" {
 		decision = "allow"
 	}
+
+	if eventName == "PermissionRequest" {
+		// Codex's shape (see codexPermissionDecision). No updatedInput channel
+		// (reserved → fails closed), so the AskUserQuestion answer-merge below is
+		// Claude-only.
+		writeJSON(w, http.StatusOK, codexPermissionDecision(decision, resp.Reason))
+		return
+	}
+
 	hookOut := map[string]any{
 		"hookEventName":            eventName,
 		"permissionDecision":       decision,

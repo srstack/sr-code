@@ -18,11 +18,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"usher/internal/core"
-	"usher/internal/jsonl"
 )
 
 type Discovery struct {
-	rootDir string
+	sources []Source
 	logger  *slog.Logger
 	watcher *fsnotify.Watcher
 
@@ -31,7 +30,12 @@ type Discovery struct {
 	paths    map[string]string       // id -> path
 }
 
-func New(rootDir string, logger *slog.Logger) (*Discovery, error) {
+// NewMulti builds a Discovery that scans and watches several backend layouts at
+// once (Claude Code and Codex), merging them into one session view. Each session
+// is tagged with the Backend of the Source that found it; the Source decides
+// which files are sessions and how to read them, everything else — scanning,
+// watching, caching — is backend-agnostic.
+func NewMulti(logger *slog.Logger, sources ...Source) (*Discovery, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -40,12 +44,26 @@ func New(rootDir string, logger *slog.Logger) (*Discovery, error) {
 		logger = slog.Default()
 	}
 	return &Discovery{
-		rootDir:  rootDir,
+		sources:  sources,
 		logger:   logger,
 		watcher:  w,
 		sessions: map[string]core.Session{},
 		paths:    map[string]string{},
 	}, nil
+}
+
+// sourceFor returns the Source that owns path — the one whose Root contains it
+// and whose IsSessionFile accepts it — or nil if path is not a session log.
+func (d *Discovery) sourceFor(path string) Source {
+	for _, s := range d.sources {
+		root := s.Root()
+		if path == root || strings.HasPrefix(path, root+string(os.PathSeparator)) {
+			if s.IsSessionFile(path) {
+				return s
+			}
+		}
+	}
+	return nil
 }
 
 // Start performs an initial scan, registers fsnotify watches on the root and
@@ -61,57 +79,50 @@ func (d *Discovery) Start(ctx context.Context) error {
 	return nil
 }
 
-// scan walks the root once and upserts every session jsonl found.
+// scan walks every source's root once and upserts each session file found.
 func (d *Discovery) scan() error {
-	return filepath.Walk(d.rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Best-effort: skip unreadable subtrees.
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		if d.isSessionJSONL(path) {
-			d.upsert(path)
-		}
-		return nil
-	})
-}
-
-// isSessionJSONL accepts only top-level project session files, i.e. paths
-// shaped like <root>/<sanitized-cwd>/<id>.jsonl. Subagent transcripts
-// (<root>/<cwd>/<session-id>/subagents/agent-<id>.jsonl), tool-results
-// .txt files, and Claude's auto-memory .md files all live deeper and are
-// filtered out so they don't show up as fake "sessions" — subagents in
-// particular have non-UUID ids that `claude -p --resume` refuses.
-func (d *Discovery) isSessionJSONL(path string) bool {
-	if !strings.HasSuffix(path, ".jsonl") {
-		return false
-	}
-	rel, err := filepath.Rel(d.rootDir, path)
-	if err != nil {
-		return false
-	}
-	return strings.Count(rel, string(os.PathSeparator)) == 1
-}
-
-// addWatches registers watches on the root dir and every existing subdir, so
-// new files are seen no matter which project they appear under.
-func (d *Discovery) addWatches() error {
-	if err := d.watcher.Add(d.rootDir); err != nil {
-		return err
-	}
-	return filepath.Walk(d.rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() && path != d.rootDir {
-			if err := d.watcher.Add(path); err != nil {
-				d.logger.Warn("watch subdir", "path", path, "err", err)
+	for _, s := range d.sources {
+		_ = filepath.Walk(s.Root(), func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				// Best-effort: skip unreadable subtrees.
+				return nil
 			}
+			if info.IsDir() {
+				return nil
+			}
+			if s.IsSessionFile(path) {
+				d.upsert(path)
+			}
+			return nil
+		})
+	}
+	return nil
+}
+
+// addWatches registers watches on each source's root and every existing subdir,
+// so new files are seen no matter which project (or, for Codex, which date
+// partition) they appear under. A missing root (e.g. Codex never used) is
+// skipped, not fatal.
+func (d *Discovery) addWatches() error {
+	for _, s := range d.sources {
+		root := s.Root()
+		if err := d.watcher.Add(root); err != nil {
+			d.logger.Warn("watch root", "path", root, "err", err)
+			continue
 		}
-		return nil
-	})
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() && path != root {
+				if err := d.watcher.Add(path); err != nil {
+					d.logger.Warn("watch subdir", "path", path, "err", err)
+				}
+			}
+			return nil
+		})
+	}
+	return nil
 }
 
 // Upsert synchronously ingests the session file at path. fsnotify would pick
@@ -124,7 +135,11 @@ func (d *Discovery) Upsert(path string) { d.upsert(path) }
 // scanned once at first sight; subsequent writes during streaming only touch
 // mtime, avoiding repeated full-file reads.
 func (d *Discovery) upsert(path string) {
-	id := sessionIDFromPath(path)
+	src := d.sourceFor(path)
+	if src == nil {
+		return
+	}
+	id := src.SessionID(path)
 	if id == "" {
 		return
 	}
@@ -143,7 +158,7 @@ func (d *Discovery) upsert(path string) {
 		// the first read can miss them; re-read while either is still empty
 		// (self-limiting once both are set — no re-parse on every later write).
 		if existing.Cwd == "" || existing.Title == "" {
-			if meta, err := jsonl.ReadSessionMeta(path); err == nil {
+			if meta, err := src.ReadMeta(path); err == nil {
 				if existing.Cwd == "" {
 					existing.Cwd = meta.Cwd
 				}
@@ -161,7 +176,7 @@ func (d *Discovery) upsert(path string) {
 		return
 	}
 
-	meta, err := jsonl.ReadSessionMeta(path)
+	meta, err := src.ReadMeta(path)
 	if err != nil {
 		d.logger.Warn("read session meta", "path", path, "err", err)
 		return
@@ -173,6 +188,7 @@ func (d *Discovery) upsert(path string) {
 		Status:      core.StatusIdle,
 		StartedAt:   meta.StartedAt,
 		LastEventAt: info.ModTime(),
+		Backend:     src.Backend(),
 	}
 	if sess.StartedAt.IsZero() {
 		sess.StartedAt = info.ModTime()
@@ -185,7 +201,9 @@ func (d *Discovery) upsert(path string) {
 }
 
 func (d *Discovery) remove(path string) {
-	d.Remove(sessionIDFromPath(path))
+	if src := d.sourceFor(path); src != nil {
+		d.Remove(src.SessionID(path))
+	}
 }
 
 // Remove forgets a session by id. fsnotify would pick a file deletion up
@@ -234,17 +252,11 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 			}
 			return
 		}
-		if d.isSessionJSONL(ev.Name) {
-			d.upsert(ev.Name)
-		}
+		d.upsert(ev.Name) // upsert resolves the owning source, no-ops if none
 	case ev.Op.Has(fsnotify.Write):
-		if d.isSessionJSONL(ev.Name) {
-			d.upsert(ev.Name)
-		}
+		d.upsert(ev.Name)
 	case ev.Op.Has(fsnotify.Remove), ev.Op.Has(fsnotify.Rename):
-		if d.isSessionJSONL(ev.Name) {
-			d.remove(ev.Name)
-		}
+		d.remove(ev.Name)
 	}
 }
 
@@ -276,12 +288,4 @@ func (d *Discovery) Path(id string) (string, bool) {
 	defer d.mu.RUnlock()
 	p, ok := d.paths[id]
 	return p, ok
-}
-
-func sessionIDFromPath(path string) string {
-	name := filepath.Base(path)
-	if !strings.HasSuffix(name, ".jsonl") {
-		return ""
-	}
-	return strings.TrimSuffix(name, ".jsonl")
 }

@@ -14,12 +14,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"usher/internal/archive"
 	"usher/internal/broker"
+	"usher/internal/codexrollout"
 	"usher/internal/core"
 	"usher/internal/discovery"
 	"usher/internal/hook"
@@ -27,12 +29,21 @@ import (
 	"usher/internal/sender"
 )
 
+// ErrSessionNotFound is returned when an operation targets a session with no
+// log on disk (so its path/backend can't be resolved).
+var ErrSessionNotFound = errors.New("session not found")
+
 type Router struct {
 	discovery *discovery.Discovery
-	sender    *sender.Sender
-	broker    *broker.Broker
-	hooks     *hook.Manager
-	archive   *archive.Store
+	// senders holds one Sender per backend ("claude", "codex"); usher manages
+	// both at once. A send is routed by the session's Backend tag (existing
+	// sessions) or the chosen model (new sessions). defaultBackend is the
+	// fallback when a backend is unknown/empty.
+	senders        map[string]*sender.Sender
+	defaultBackend string
+	broker         *broker.Broker
+	hooks          *hook.Manager
+	archive        *archive.Store
 
 	sendMu     sync.Mutex
 	activeSend map[string]*sendToken   // sessionID -> latest send's cancel handle
@@ -46,15 +57,119 @@ type sendToken struct {
 	cancel context.CancelFunc
 }
 
-func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Manager, archiveStore *archive.Store) *Router {
+// New builds a Router over the given backends (at least one). senders maps a
+// backend name ("claude"/"codex") to its Sender; defaultBackend names the one to
+// fall back to for unknown/empty backends and is the new-session default — it
+// must be a key in senders.
+func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBackend string, b *broker.Broker, h *hook.Manager, archiveStore *archive.Store) *Router {
 	return &Router{
-		discovery:  d,
-		sender:     s,
-		broker:     b,
-		hooks:      h,
-		archive:    archiveStore,
-		activeSend: map[string]*sendToken{},
-		creating:   map[string]core.Session{},
+		discovery:      d,
+		senders:        senders,
+		defaultBackend: defaultBackend,
+		broker:         b,
+		hooks:          h,
+		archive:        archiveStore,
+		activeSend:     map[string]*sendToken{},
+		creating:       map[string]core.Session{},
+	}
+}
+
+// Backends returns the enabled backend names, sorted ("claude" before "codex").
+// The web layer uses it to show only available backends in the model picker.
+func (r *Router) Backends() []string {
+	out := make([]string, 0, len(r.senders))
+	for b := range r.senders {
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// senderForBackend returns the Sender for a backend, falling back to the
+// default when the backend is empty or unregistered.
+func (r *Router) senderForBackend(backend string) *sender.Sender {
+	if s, ok := r.senders[backend]; ok {
+		return s
+	}
+	return r.senders[r.defaultBackend]
+}
+
+// senderFor returns the Sender owning an existing session, by its Backend tag.
+func (r *Router) senderFor(id string) *sender.Sender {
+	if s, ok := r.discovery.Get(id); ok {
+		return r.senderForBackend(s.Backend)
+	}
+	return r.senders[r.defaultBackend]
+}
+
+// anyHas reports whether any backend's sender holds a live process for id —
+// used for hook ownership, where the session's backend may not be resolved yet.
+func (r *Router) anyHas(id string) bool {
+	for _, s := range r.senders {
+		if s.Has(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// liveSet unions the live-session ids across every backend's sender.
+func (r *Router) liveSet() map[string]bool {
+	set := map[string]bool{}
+	for _, s := range r.senders {
+		for _, id := range s.LiveSessions() {
+			set[id] = true
+		}
+	}
+	return set
+}
+
+// backendOf returns the backend a session belongs to, or the default if the
+// session isn't known to discovery yet.
+func (r *Router) backendOf(id string) string {
+	if s, ok := r.discovery.Get(id); ok && s.Backend != "" {
+		return s.Backend
+	}
+	return r.defaultBackend
+}
+
+// readTurnsForBackend parses a session log into display turns using the parser
+// for its backend: Codex rollouts vs Claude jsonl. Both return the same shape.
+func readTurnsForBackend(path, backend string, limit int) ([]jsonl.Turn, int, error) {
+	if backend == "codex" {
+		return codexrollout.ReadTurns(path, limit)
+	}
+	return jsonl.ReadTurns(path, limit)
+}
+
+// ReadTurns resolves a session's log path and backend and returns its grouped
+// display turns (and the pre-trim total). Returns ErrSessionNotFound when the
+// session has no log on disk.
+func (r *Router) ReadTurns(id string, limit int) ([]jsonl.Turn, int, error) {
+	path, ok := r.discovery.Path(id)
+	if !ok {
+		return nil, 0, ErrSessionNotFound
+	}
+	return readTurnsForBackend(path, r.backendOf(id), limit)
+}
+
+// BackendForModel exposes backendForModel to other packages (the web layer's
+// model gate) — which backend a chosen model routes to.
+func BackendForModel(model string) string { return backendForModel(model) }
+
+// backendForModel maps a new-session model choice to its backend. Model names
+// are unique across backends except the literal "default" (the UI resolves that
+// to an explicit backend); gpt-*/o-series/codex are Codex, everything else
+// (claude-*, opus, sonnet, haiku, fable) is Claude.
+func backendForModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"),
+		strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"),
+		strings.Contains(m, "codex"):
+		return "codex"
+	default:
+		return "claude"
 	}
 }
 
@@ -64,7 +179,7 @@ func New(d *discovery.Discovery, s *sender.Sender, b *broker.Broker, h *hook.Man
 // turn in flight is "running"; otherwise a warm pooled process is "live".
 func (r *Router) ListSessions() []core.Session {
 	sessions := r.discovery.List()
-	live := sliceToSet(r.sender.LiveSessions())
+	live := r.liveSet()
 	r.sendMu.Lock()
 	known := make(map[string]bool, len(sessions))
 	for i := range sessions {
@@ -102,18 +217,10 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 	r.sendMu.Unlock()
 	if running {
 		sess.Status = core.StatusRunning
-	} else if r.sender.Has(id) {
+	} else if r.senderForBackend(sess.Backend).Has(id) {
 		sess.Status = core.StatusLive
 	}
 	return sess, true
-}
-
-func sliceToSet(xs []string) map[string]bool {
-	m := make(map[string]bool, len(xs))
-	for _, x := range xs {
-		m[x] = true
-	}
-	return m
 }
 
 func (r *Router) SessionPath(id string) (string, bool) {
@@ -128,11 +235,23 @@ func (r *Router) SessionPath(id string) (string, bool) {
 func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
 	path, ok := r.discovery.Path(srcID)
 	if !ok {
-		return "", errors.New("session not found")
+		return "", ErrSessionNotFound
 	}
 	newID := newUUIDv4()
-	dstPath := filepath.Join(filepath.Dir(path), newID+".jsonl")
-	if err := jsonl.ForkCopy(path, dstPath, afterUUID, newID); err != nil {
+	dir := filepath.Dir(path)
+
+	var dstPath string
+	var err error
+	if r.backendOf(srcID) == "codex" {
+		// Codex rollout: name the fork rollout-<ts>-<id>.jsonl (the shape discovery
+		// matches) and truncate at the turn whose task_complete is afterUUID.
+		dstPath = filepath.Join(dir, codexrollout.RolloutFilename(newID, time.Now()))
+		err = codexrollout.ForkCopy(path, dstPath, afterUUID, newID, srcID)
+	} else {
+		dstPath = filepath.Join(dir, newID+".jsonl")
+		err = jsonl.ForkCopy(path, dstPath, afterUUID, newID)
+	}
+	if err != nil {
 		return "", err
 	}
 	// Ingest synchronously so the id resolves the moment the client navigates
@@ -195,7 +314,7 @@ func (r *Router) DeleteSession(id string) error {
 	if tok != nil {
 		tok.cancel()
 	}
-	if err := r.sender.Kill(id); err != nil {
+	if err := r.senderFor(id).Kill(id); err != nil {
 		slog.Warn("kill session window on delete", "session", id, "err", err)
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -250,7 +369,7 @@ func (r *Router) SendToSession(id, text string) error {
 func (r *Router) injectDirect(sessionID, text, cwd string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := r.sender.Inject(ctx, sessionID, text, cwd); err != nil {
+	if err := r.senderFor(sessionID).Inject(ctx, sessionID, text, cwd); err != nil {
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
@@ -264,13 +383,13 @@ func (r *Router) injectDirect(sessionID, text, cwd string) {
 func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
 
-	ch, err := r.sender.Send(ctx, sessionID, prompt, cwd)
+	ch, err := r.senderFor(sessionID).Send(ctx, sessionID, prompt, cwd)
 	if err != nil {
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
-	asm := jsonl.NewAssembler()
+	asm := newStreamAssembler(r.backendOf(sessionID))
 	for ev := range ch {
 		r.publishStream(sessionID, asm, ev)
 	}
@@ -294,20 +413,56 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 //
 // Returns the appended part (nil otherwise) so callers that accumulate the
 // turn's text (CreateSession) don't re-parse the payload.
-func (r *Router) publishStream(sessionID string, asm *jsonl.Assembler, ev sender.StreamEvent) *jsonl.TurnPart {
+// streamAssembler is the cross-backend turn-grouping engine: both
+// jsonl.Assembler (Claude) and codexrollout.Assembler (Codex) implement it, so
+// publishStream derives the same turn.user/part events from either backend's
+// log lines.
+type streamAssembler interface {
+	FeedLine(raw []byte) (completed []jsonl.Turn, part *jsonl.TurnPart)
+	Model() string
+}
+
+var (
+	_ streamAssembler = (*jsonl.Assembler)(nil)
+	_ streamAssembler = (*codexrollout.Assembler)(nil)
+)
+
+// newStreamAssembler returns the assembler for a backend's log shape.
+func newStreamAssembler(backend string) streamAssembler {
+	if backend == "codex" {
+		return codexrollout.NewAssembler()
+	}
+	return jsonl.NewAssembler()
+}
+
+// isControlEvent reports whether a StreamEvent is a synthesized control signal
+// (not a backend log line) and so must not be fed to the assembler.
+func isControlEvent(t string) bool {
+	return t == "subprocess.started" || t == "subprocess.exit" || t == "error"
+}
+
+// lineTimestamp pulls the top-level "timestamp" from a log line (present on both
+// Claude and Codex lines); zero time if absent.
+func lineTimestamp(raw json.RawMessage) time.Time {
+	var o struct {
+		Timestamp time.Time `json:"timestamp"`
+	}
+	_ = json.Unmarshal(raw, &o)
+	return o.Timestamp
+}
+
+func (r *Router) publishStream(sessionID string, asm streamAssembler, ev sender.StreamEvent) *jsonl.TurnPart {
 	if ev.Type == "subprocess.exit" {
 		ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw)
 	}
 	r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
 
-	if ev.Type != "user" && ev.Type != "assistant" {
+	if isControlEvent(ev.Type) {
 		return nil
 	}
-	jev, err := jsonl.ParseLine(ev.Raw)
-	if err != nil {
-		return nil
-	}
-	completed, part := asm.Feed(jev)
+	// Feed every log line; the assembler ignores non-conversational ones
+	// (Claude's system events, Codex's session_meta/token_count, etc.).
+	completed, part := asm.FeedLine(ev.Raw)
 	for _, t := range completed {
 		if t.Role != "user" {
 			// Assistant turns are finalized client-side by the turn-end
@@ -321,7 +476,7 @@ func (r *Router) publishStream(sessionID string, asm *jsonl.Assembler, ev sender
 	}
 	if part != nil {
 		raw, mErr := json.Marshal(map[string]any{
-			"role": "assistant", "ts": jev.Timestamp, "model": asm.Model(), "part": part,
+			"role": "assistant", "ts": lineTimestamp(ev.Raw), "model": asm.Model(), "part": part,
 		})
 		if mErr == nil {
 			r.broker.Publish(broker.Event{SessionID: sessionID, Type: "part", Raw: raw})
@@ -340,7 +495,7 @@ func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMess
 	if !ok {
 		return raw
 	}
-	turns, _, err := jsonl.ReadTurns(path, 2)
+	turns, _, err := readTurnsForBackend(path, r.backendOf(sessionID), 2)
 	if err != nil || len(turns) == 0 {
 		return raw
 	}
@@ -385,7 +540,7 @@ func (r *Router) CancelSend(sessionID string) error {
 	if !ok {
 		return errors.New("no active send")
 	}
-	if err := r.sender.Interrupt(sessionID); err != nil {
+	if err := r.senderFor(sessionID).Interrupt(sessionID); err != nil {
 		slog.Warn("interrupt session turn", "session", sessionID, "err", err)
 	}
 	tok.cancel()
@@ -404,20 +559,22 @@ func (r *Router) SubscribeSession(id string) (<-chan broker.Event, func()) {
 // mirror unless usher has a live window (sender.Has), and we must not reach
 // into the user's own terminal/IDE claude on a shared socket.
 func (r *Router) CaptureScreen(id string) (string, error) {
-	if !r.sender.Has(id) {
+	snd := r.senderFor(id)
+	if !snd.Has(id) {
 		return "", errors.New("session not live")
 	}
-	return r.sender.CapturePane(id)
+	return snd.CapturePane(id)
 }
 
 // SendKeys forwards navigation keys to a live session's pane, powering the
 // terminal mirror's soft keys. Same ownership gate as CaptureScreen. The web
 // layer restricts which key names reach here; this only enforces ownership.
 func (r *Router) SendKeys(id string, keys ...string) error {
-	if !r.sender.Has(id) {
+	snd := r.senderFor(id)
+	if !snd.Has(id) {
 		return errors.New("session not live")
 	}
-	if err := r.sender.SendKeys(id, keys...); err != nil {
+	if err := snd.SendKeys(id, keys...); err != nil {
 		return err
 	}
 	// Esc while a turn is running interrupts claude in the pane, but an
@@ -444,10 +601,11 @@ func (r *Router) SendKeys(id string, keys ...string) error {
 // derived client-side from the viewer. Same ownership gate; a no-op error for
 // unowned sessions is ignored by the caller.
 func (r *Router) ResizeCanvas(id string, cols, rows int) error {
-	if !r.sender.Has(id) {
+	snd := r.senderFor(id)
+	if !snd.Has(id) {
 		return errors.New("session not live")
 	}
-	return r.sender.ResizeCanvas(id, cols, rows)
+	return snd.ResizeCanvas(id, cols, rows)
 }
 
 // --- hook / interactions -------------------------------------------------
@@ -470,7 +628,7 @@ func (r *Router) HandleHook(ctx context.Context, ev hook.Event) (hook.Response, 
 	if resp, ok := r.hooks.QuickDecide(ev); ok {
 		return resp, nil
 	}
-	if !r.sender.Has(ev.SessionID) {
+	if !r.anyHas(ev.SessionID) {
 		return hook.Response{}, errors.New("session not owned by usher")
 	}
 	return r.hooks.Submit(ctx, ev)
@@ -491,9 +649,9 @@ func (r *Router) IsAutoApprove(sessionID string) bool {
 func (r *Router) ReadSessionTranscript(id string, limit int) ([]core.TranscriptTurn, error) {
 	path, ok := r.discovery.Path(id)
 	if !ok {
-		return nil, errors.New("session not found")
+		return nil, ErrSessionNotFound
 	}
-	turns, _, err := jsonl.ReadTurns(path, limit)
+	turns, _, err := readTurnsForBackend(path, r.backendOf(id), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -595,6 +753,13 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 	if err := validateCreateInputs(cwd, initialMsg); err != nil {
 		return "", err
 	}
+	backend := backendForModel(model)
+	snd := r.senderForBackend(backend)
+	if !snd.PreAssignsID() {
+		// Codex assigns its own id; spawn, discover it, register under it.
+		return r.startDiscoveredSession(cwd, initialMsg, model, backend, snd)
+	}
+
 	sessionID := newUUIDv4()
 	ctx, cancel := context.WithCancel(context.Background())
 	tok := &sendToken{cancel: cancel}
@@ -610,6 +775,7 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 		Status:      core.StatusRunning,
 		StartedAt:   now,
 		LastEventAt: now,
+		Backend:     backend,
 	}
 	r.sendMu.Unlock()
 
@@ -617,15 +783,57 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 	return sessionID, nil
 }
 
+// codexDiscoverTimeout bounds how long StartSession blocks waiting for Codex to
+// write its new session log (and so reveal the id it assigned itself).
+const codexDiscoverTimeout = 20 * time.Second
+
+// startDiscoveredSession creates a new session for a backend that assigns its
+// own id (Codex). It spawns under a temporary handle, blocks until the real id
+// is discovered, then registers creating/activeSend/broker under that id — first
+// and only id, no placeholder, no re-keying. The turn then streams in the
+// background like a Claude start.
+func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, snd *sender.Sender) (string, error) {
+	tempID := newUUIDv4()
+	ctx, cancel := context.WithCancel(context.Background())
+	realID, ch, err := snd.StartCodexSession(ctx, tempID, initialMsg, cwd, model, codexDiscoverTimeout)
+	if err != nil {
+		cancel()
+		return "", err
+	}
+
+	tok := &sendToken{cancel: cancel}
+	now := time.Now()
+	r.sendMu.Lock()
+	r.activeSend[realID] = tok
+	r.creating[realID] = core.Session{
+		ID:          realID,
+		Cwd:         cwd,
+		Status:      core.StatusRunning,
+		StartedAt:   now,
+		LastEventAt: now,
+		Backend:     backend,
+	}
+	r.sendMu.Unlock()
+
+	go func() {
+		defer r.releaseSend(realID, tok)
+		asm := newStreamAssembler(backend)
+		for ev := range ch {
+			r.publishStream(realID, asm, ev)
+		}
+	}()
+	return realID, nil
+}
+
 func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
-	ch, err := r.sender.SendNew(ctx, sessionID, prompt, cwd, model)
+	ch, err := r.senderForBackend(backendForModel(model)).SendNew(ctx, sessionID, prompt, cwd, model)
 	if err != nil {
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
-	asm := jsonl.NewAssembler()
+	asm := newStreamAssembler(backendForModel(model))
 	for ev := range ch {
 		r.publishStream(sessionID, asm, ev)
 	}
@@ -656,18 +864,28 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 		return "", "", err
 	}
 
-	sessionID := newUUIDv4()
-
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ch, err := r.sender.SendNew(waitCtx, sessionID, initialMsg, cwd, "")
+	// Create in the default backend with its default model (empty model → the
+	// CLI's own default). Claude lets usher pick the id up front; Codex assigns
+	// its own, so discover it first (mirrors StartSession's preAssignsID split).
+	snd := r.senderForBackend(r.defaultBackend)
+	var sessionID string
+	var ch <-chan sender.StreamEvent
+	var err error
+	if snd.PreAssignsID() {
+		sessionID = newUUIDv4()
+		ch, err = snd.SendNew(waitCtx, sessionID, initialMsg, cwd, "")
+	} else {
+		sessionID, ch, err = snd.StartCodexSession(waitCtx, newUUIDv4(), initialMsg, cwd, "", codexDiscoverTimeout)
+	}
 	if err != nil {
 		return "", "", err
 	}
 
 	var buf strings.Builder
-	asm := jsonl.NewAssembler()
+	asm := newStreamAssembler(r.defaultBackend)
 	for ev := range ch {
 		// Forward to broker (raw + derived part/turn.user events) so any
 		// session-detail subscriber that opens the new tab sees the live

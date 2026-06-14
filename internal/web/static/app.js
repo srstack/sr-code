@@ -520,14 +520,16 @@ async function showNewSession() {
           <div class="composer-bar">
             <div class="composer-tools">
               <select id="new-model" class="composer-model" aria-label="model">
-                <option value="default">Default</option>
-                <option value="fable">Fable</option>
-                <option value="opus">Opus</option>
-                <option value="claude-opus-4-6">Opus 4.6</option>
-                <option value="sonnet">Sonnet</option>
-                <option value="haiku">Haiku</option>
-                <option value="opusplan">Opus Plan</option>
-                <option value="sonnet[1m]">Sonnet [1m]</option>
+                <optgroup label="Claude">
+                  <option value="opus" selected>Opus</option>
+                  <option value="claude-opus-4-6">Opus 4.6</option>
+                  <option value="sonnet">Sonnet</option>
+                  <option value="sonnet[1m]">Sonnet [1m]</option>
+                  <option value="haiku">Haiku</option>
+                  <option value="fable">Fable</option>
+                  <option value="opusplan">Opus Plan</option>
+                </optgroup>
+                <optgroup label="Codex" id="codex-modelgroup"></optgroup>
               </select>
             </div>
             <div class="composer-send"><button id="send">send</button></div>
@@ -553,16 +555,52 @@ async function showNewSession() {
   const errEl = document.getElementById('new-session-err');
   cwdEl.focus();
 
-  // Restore the last-picked model so it carries across new sessions (the
-  // <select> defaults to "default" in markup; an unknown stored value just
-  // leaves that default in place). Persist on change.
-  try {
-    const saved = localStorage.getItem('usher.newModel');
-    if (saved && [...modelEl.options].some(o => o.value === saved)) modelEl.value = saved;
-  } catch {/* private mode → keep default */}
+  // Restore the last-picked model (the <select> defaults to Opus in markup; an
+  // unknown stored value just leaves that default). Run AFTER codex models load
+  // so a saved codex pick can be restored once its option exists.
+  // Tint the picker by the selected model's backend (Claude coral / Codex green),
+  // keyed off the chosen option's optgroup so it tracks whichever group it's in.
+  const syncModelColor = () => {
+    const og = modelEl.selectedOptions[0] && modelEl.selectedOptions[0].closest('optgroup');
+    modelEl.classList.toggle('codex', !!og && og.label === 'Codex');
+  };
+  const applySavedModel = () => {
+    try {
+      const saved = localStorage.getItem('usher.newModel');
+      if (saved && [...modelEl.options].some(o => o.value === saved)) modelEl.value = saved;
+    } catch {/* private mode → keep default */}
+    syncModelColor();
+  };
   modelEl.addEventListener('change', () => {
+    syncModelColor();
     try { localStorage.setItem('usher.newModel', modelEl.value); } catch {/* private mode */}
   });
+  // Show only installed backends. Drop the Claude group if Claude isn't present
+  // (so the default lands on an available model), and populate Codex's group from
+  // its per-account catalog (or drop it if empty). The browser then selects the
+  // first remaining option as the default.
+  fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
+    const backends = (data && data.backends) || ['claude'];
+    if (!backends.includes('claude')) {
+      const cg = modelEl.querySelector('optgroup[label="Claude"]');
+      if (cg) cg.remove();
+    }
+    const grp = document.getElementById('codex-modelgroup');
+    if (grp) {
+      const models = (data && data.codex) || [];
+      if (!models.length) {
+        grp.remove();
+      } else {
+        for (const m of models) {
+          const o = document.createElement('option');
+          o.value = m.value;
+          o.textContent = m.label;
+          grp.appendChild(o);
+        }
+      }
+    }
+    applySavedModel();
+  }).catch(applySavedModel);
 
   const submit = async () => {
     if (sendBtn.disabled) return; // re-entrancy guard during in-flight submit
