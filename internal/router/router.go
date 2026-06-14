@@ -19,14 +19,14 @@ import (
 	"sync"
 	"time"
 
-	"usher/internal/archive"
-	"usher/internal/broker"
-	"usher/internal/codexrollout"
-	"usher/internal/core"
-	"usher/internal/discovery"
-	"usher/internal/hook"
-	"usher/internal/jsonl"
-	"usher/internal/sender"
+	"github.com/nexustar/usher/internal/archive"
+	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/codexrollout"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/discovery"
+	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/sender"
 )
 
 // ErrSessionNotFound is returned when an operation targets a session with no

@@ -17,7 +17,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"usher/internal/core"
+	"github.com/nexustar/usher/internal/core"
 )
 
 type Discovery struct {

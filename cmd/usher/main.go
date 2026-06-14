@@ -14,19 +14,19 @@ import (
 	"syscall"
 	"time"
 
-	"usher/internal/agent/usheragent"
-	"usher/internal/archive"
-	"usher/internal/auth"
-	"usher/internal/broker"
-	"usher/internal/discovery"
-	"usher/internal/hook"
-	"usher/internal/mainchat"
-	"usher/internal/router"
-	"usher/internal/sender"
-	"usher/internal/web"
+	"github.com/nexustar/usher/internal/agent/usheragent"
+	"github.com/nexustar/usher/internal/archive"
+	"github.com/nexustar/usher/internal/auth"
+	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/discovery"
+	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/mainchat"
+	"github.com/nexustar/usher/internal/router"
+	"github.com/nexustar/usher/internal/sender"
+	"github.com/nexustar/usher/internal/web"
 )
 
-const Version = "0.1.0-dev"
+var Version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {

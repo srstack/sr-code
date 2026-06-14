@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"usher/internal/codexrollout"
+	"github.com/nexustar/usher/internal/codexrollout"
 )
 
 // backend abstracts the per-CLI differences in driving an interactive coding

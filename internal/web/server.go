@@ -31,13 +31,13 @@ import (
 	"strings"
 	"time"
 
-	"usher/internal/agent/usheragent"
-	"usher/internal/auth"
-	"usher/internal/core"
-	"usher/internal/hook"
-	"usher/internal/jsonl"
-	"usher/internal/mainchat"
-	"usher/internal/router"
+	"github.com/nexustar/usher/internal/agent/usheragent"
+	"github.com/nexustar/usher/internal/auth"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/mainchat"
+	"github.com/nexustar/usher/internal/router"
 )
 
 //go:embed static

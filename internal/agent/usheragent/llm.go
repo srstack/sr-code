@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"usher/internal/core"
-	"usher/internal/hook"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/hook"
 )
 
 //go:embed prompts/system_prompt.md

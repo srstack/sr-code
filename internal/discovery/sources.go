@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"usher/internal/codexrollout"
-	"usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/codexrollout"
+	"github.com/nexustar/usher/internal/jsonl"
 )
 
 // Source describes where one backend's session logs live on disk and how to

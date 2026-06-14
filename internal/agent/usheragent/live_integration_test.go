@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"usher/internal/core"
+	"github.com/nexustar/usher/internal/core"
 )
 
 // Live tests that a real reasoning model's multi-turn tool loop survives our

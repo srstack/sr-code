@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"usher/internal/core"
-	"usher/internal/hook"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/hook"
 )
 
 type fakeAPI struct {

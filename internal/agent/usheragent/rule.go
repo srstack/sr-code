@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"usher/internal/core"
-	"usher/internal/hook"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/hook"
 )
 
 // RuleAgent is the v0.1 main-chat agent: a small dispatcher over slash

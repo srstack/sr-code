@@ -1,4 +1,4 @@
-module usher
+module github.com/nexustar/usher
 
 go 1.25.0
 

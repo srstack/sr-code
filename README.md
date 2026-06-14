@@ -20,17 +20,25 @@ approve or deny tool-permission prompts — without being at the keyboard.
   by default, or plain language ("run the tests in the auth session and tell me
   what fails") once you enable the optional LLM agent ([Main chat](#main-chat)).
 
+## Install
+
+Download a binary from the [latest release](https://github.com/nexustar/usher/releases),
+or install with Go:
+
+```
+go install github.com/nexustar/usher/cmd/usher@latest
+```
+
 ## Quickstart
 
-Needs Go 1.25+, `tmux` (usher runs each session inside it), and at least one of
+Needs `tmux` (usher runs each session inside it) and at least one of
 the `claude` or `codex` CLIs you've already signed in to — install either or
 both.
 
 ```
-make build            # → ./usher
-./usher setup         # register the permission hooks for whichever CLIs are installed (once; --remove to undo)
-./usher set-password  # optional for local use; recommended before exposing it
-./usher serve         # serve on http://127.0.0.1:7777
+usher setup         # register the permission hooks for whichever CLIs are installed (once; --remove to undo)
+usher set-password  # optional for local use; recommended before exposing it
+usher serve         # serve on http://127.0.0.1:7777
 ```
 
 To reach usher from another device, see [Remote access](#remote-access).

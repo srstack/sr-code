@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/jsonl"
 )
 
 // line is the uniform envelope of every rollout record.

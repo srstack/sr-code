@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"usher/internal/broker"
-	"usher/internal/sender"
+	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/sender"
 )
 
 // TestPublishStreamDerivesCodexTurns proves the live path: fed Codex rollout
