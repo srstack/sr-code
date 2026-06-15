@@ -5,6 +5,10 @@
 Drive multiple Claude Code and Codex sessions from any browser — including your
 phone over Tailscale.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="usher dashboard" width="830">
+</p>
+
 usher is a web dashboard over the sessions on your machine: list them, send a
 message and watch the reply stream in (markdown or raw, for easy copying), and
 approve or deny tool-permission prompts — without being at the keyboard.
