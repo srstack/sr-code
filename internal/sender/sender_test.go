@@ -232,6 +232,13 @@ func TestComposerReady(t *testing.T) {
 	if composerReady(cmd) {
 		t.Fatal(`"❯ /exit" with trailing text must not match the empty prompt`)
 	}
+	// A transcript user line "❯ ────" (prompt glyph + a dash run) sandwiched by
+	// real rules must not match: the cutset must not strip "─", or it would
+	// collapse to a bare "❯" and false-positive (the test-script "────" case).
+	dashed := strings.Repeat("─", 40) + "\n❯ " + strings.Repeat("─", 12) + "\n" + strings.Repeat("─", 40) + "\n"
+	if composerReady(dashed) {
+		t.Fatal(`"❯ ────" must not collapse to the empty prompt`)
+	}
 	// A ">" blockquote replayed in the transcript, with no rules around it, must
 	// not look like the composer — the failure mode the footer-string match had.
 	quote := "  Earlier the model wrote:\n  > do the thing\n  and then stopped\n"

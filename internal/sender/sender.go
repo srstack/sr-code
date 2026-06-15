@@ -498,9 +498,10 @@ func isBoxBorder(line string) bool {
 // "❯" (or ">") once padding and rule/box glyphs are stripped. Strict (no
 // trailing text) so a transcript command like "❯ /exit" isn't mistaken for it.
 func isPromptLine(line string) bool {
-	// \u00a0: claude renders a non-breaking space after the prompt that a
-	// plain space won't strip.
-	s := strings.Trim(line, " \t\u00a0│|╭╮╰╯─")
+	// Strip padding, the non-breaking space after the prompt (\u00a0, which a
+	// plain space misses), and box-side glyphs — but NOT "─", so a transcript
+	// line like "❯ ────" stays distinct from the empty prompt.
+	s := strings.Trim(line, " \t\u00a0│|╭╮╰╯")
 	return s == "❯" || s == ">"
 }
 
