@@ -104,8 +104,28 @@ function growPrompt(el) {
   el.style.height = el.scrollHeight + 'px';
 }
 
+// Per-session prompt drafts. Routing swaps innerHTML, so unsent text in #prompt
+// would vanish on switch — stash it here keyed by the mounted view, restore on
+// re-mount. In-memory only (survives switching, not refresh). currentDraftKey is
+// null on views with no managed draft (list/new) so their #prompt can't clobber.
+const promptDrafts = new Map();
+let currentDraftKey = null;
+
+function restoreDraft(promptEl) {
+  if (!promptEl || !currentDraftKey) return;
+  const d = promptDrafts.get(currentDraftKey);
+  if (d) { promptEl.value = d; growPrompt(promptEl); }
+}
+
+function clearDraft() {
+  if (currentDraftKey) promptDrafts.delete(currentDraftKey);
+}
+
 document.addEventListener('input', (e) => {
-  if (e.target && e.target.id === 'prompt') growPrompt(e.target);
+  if (e.target && e.target.id === 'prompt') {
+    growPrompt(e.target);
+    if (currentDraftKey) promptDrafts.set(currentDraftKey, e.target.value);
+  }
 });
 // Per-cwd archived-disclosure expansion state. Session-only — refresh
 // collapses everything, matching the assumption that browsing archived
@@ -499,6 +519,7 @@ async function deleteSession(id) {
 async function showNewSession() {
   clearListInterval();
   currentDetailId = null;
+  currentDraftKey = null; // not draft-managed; don't clobber a session draft
   closeES();
   subtitle.textContent = 'new session';
 
@@ -647,6 +668,7 @@ async function showNewSession() {
 async function showList() {
   closeES();
   currentDetailId = null;
+  currentDraftKey = null;
   subtitle.textContent = 'discovered Claude Code sessions';
   // Stable shell: pinned controls + a .list-scroll wrapper (the scroll
   // container — <main> is overflow:hidden). loadList only swaps the rows, so
@@ -754,6 +776,7 @@ async function showDetail(id) {
   // Fresh view: reset sync state so a prior session's signature/stream flag
   // can't suppress this one's first render.
   currentDetailId = id;
+  currentDraftKey = 's:' + id;
   lastTranscriptSig = '';
   renderedTurns = [];
   liveTurn = null;
@@ -830,6 +853,7 @@ async function showDetail(id) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cancelBtn = document.getElementById('cancel');
+  restoreDraft(promptEl);
 
   const autoBtn = document.getElementById('auto-approve-toggle');
   if (autoBtn) {
@@ -949,6 +973,7 @@ async function showDetail(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    clearDraft();
     growPrompt(promptEl); // shrink back; programmatic clear fires no input event
     // Optimistic: show the user message immediately. The live bubble is
     // created by openEventStream on subprocess.started. Marked .optimistic so
@@ -1415,6 +1440,7 @@ function ansiToHtml(s) {
 async function showMainChat(id) {
   clearListInterval();
   currentDetailId = null;
+  currentDraftKey = 'c:' + id;
   closeES();
   subtitle.innerHTML = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
 
@@ -1433,6 +1459,7 @@ async function showMainChat(id) {
 
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
+  restoreDraft(promptEl);
 
   await loadMainChatInfo(id);
   await loadChatMessages(id);
@@ -1442,6 +1469,7 @@ async function showMainChat(id) {
     if (!text.trim() || sendBtn.disabled) return;
     sendBtn.disabled = true;
     promptEl.value = '';
+    clearDraft();
     growPrompt(promptEl); // shrink back; programmatic clear fires no input event
     // Optimistic: show the user's message immediately and a "thinking" placeholder
     // since LLM agents may take 5–30s before any response comes back.
