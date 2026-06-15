@@ -56,6 +56,16 @@ func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
 	return s, filepath.Join(sub, id+".jsonl")
 }
 
+// idleComposer is a fake capture of claude's mounted empty input box in its
+// real shape: two "─" rules around the "❯" prompt, a footer, then the blank
+// rows tmux pads below the content. composerReady keys off the rule/❯/rule
+// sandwich, not the footer.
+const idleComposer = "────────────────────────────────────\n" +
+	"❯\u00a0\n" + // real claude renders a non-breaking space after the prompt
+	"────────────────────────────────────\n" +
+	"  ? for shortcuts · ← for agents\n" +
+	"\n\n\n\n\n"
+
 var turnLines = []string{
 	`{"type":"user","message":{"role":"user","content":"hi"}}`,
 	`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}`,
@@ -64,7 +74,7 @@ var turnLines = []string{
 
 func TestSend_ResumeStreamsTurn(t *testing.T) {
 	// Pane already at the idle input box: no resume chooser to answer.
-	f := &fakeTmux{captureOut: "  " + inputReadyMarker + " · ← for agents\n"}
+	f := &fakeTmux{captureOut: idleComposer}
 	s, path := testSender(t, f, "sess-1")
 	// Pre-existing history so this is a resume with a non-zero offset.
 	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
@@ -128,8 +138,13 @@ func TestSend_ResumeAnswersChooserWithFullSession(t *testing.T) {
 	// A long resume opens the chooser with the "summary" option highlighted;
 	// usher must step the arrow down to "full session as-is", never a bare
 	// Enter (which would pick the highlighted summary default).
-	f := &fakeTmux{captureOut: "❯ 1. Resume from summary (recommended)\n" +
-		"  2. " + resumeChooserMarker + "\n  3. Don't ask me again\n"}
+	// The chooser shows first; once usher steps the arrow Down toward
+	// full-session, the pane gives way to the mounted composer (readiness).
+	f := &fakeTmux{
+		captureOut: "❯ 1. Resume from summary (recommended)\n" +
+			"  2. " + resumeChooserMarker + "\n  3. Don't ask me again\n",
+		captureAfterDown: idleComposer,
+	}
 	s, path := testSender(t, f, "resume-1")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -166,7 +181,7 @@ func TestChooserArrowOn(t *testing.T) {
 	// prompt box during the boot frames before the input footer rendered. The
 	// arrow-row match must require the selection arrow on the SAME line.
 	transcript := "  we replaced the blind Down with Resume full session as-is handling\n" +
-		"❯ \n" + // the idle prompt's own arrow, on its own line
+		"❯\u00a0\n" + // the idle prompt's own arrow, on its own line
 		"  ? for shortcuts"
 	if chooserArrowOn(transcript, resumeChooserMarker) {
 		t.Fatal("must not match option text in transcript that lacks the arrow on its line")
@@ -181,10 +196,72 @@ func TestChooserArrowOn(t *testing.T) {
 	}
 }
 
+func TestSend_ResumeNotReadyEmitsError(t *testing.T) {
+	// The composer never appears (and there's no chooser to answer): waitReady
+	// must time out and the turn must surface a visible error rather than
+	// blind-pasting the prompt into an unknown screen.
+	f := &fakeTmux{captureOut: "loading session…\n"}
+	s, path := testSender(t, f, "stuck-1")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch, err := s.Send(context.Background(), "stuck-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collect(t, ch, 6*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "error"}) {
+		t.Fatalf("got %v, want a visible error and no turn", types(got))
+	}
+	if n := f.countCmd("paste-buffer"); n != 0 {
+		t.Fatalf("must not paste a prompt when the box never readied; got %d injects", n)
+	}
+}
+
+func TestComposerReady(t *testing.T) {
+	// The mounted composer — even though tmux pads ~28 blank rows below it, so
+	// it sits at the bottom of the CONTENT, not the captured grid (real case).
+	if !composerReady(idleComposer) {
+		t.Fatal("the mounted empty composer must be detected past the blank padding")
+	}
+	// A rendered transcript command keeps the "❯" glyph but carries trailing
+	// text, so the strict prompt match must not treat it as the live prompt even
+	// when rules happen to sit around it.
+	cmd := strings.Repeat("─", 40) + "\n❯ /exit\n" + strings.Repeat("─", 40) + "\n"
+	if composerReady(cmd) {
+		t.Fatal(`"❯ /exit" with trailing text must not match the empty prompt`)
+	}
+	// A transcript user line "❯ ────" (prompt glyph + a dash run) sandwiched by
+	// real rules must not match: the cutset must not strip "─", or it would
+	// collapse to a bare "❯" and false-positive (the test-script "────" case).
+	dashed := strings.Repeat("─", 40) + "\n❯ " + strings.Repeat("─", 12) + "\n" + strings.Repeat("─", 40) + "\n"
+	if composerReady(dashed) {
+		t.Fatal(`"❯ ────" must not collapse to the empty prompt`)
+	}
+	// A ">" blockquote replayed in the transcript, with no rules around it, must
+	// not look like the composer — the failure mode the footer-string match had.
+	quote := "  Earlier the model wrote:\n  > do the thing\n  and then stopped\n"
+	if composerReady(quote) {
+		t.Fatal("a bare > line without rules must not match")
+	}
+	// The composer scrolled above the scan window (lots of content below it)
+	// must not match — only the live composer sits at the bottom of the content.
+	scrolled := idleComposer + strings.Repeat("filler\n", composerScanLines)
+	if composerReady(scrolled) {
+		t.Fatal("a composer outside the bottom scan window must not match")
+	}
+	// The resume chooser is not a composer (its "❯" carries the option text).
+	chooser := "❯ 1. Resume from summary\n  2. Resume full session as-is\n"
+	if composerReady(chooser) {
+		t.Fatal("the resume chooser must not match the composer")
+	}
+}
+
 func TestSend_InjectsOnceNoRetry(t *testing.T) {
 	// The landed-oracle/re-inject loop is gone: exactly one paste per send, even
 	// when the user turn lands slowly (here, after a delay).
-	f := &fakeTmux{captureOut: "  " + inputReadyMarker + "\n"}
+	f := &fakeTmux{captureOut: idleComposer}
 	s, path := testSender(t, f, "once-1")
 	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
