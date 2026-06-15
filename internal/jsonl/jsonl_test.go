@@ -98,6 +98,43 @@ func TestReadSessionMeta_Missing(t *testing.T) {
 	}
 }
 
+// TestReadSessionMeta_LastInputAt pins the sidebar sort key: LastInputAt tracks
+// the last genuine user prompt and ignores tool_result echoes, the interrupt
+// marker, and the untimed metadata claude appends on pause/kill — so a paused
+// session does not jump to the top of the list.
+func TestReadSessionMeta_LastInputAt(t *testing.T) {
+	lines := []string{
+		`{"type":"user","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"user","content":"first prompt"}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}`,
+		// tool_result comes back as a user-role line — must NOT count as input.
+		`{"type":"user","timestamp":"2026-04-26T10:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`,
+		// the last genuine prompt — this is the expected LastInputAt.
+		`{"type":"user","timestamp":"2026-04-26T10:00:10.000Z","message":{"role":"user","content":"second prompt"}}`,
+		// interrupt marker (user-role, timestamped) — must NOT count.
+		`{"type":"user","timestamp":"2026-04-26T10:05:00.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`,
+		// untimed metadata claude writes on pause/kill — must NOT count.
+		`{"type":"last-prompt"}`,
+		`{"type":"permission-mode"}`,
+	}
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadSessionMeta(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "2026-04-26T10:00:10.000Z"
+	if got := meta.LastInputAt.UTC().Format("2006-01-02T15:04:05.000Z"); got != want {
+		t.Errorf("LastInputAt = %s, want %s (the last genuine prompt)", got, want)
+	}
+	// LastEventAt still tracks the last timestamped line (the interrupt marker),
+	// confirming the two clocks diverge exactly where it matters.
+	if !meta.LastEventAt.After(meta.LastInputAt) {
+		t.Errorf("LastEventAt %v should be after LastInputAt %v", meta.LastEventAt, meta.LastInputAt)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("abc", 10); got != "abc" {
 		t.Errorf("short: got %q", got)

@@ -299,8 +299,11 @@ function renderSidebarSessions(allSessions) {
     lastSidebarHtml = '';
     return;
   }
-  const recencyOf = arr => Math.max(...arr.map(s => Date.parse(s.last_event_at) || 0));
-  const byRecent = (a, b) => (Date.parse(b.last_event_at) || 0) - (Date.parse(a.last_event_at) || 0);
+  // Order by last user input, not file mtime, so a session doesn't jump on
+  // streaming or on pause/kill. Falls back to last_event_at when unset.
+  const recencyKey = s => Date.parse(s.last_input_at) || Date.parse(s.last_event_at) || 0;
+  const recencyOf = arr => Math.max(...arr.map(recencyKey));
+  const byRecent = (a, b) => recencyKey(b) - recencyKey(a);
   // Sort cwd groups by their most-recent visible activity, not absolute
   // — stale cwds with one expanded archived row shouldn't jump to the top.
   cwds.sort((a, b) => {
@@ -321,6 +324,7 @@ function renderSidebarSessions(allSessions) {
       <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
       <button class="kebab-btn" type="button"
         data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}"
+        data-status="${esc(s.status || '')}"
         aria-label="session actions" title="more">⋮</button>
     </li>`;
   };
@@ -404,8 +408,15 @@ function openKebabPopover(btn) {
   const archived = btn.dataset.archived === '1';
   const action = archived ? 'unarchive' : 'archive';
   const label = archived ? 'Unarchive' : 'Archive';
+  // Pause only applies to a session with a live window; an idle one has
+  // nothing to tear down, so we hide it rather than offer a no-op.
+  const status = btn.dataset.status;
+  const pauseItem = (status === 'live' || status === 'running' || status === 'awaiting_permission')
+    ? `<button type="button" class="kebab-item" data-action="pause" data-id="${esc(id)}">Pause</button>`
+    : '';
   kebabPopover.innerHTML =
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
+    pauseItem +
     `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`;
   kebabPopover.hidden = false;
   // Position below-right of the button; clamp to viewport edges so the
@@ -474,6 +485,10 @@ async function handleKebabAction(action, id) {
     deleteSession(id);
     return;
   }
+  if (action === 'pause') {
+    pauseSession(id);
+    return;
+  }
   const method = action === 'archive' ? 'POST' : 'DELETE';
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/archive', { method });
@@ -503,6 +518,21 @@ async function deleteSession(id) {
   } catch (e) {
     console.warn('delete failed', e);
     alert('Failed to delete session.');
+  }
+}
+
+// pauseSession tears down the session's live TUI window without deleting
+// anything — the conversation stays on disk and resumes on the next send.
+// Non-destructive, so no confirm. The session simply drops back to "idle".
+async function pauseSession(id) {
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/pause', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    loadSidebar();
+    loadList(); // no-op unless the list view is open
+  } catch (e) {
+    console.warn('pause failed', e);
+    alert('Failed to pause session.');
   }
 }
 
@@ -743,7 +773,7 @@ async function loadList() {
         <td class="title" title="${esc(title)}">${dot ? dot + ' ' : ''}${esc(title)}</td>
         <td class="cwd" title="${esc(s.cwd || '')}">${esc(s.cwd || '')}</td>
         <td>${esc(fmt(s.last_event_at))}</td>
-        <td class="act"><button class="kebab-btn" type="button" data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}" aria-label="session actions" title="more">⋮</button></td>
+        <td class="act"><button class="kebab-btn" type="button" data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}" data-status="${esc(s.status || '')}" aria-label="session actions" title="more">⋮</button></td>
       </tr>`;
     }).join('') : '<tr><td colspan="4" class="muted" style="padding:0.75rem">no sessions found</td></tr>';
     // Skip the rebuild when unchanged so status-dot animations don't restart

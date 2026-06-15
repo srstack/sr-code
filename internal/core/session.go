@@ -27,6 +27,13 @@ type Session struct {
 	StartedAt   time.Time `json:"started_at"`
 	LastEventAt time.Time `json:"last_event_at"`
 
+	// LastInputAt is the time of the most recent genuine user prompt. Unlike
+	// LastEventAt (file mtime) it ignores assistant streaming, tool turns, and
+	// the untimed metadata claude writes on pause/kill, so it is the sidebar
+	// sort key and auto-archive clock: a session only reorders when the user
+	// talks to it. Seeded from jsonl at discovery, stamped on usher sends.
+	LastInputAt time.Time `json:"last_input_at"`
+
 	// Backend names the agent CLI this session belongs to ("claude" or "codex").
 	// usher manages both at once; a session belongs to one for its life. Set by
 	// discovery from the Source that found the session's log.

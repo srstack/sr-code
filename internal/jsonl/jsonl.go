@@ -59,6 +59,9 @@ type SessionMeta struct {
 	Title       string
 	StartedAt   time.Time
 	LastEventAt time.Time
+	// LastInputAt is the time of the last genuine user prompt (see
+	// core.Session.LastInputAt); skips tool_result lines and interrupt markers.
+	LastInputAt time.Time
 }
 
 // ReadSessionMeta scans the file at path and produces a SessionMeta. It walks
@@ -99,8 +102,17 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		if ev.Type == "ai-title" && ev.Title != "" {
 			meta.Title = ev.Title
 		}
-		if firstUserPrompt == "" && ev.Type == "user" && len(ev.Message) > 0 {
-			firstUserPrompt = extractUserContent(ev.Message)
+		if ev.Type == "user" && len(ev.Message) > 0 {
+			content := extractUserContent(ev.Message)
+			if firstUserPrompt == "" {
+				firstUserPrompt = content
+			}
+			// A genuine typed prompt — not a tool_result echo or the
+			// "[Request interrupted ...]" marker claude writes on Ctrl-C.
+			if !ev.Timestamp.IsZero() && !hasToolResult(ev.Message) &&
+				!strings.HasPrefix(content, "[Request interrupted") {
+				meta.LastInputAt = ev.Timestamp
+			}
 		}
 	}
 

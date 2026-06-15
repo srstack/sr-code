@@ -208,6 +208,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/fork", s.handleFork)
 	webMux.HandleFunc("POST /api/sessions/{id}/send", s.handleSend)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
+	webMux.HandleFunc("POST /api/sessions/{id}/pause", s.handlePauseSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
 	webMux.HandleFunc("GET /api/sessions/{id}/screen", s.handleScreen)
 	webMux.HandleFunc("POST /api/sessions/{id}/keys", s.handleKeys)
@@ -555,6 +556,19 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+// handlePauseSession tears down the session's live window without deleting
+// anything — the conversation stays on disk and resumes on the next send.
+// Non-destructive and distinct from DELETE (which removes the jsonl). Returns
+// 404 for an unknown id.
+func (s *Server) handlePauseSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.router.PauseSession(id); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"paused": true})
 }
 
 func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {

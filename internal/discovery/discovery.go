@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -157,7 +158,7 @@ func (d *Discovery) upsert(path string) {
 		// cwd/title come from jsonl content written after the file appears, so
 		// the first read can miss them; re-read while either is still empty
 		// (self-limiting once both are set — no re-parse on every later write).
-		if existing.Cwd == "" || existing.Title == "" {
+		if existing.Cwd == "" || existing.Title == "" || existing.LastInputAt.IsZero() {
 			if meta, err := src.ReadMeta(path); err == nil {
 				if existing.Cwd == "" {
 					existing.Cwd = meta.Cwd
@@ -167,6 +168,11 @@ func (d *Discovery) upsert(path string) {
 				}
 				if existing.StartedAt.IsZero() {
 					existing.StartedAt = meta.StartedAt
+				}
+				// Fill input time only until the first prompt lands; after that
+				// MarkInput owns it and we never re-read content on writes.
+				if existing.LastInputAt.IsZero() {
+					existing.LastInputAt = meta.LastInputAt
 				}
 			}
 		}
@@ -188,6 +194,7 @@ func (d *Discovery) upsert(path string) {
 		Status:      core.StatusIdle,
 		StartedAt:   meta.StartedAt,
 		LastEventAt: info.ModTime(),
+		LastInputAt: meta.LastInputAt,
 		Backend:     src.Backend(),
 	}
 	if sess.StartedAt.IsZero() {
@@ -216,6 +223,21 @@ func (d *Discovery) Remove(id string) {
 	d.mu.Lock()
 	delete(d.sessions, id)
 	delete(d.paths, id)
+	d.mu.Unlock()
+}
+
+// MarkInput advances a session's input clock to t without reading the file, so
+// ordering reflects "last talked to" the instant usher sends. No-op for an
+// unknown id (seeded from content at first-sight) and never moves backwards.
+func (d *Discovery) MarkInput(id string, t time.Time) {
+	if id == "" || t.IsZero() {
+		return
+	}
+	d.mu.Lock()
+	if s, ok := d.sessions[id]; ok && t.After(s.LastInputAt) {
+		s.LastInputAt = t
+		d.sessions[id] = s
+	}
 	d.mu.Unlock()
 }
 
@@ -260,7 +282,7 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 	}
 }
 
-// List returns sessions sorted by most recent activity first.
+// List returns sessions sorted by most recent user input first (see sortKey).
 func (d *Discovery) List() []core.Session {
 	d.mu.RLock()
 	out := make([]core.Session, 0, len(d.sessions))
@@ -269,9 +291,18 @@ func (d *Discovery) List() []core.Session {
 	}
 	d.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastEventAt.After(out[j].LastEventAt)
+		return sortKey(out[i]).After(sortKey(out[j]))
 	})
 	return out
+}
+
+// sortKey orders by last user input, falling back to last event for sessions
+// with no recorded input yet (only system lines).
+func sortKey(s core.Session) time.Time {
+	if !s.LastInputAt.IsZero() {
+		return s.LastInputAt
+	}
+	return s.LastEventAt
 }
 
 // Get returns a session by ID. The bool is false if not found.

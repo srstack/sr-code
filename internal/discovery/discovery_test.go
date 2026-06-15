@@ -109,6 +109,34 @@ func TestDiscovery_Remove(t *testing.T) {
 	d.Remove("abc") // idempotent / unknown id is a no-op
 }
 
+func TestDiscovery_MarkInputOrdersList(t *testing.T) {
+	tmp := t.TempDir()
+	// Both fixtures carry the same content timestamp, so initial order is
+	// unspecified; MarkInput must then deterministically float "b" to the top.
+	writeJSONL(t, filepath.Join(tmp, "-tmp-a", "aaa.jsonl"), "aaa", "/tmp/a", "hi a")
+	writeJSONL(t, filepath.Join(tmp, "-tmp-b", "bbb.jsonl"), "bbb", "/tmp/b", "hi b")
+
+	d := newTestDiscovery(t, tmp)
+	if err := d.scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.MarkInput("bbb", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if got := d.List(); got[0].ID != "bbb" {
+		t.Errorf("List()[0] = %q, want bbb (most recent input first)", got[0].ID)
+	}
+
+	// Monotonic: an earlier stamp must not move the clock backwards.
+	d.MarkInput("bbb", time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC))
+	if s, _ := d.Get("bbb"); !s.LastInputAt.Equal(time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)) {
+		t.Errorf("LastInputAt regressed to %v", s.LastInputAt)
+	}
+
+	// Unknown id and zero time are no-ops, not panics.
+	d.MarkInput("nope", time.Now())
+	d.MarkInput("bbb", time.Time{})
+}
+
 func TestDiscovery_WatchPicksUpNewFile(t *testing.T) {
 	tmp := t.TempDir()
 	d := newTestDiscovery(t, tmp)

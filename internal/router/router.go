@@ -260,9 +260,19 @@ func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
 	return newID, nil
 }
 
+// staleClock is what auto-archive measures inactivity from: last user input,
+// falling back to last event. Keying on input (not mtime) means pause/kill and
+// streaming don't reset the countdown — mirrors discovery's sort.
+func staleClock(s core.Session) time.Time {
+	if !s.LastInputAt.IsZero() {
+		return s.LastInputAt
+	}
+	return s.LastEventAt
+}
+
 // IsArchived reports whether sessionID is archived in the default
 // sidebar view. Wraps archive.Store.IsArchived with the session's
-// last_event_at from discovery; returns false for unknown ids.
+// last-input time from discovery; returns false for unknown ids.
 func (r *Router) IsArchived(sessionID string) bool {
 	if r.archive == nil {
 		return false
@@ -271,7 +281,7 @@ func (r *Router) IsArchived(sessionID string) bool {
 	if !ok {
 		return false
 	}
-	return r.archive.IsArchived(sessionID, sess.LastEventAt, time.Now())
+	return r.archive.IsArchived(sessionID, staleClock(sess), time.Now())
 }
 
 // Archive marks sessionID as manually archived.
@@ -291,7 +301,7 @@ func (r *Router) Unarchive(sessionID string) {
 		return
 	}
 	sess, _ := r.discovery.Get(sessionID)
-	r.archive.Unarchive(sessionID, sess.LastEventAt, time.Now())
+	r.archive.Unarchive(sessionID, staleClock(sess), time.Now())
 }
 
 // DeleteSession permanently removes a session: it cancels any in-flight turn,
@@ -331,6 +341,27 @@ func (r *Router) DeleteSession(id string) error {
 	return nil
 }
 
+// PauseSession kills usher's live window for a session without touching its
+// jsonl or per-session state: it cancels any in-flight turn and the tmux
+// window, dropping the session to "idle". The conversation survives and
+// resumes (via --resume) on the next Send. The manual equivalent of LRU
+// eviction. Idempotent for an already-idle session; errors only on unknown id.
+func (r *Router) PauseSession(id string) error {
+	if _, ok := r.discovery.Path(id); !ok {
+		return errors.New("session not found")
+	}
+	r.sendMu.Lock()
+	tok := r.activeSend[id]
+	r.sendMu.Unlock()
+	if tok != nil {
+		tok.cancel()
+	}
+	if err := r.senderFor(id).Kill(id); err != nil {
+		slog.Warn("kill session window on pause", "session", id, "err", err)
+	}
+	return nil
+}
+
 // --- session writes ------------------------------------------------------
 
 // SendToSession spawns a fire-and-forget subprocess for the session. Stream
@@ -350,6 +381,9 @@ func (r *Router) SendToSession(id, text string) error {
 		go r.injectDirect(sess.ID, text, sess.Cwd)
 		return nil
 	}
+	// Reorder the sidebar the instant the user sends, without waiting for the
+	// prompt to land in the jsonl (see discovery.MarkInput).
+	r.discovery.MarkInput(id, time.Now().UTC())
 	ctx, cancel := context.WithCancel(context.Background())
 	tok := &sendToken{cancel: cancel}
 
@@ -775,6 +809,7 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 		Status:      core.StatusRunning,
 		StartedAt:   now,
 		LastEventAt: now,
+		LastInputAt: now,
 		Backend:     backend,
 	}
 	r.sendMu.Unlock()
@@ -811,6 +846,7 @@ func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, 
 		Status:      core.StatusRunning,
 		StartedAt:   now,
 		LastEventAt: now,
+		LastInputAt: now,
 		Backend:     backend,
 	}
 	r.sendMu.Unlock()

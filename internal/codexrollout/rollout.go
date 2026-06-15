@@ -102,9 +102,14 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 				meta.Cwd = p.Cwd
 			}
 		case "event_msg":
-			if firstPrompt == "" {
-				if msg, ok := userMessage(l.Payload); ok {
+			if msg, ok := userMessage(l.Payload); ok {
+				if firstPrompt == "" {
 					firstPrompt = msg
+				}
+				// user_message is codex's clean typed prompt — the sort key
+				// (jsonl.SessionMeta.LastInputAt).
+				if !l.Timestamp.IsZero() {
+					meta.LastInputAt = l.Timestamp
 				}
 			}
 		}
