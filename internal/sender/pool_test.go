@@ -21,6 +21,9 @@ type fakeTmux struct {
 	stdins     []string // stdin passed to each runStdin call
 	failSpawn  bool     // when set, new-session/new-window return an error
 	captureOut string   // canned capture-pane output
+	// captureAfterDown, if set, is returned by capture-pane once a "Down" key has
+	// been sent — lets a test model the resume chooser giving way to the composer.
+	captureAfterDown string
 }
 
 func (f *fakeTmux) runStdin(in string, args ...string) (string, error) {
@@ -63,6 +66,17 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 		f.exists = false
 		return "", nil
 	case "capture-pane":
+		if f.captureAfterDown != "" {
+			for _, c := range f.cmds {
+				if len(c) > 0 && c[0] == "send-keys" {
+					for _, a := range c {
+						if a == "Down" {
+							return f.captureAfterDown, nil
+						}
+					}
+				}
+			}
+		}
 		return f.captureOut, nil
 	default: // set-window-option, set-buffer, paste-buffer, send-keys
 		return "", nil

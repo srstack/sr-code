@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,11 @@ import (
 
 	"github.com/nexustar/usher/internal/codexrollout"
 )
+
+// errReadyTimeout is returned by a backend's waitReady when the TUI did not
+// reach an injectable state within t.resumeReady. The caller surfaces it as a
+// visible error rather than blind-pasting the prompt into an unknown screen.
+var errReadyTimeout = errors.New("timed out waiting for the agent's input box")
 
 // backend abstracts the per-CLI differences in driving an interactive coding
 // agent inside a tmux window. The pool (window lifecycle, inject, capture) and
@@ -41,8 +47,10 @@ type backend interface {
 	// turnComplete is the tailer's end-of-turn predicate for this backend's log.
 	turnComplete(line []byte) bool
 	// waitReady prepares the freshly-spawned/resumed TUI to accept a pasted
-	// prompt. Returns false only on ctx cancellation.
-	waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) bool
+	// prompt. Returns nil once ready; ctx.Err() on cancellation, or
+	// errReadyTimeout if the TUI never became injectable within t.resumeReady
+	// (so the caller surfaces a visible failure instead of blind-pasting).
+	waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) error
 }
 
 // --- Claude --------------------------------------------------------------
@@ -88,26 +96,33 @@ func (b claudeBackend) locate(sessionID string) string {
 // the long-session chooser, a fresh new window dismisses the trust prompt, a
 // warm window just needs a beat. cwd is unused (the markers are global). Returns
 // false on ctx cancel.
-func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) bool {
+func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) error {
 	switch {
 	case fresh && resume:
 		return b.waitResumeReady(ctx, sessionID)
 	case fresh:
 		if !sleepCtx(ctx, b.t.spawnSettle) {
-			return false
+			return ctx.Err()
 		}
 		_ = b.p.acceptTrust(sessionID)
-		return sleepCtx(ctx, b.t.trustToInject)
+		if !sleepCtx(ctx, b.t.trustToInject) {
+			return ctx.Err()
+		}
+		return nil
 	default:
-		return sleepCtx(ctx, b.t.warmSettle)
+		if !sleepCtx(ctx, b.t.warmSettle) {
+			return ctx.Err()
+		}
+		return nil
 	}
 }
 
 // waitResumeReady answers the long-resume chooser ("full session") and waits for
-// the input box, tracking the selection arrow each tick: claude swallows keys
-// aimed at the select before it mounts, so a swallowed Down must self-retry (the
-// arrow hasn't moved). Bounded by t.resumeReady; false only on ctx cancel.
-func (b claudeBackend) waitResumeReady(ctx context.Context, sessionID string) bool {
+// the input composer (composerReady), tracking the selection arrow each tick:
+// claude swallows keys aimed at the select before it mounts, so a swallowed Down
+// must self-retry (the arrow hasn't moved). Bounded by t.resumeReady; false only
+// on ctx cancel.
+func (b claudeBackend) waitResumeReady(ctx context.Context, sessionID string) error {
 	deadline := time.NewTimer(b.t.resumeReady)
 	defer deadline.Stop()
 	ticker := time.NewTicker(b.t.poll)
@@ -115,10 +130,13 @@ func (b claudeBackend) waitResumeReady(ctx context.Context, sessionID string) bo
 	for {
 		text, _ := b.p.paneText(sessionID)
 		switch {
-		case strings.Contains(text, inputReadyMarker):
-			// Box ready. Settle first or the Enter after inject's paste races the
-			// still-settling TUI and is dropped (the "lost Enter" on resume).
-			return sleepCtx(ctx, b.t.trustToInject)
+		case composerReady(text):
+			// Composer mounted. Settle first or the Enter after inject's paste races
+			// the still-settling TUI and is dropped (the "lost Enter" on resume).
+			if !sleepCtx(ctx, b.t.trustToInject) {
+				return ctx.Err()
+			}
+			return nil
 		case chooserArrowOn(text, resumeChooserMarker):
 			_ = b.p.sendKeys(sessionID, "Enter")
 		case chooserArrowOn(text, resumeSummaryMarker):
@@ -128,9 +146,9 @@ func (b claudeBackend) waitResumeReady(ctx context.Context, sessionID string) bo
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return ctx.Err()
 		case <-deadline.C:
-			return true
+			return errReadyTimeout
 		case <-ticker.C:
 		}
 	}
@@ -258,9 +276,12 @@ func (b codexBackend) knownSessionIDs() map[string]bool {
 // continue" → Enter) if it appears, then waits for the input-ready footer.
 // Codex resume has no chooser, so unlike the Claude path there is no arrow-row
 // tracking — just trust-then-footer. Bounded by t.resumeReady; false on cancel.
-func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) bool {
+func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) error {
 	if !fresh {
-		return sleepCtx(ctx, b.t.warmSettle)
+		if !sleepCtx(ctx, b.t.warmSettle) {
+			return ctx.Err()
+		}
+		return nil
 	}
 	deadline := time.NewTimer(b.t.resumeReady)
 	defer deadline.Stop()
@@ -273,16 +294,19 @@ func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fres
 		case codexInputReady(text, cwd):
 			// Settle before the paste so the Enter after it isn't dropped into a
 			// still-rendering composer.
-			return sleepCtx(ctx, b.t.trustToInject)
+			if !sleepCtx(ctx, b.t.trustToInject) {
+				return ctx.Err()
+			}
+			return nil
 		case !trusted && strings.Contains(text, codexTrustMarker):
 			_ = b.p.sendKeys(sessionID, "Enter")
 			trusted = true
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return ctx.Err()
 		case <-deadline.C:
-			return true
+			return errReadyTimeout
 		case <-ticker.C:
 		}
 	}

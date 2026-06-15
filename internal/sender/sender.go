@@ -113,7 +113,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		spawnSettle:   5 * time.Second,
 		trustToInject: 1500 * time.Millisecond,
 		warmSettle:    400 * time.Millisecond,
-		resumeReady:   30 * time.Second,
+		resumeReady:   8 * time.Second,
 		confirm:       8 * time.Second,
 		poll:          150 * time.Millisecond,
 	}
@@ -156,7 +156,7 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		spawnSettle:   5 * time.Second,
 		trustToInject: 1500 * time.Millisecond,
 		warmSettle:    400 * time.Millisecond,
-		resumeReady:   30 * time.Second,
+		resumeReady:   8 * time.Second,
 		confirm:       8 * time.Second,
 		poll:          150 * time.Millisecond,
 	}
@@ -240,9 +240,9 @@ func (s *Sender) StartCodexSession(ctx context.Context, tempID, prompt, cwd, mod
 	}
 	s.markBusy(tempID)
 
-	if !s.backend.waitReady(ctx, tempID, cwd, fresh, false) {
+	if err := s.backend.waitReady(ctx, tempID, cwd, fresh, false); err != nil {
 		s.clearBusy(tempID)
-		return "", nil, ctx.Err()
+		return "", nil, err
 	}
 	if err := s.pool.inject(tempID, prompt); err != nil {
 		s.clearBusy(tempID)
@@ -318,8 +318,8 @@ func (s *Sender) Inject(ctx context.Context, sessionID, prompt, cwd string) erro
 	if err != nil {
 		return err
 	}
-	if !s.backend.waitReady(ctx, sessionID, cwd, fresh, true) {
-		return ctx.Err()
+	if err := s.backend.waitReady(ctx, sessionID, cwd, fresh, true); err != nil {
+		return err
 	}
 	return s.pool.inject(sessionID, prompt)
 }
@@ -387,8 +387,13 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			return
 		}
 
-		// Get the TUI ready to receive the prompt.
-		if !s.backend.waitReady(ctx, sessionID, cwd, fresh, resume) {
+		// Get the TUI ready to receive the prompt. A timeout here means the box
+		// never became injectable: surface it (unless the caller cancelled)
+		// instead of blind-pasting into an unknown screen.
+		if err := s.backend.waitReady(ctx, sessionID, cwd, fresh, resume); err != nil {
+			if ctx.Err() == nil {
+				emitError(ctx, out, "session did not become ready: "+err.Error())
+			}
 			return
 		}
 
@@ -431,11 +436,13 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 }
 
 // Markers for matching TUI states in a plain pane capture: the resume chooser's
-// two option lines, the idle input box's footer, and the chooser's arrow.
+// two option lines and the chooser's arrow. Input-box readiness is NOT a string
+// match — it is detected structurally by composerReady, since the footer below
+// the box ("? for shortcuts") sits on a line the user can replace with a custom
+// statusLine and so can't be relied on.
 const (
 	resumeChooserMarker = "Resume full session as-is" // the option usher wants
 	resumeSummaryMarker = "Resume from summary"       // the highlighted default
-	inputReadyMarker    = "? for shortcuts"
 	chooserArrow        = "❯"
 )
 
@@ -450,6 +457,51 @@ func chooserArrowOn(text, option string) bool {
 		}
 	}
 	return false
+}
+
+const (
+	composerScanLines = 10 // search only the bottom N pane lines for the box
+	composerBorderRun = 5  // min "─" chars for a line to count as a box border
+)
+
+// composerReady reports whether claude's idle input composer is mounted: two
+// "─" rules sandwiching the empty "❯" prompt. Preferred over the "? for
+// shortcuts" footer, which a custom statusLine can replace.
+//
+// Trailing blank rows are dropped first — tmux pads empty rows below the
+// content, so the composer sits at the bottom of the non-blank region, not the
+// grid — then the scan is confined to the last composerScanLines lines so the
+// same shape replayed in the transcript can't trip it.
+func composerReady(text string) bool {
+	lines := strings.Split(text, "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) > composerScanLines {
+		lines = lines[len(lines)-composerScanLines:]
+	}
+	for i := 0; i+2 < len(lines); i++ {
+		if isBoxBorder(lines[i]) && isPromptLine(lines[i+1]) && isBoxBorder(lines[i+2]) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBoxBorder reports whether a line is a composer rule — at least
+// composerBorderRun horizontal box-drawing characters ("─").
+func isBoxBorder(line string) bool {
+	return strings.Count(line, "─") >= composerBorderRun
+}
+
+// isPromptLine reports whether a line is the composer's empty prompt row: just
+// "❯" (or ">") once padding and rule/box glyphs are stripped. Strict (no
+// trailing text) so a transcript command like "❯ /exit" isn't mistaken for it.
+func isPromptLine(line string) bool {
+	// \u00a0: claude renders a non-breaking space after the prompt that a
+	// plain space won't strip.
+	s := strings.Trim(line, " \t\u00a0│|╭╮╰╯─")
+	return s == "❯" || s == ">"
 }
 
 // locate finds the session log for sessionID via the active backend.
