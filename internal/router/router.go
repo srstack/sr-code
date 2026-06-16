@@ -784,7 +784,8 @@ func extractErrorMessage(raw json.RawMessage) string {
 // subscribers — callers that want the first response inline should use
 // CreateSession instead. Registered in activeSend so CancelSend works.
 func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
-	if err := validateCreateInputs(cwd, initialMsg); err != nil {
+	cwd, err := validateCreateInputs(cwd, initialMsg)
+	if err != nil {
 		return "", err
 	}
 	backend := backendForModel(model)
@@ -875,19 +876,31 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model str
 	}
 }
 
-func validateCreateInputs(cwd, initialMsg string) error {
+// validateCreateInputs checks the new-session inputs and returns the resolved
+// cwd: ~ is expanded, the path must otherwise be absolute, and it is created
+// if missing.
+func validateCreateInputs(cwd, initialMsg string) (string, error) {
 	if cwd == "" {
-		return errors.New("cwd is required")
-	}
-	if info, err := os.Stat(cwd); err != nil {
-		return fmt.Errorf("cwd %q: %w", cwd, err)
-	} else if !info.IsDir() {
-		return fmt.Errorf("cwd %q is not a directory", cwd)
+		return "", errors.New("cwd is required")
 	}
 	if initialMsg == "" {
-		return errors.New("initial_message is required")
+		return "", errors.New("initial_message is required")
 	}
-	return nil
+	if cwd == "~" || strings.HasPrefix(cwd, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot expand ~: %w", err)
+		}
+		cwd = filepath.Join(home, cwd[1:])
+	}
+	if !filepath.IsAbs(cwd) {
+		return "", fmt.Errorf("cwd %q must be an absolute path or start with ~", cwd)
+	}
+	// MkdirAll no-ops if cwd exists and errors on a non-dir, so it also is-dir-checks.
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		return "", fmt.Errorf("cwd %q: %w", cwd, err)
+	}
+	return cwd, nil
 }
 
 // CreateSession spawns a brand-new Claude Code session in cwd and waits for
@@ -896,7 +909,8 @@ func validateCreateInputs(cwd, initialMsg string) error {
 // will appear in discovery via fsnotify shortly after the subprocess
 // starts writing its jsonl.
 func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, timeout time.Duration) (string, string, error) {
-	if err := validateCreateInputs(cwd, initialMsg); err != nil {
+	cwd, err := validateCreateInputs(cwd, initialMsg)
+	if err != nil {
 		return "", "", err
 	}
 
@@ -909,7 +923,6 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 	snd := r.senderForBackend(r.defaultBackend)
 	var sessionID string
 	var ch <-chan sender.StreamEvent
-	var err error
 	if snd.PreAssignsID() {
 		sessionID = newUUIDv4()
 		ch, err = snd.SendNew(waitCtx, sessionID, initialMsg, cwd, "")
