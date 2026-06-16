@@ -117,7 +117,7 @@ body {
 .sidebar-mainchat.active { background: var(--bg-accent); border-color: var(--accent-border); font-weight: 500; }
 .sidebar-section { margin-bottom: 1rem; }
 .sidebar-heading {
-  font-size: 0.7rem;
+  font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-faint);
@@ -128,6 +128,9 @@ body {
   justify-content: space-between;
   gap: 0.4rem;
 }
+/* The session count borrows .muted only for its faint color; override the
+ * size that class also carries so it tracks the heading instead of dwarfing it. */
+.sidebar-heading .muted { font-size: inherit; }
 .sidebar-new {
   display: inline-flex;
   align-items: center;
@@ -171,7 +174,7 @@ body {
   text-overflow: ellipsis;
   font-size: 0.9rem;
 }
-.sidebar-list li.sidebar-item a.active { background: var(--bg-accent); color: var(--accent); font-weight: 500; }
+.sidebar-list li.sidebar-item a.active { background: var(--bg-accent); color: var(--accent); }
 .sidebar-list li.sidebar-item a .running-dot {
   margin-left: 0;
   margin-right: 0.25rem;
@@ -282,9 +285,30 @@ body {
   font-size: 0.8rem;
   color: var(--text-disabled);
   padding: 0.3rem 0.5rem 0.1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.cwd-label-text {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* The per-cwd "+" reuses .sidebar-new; keep it from being squeezed by a long
+ * path and let the path text take the remaining width. */
+.cwd-new { flex-shrink: 0; margin-left: auto; }
+/* Hover-reveal it on pointer devices so only the top "sessions +" is permanent.
+ * opacity (not display) keeps it occupying its slot, so the path width — and the
+ * row — never shift when it fades in. On touch (no hover) it stays visible. */
+@media (hover: hover) {
+  .cwd-new { opacity: 0; pointer-events: none; }
+  .cwd-group:hover .cwd-new,
+  .cwd-new:focus {
+    opacity: 1;
+    pointer-events: auto;
+    transition: opacity 0.1s ease;
+  }
 }
 
 /* ----- Main wrap -------------------------------------------------------- */
@@ -845,6 +869,9 @@ pre.raw-markdown {
   align-items: center;
   gap: 0.75rem;
   margin-top: 0.4rem;
+  /* Indent so "cwd" lines up roughly with the model text inside the composer
+   * below: composer-bar pad (0.4) + composer-model pad (0.3) ≈ 0.7rem. */
+  padding-left: 0.7rem;
 }
 /* Secondary controls — ghost style (no border/fill) so they recede beside the
  * accent send button. State shows via text color: muted off, amber when
@@ -1123,13 +1150,16 @@ pre.raw-markdown {
   width: 18rem;
   max-width: 100%;  font-size: 1rem;
   padding: 0.25rem 0.5rem;
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 4px;
-  background: var(--bg-chrome);
+  background: transparent;
   color: var(--text);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
-.new-cwd-field input:focus { outline: none; border-color: var(--accent); }
+/* Ghost field (no border/fill); focus shows a fill since there's no border
+ * left to highlight. --bg-hover (not --bg-subtle) so it reads against the
+ * near-white canvas in light mode. */
+.new-cwd-field input:focus { outline: none; background: var(--bg-hover); }
 /* Phones: cwd (a path) wants the whole row, so stack the two fields rather
  * than cram them side by side. (send-controls is the new-session view only.) */
 @media (max-width: 720px) {

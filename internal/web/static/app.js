@@ -237,6 +237,8 @@ function route() {
     showList();
   } else if (hash === '#/new') {
     showNewSession();
+  } else if (hash.startsWith('#/new/')) {
+    showNewSession(decodeURIComponent(hash.slice('#/new/'.length)));
   } else if (hash === '#/chat' || hash.startsWith('#/chat/')) {
     const id = hash === '#/chat' ? 'default' : decodeURIComponent(hash.slice('#/chat/'.length));
     showMainChat(id);
@@ -341,8 +343,15 @@ function renderSidebarSessions(allSessions) {
       : `<button class="cwd-toggle-archived" type="button" data-cwd="${esc(cwd)}">${
           expanded ? '└ [ collapse ]' : '└ [ ' + archivedItems.length + ' archived ]'
         }</button>`;
+    const newHere = cwd === '(unknown)'
+      ? ''
+      : `<a class="sidebar-new cwd-new" href="${esc('#/new/' + encodeURIComponent(cwd))}"
+           title="new session here" aria-label="new session here">+</a>`;
     return `<div class="cwd-group">
-      <div class="cwd-label" title="${esc(cwd)}">${esc(cwd)}</div>
+      <div class="cwd-label">
+        <span class="cwd-label-text" title="${esc(cwd)}">${esc(cwd)}</span>
+        ${newHere}
+      </div>
       <ul class="sidebar-list">${lis}</ul>
       ${toggleRow}
     </div>`;
@@ -360,7 +369,7 @@ function updateSidebarActive() {
   document.querySelectorAll('.sidebar-mainchat').forEach(a => {
     a.classList.toggle('active', inMainChat);
   });
-  document.querySelectorAll('.sidebar-new').forEach(a => {
+  document.querySelectorAll('.sidebar-new:not(.cwd-new)').forEach(a => {
     a.classList.toggle('active', hash === '#/new');
   });
   let sessionKey = '';
@@ -546,7 +555,7 @@ async function pauseSession(id) {
 // id immediately and streams to broker subscribers), then hash-routes to
 // the freshly-created session's detail page.
 
-async function showNewSession() {
+async function showNewSession(prefillCwd) {
   clearListInterval();
   currentDetailId = null;
   currentDraftKey = null; // not draft-managed; don't clobber a session draft
@@ -566,6 +575,14 @@ async function showNewSession() {
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
+        <div class="send-controls">
+          <label class="new-cwd-field">
+            <span class="muted">cwd</span>
+            <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
+                   placeholder="/absolute/path/to/project">
+            <datalist id="new-cwd-list">${options}</datalist>
+          </label>
+        </div>
         <div class="composer">
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
@@ -586,14 +603,6 @@ async function showNewSession() {
             <div class="composer-send"><button id="send">send</button></div>
           </div>
         </div>
-        <div class="send-controls">
-          <label class="new-cwd-field">
-            <span class="muted">cwd</span>
-            <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
-                   placeholder="/absolute/path/to/project">
-            <datalist id="new-cwd-list">${options}</datalist>
-          </label>
-        </div>
         <div id="new-session-err" class="err" style="display:none; margin-top:0.5rem"></div>
       </section>
     </div>
@@ -604,7 +613,14 @@ async function showNewSession() {
   const cwdEl = document.getElementById('new-cwd');
   const modelEl = document.getElementById('new-model');
   const errEl = document.getElementById('new-session-err');
-  cwdEl.focus();
+  // Prefilled from a sidebar cwd "+": cwd is known, so drop the cursor in the
+  // message box instead of the cwd field.
+  if (prefillCwd) {
+    cwdEl.value = prefillCwd;
+    promptEl.focus();
+  } else {
+    cwdEl.focus();
+  }
 
   // Restore the last-picked model (the <select> defaults to Opus in markup; an
   // unknown stored value just leaves that default). Run AFTER codex models load
