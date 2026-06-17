@@ -47,11 +47,10 @@
   --code-block-bg: #1f2328;
   --code-block-text: #e6edf3;
 
-  /* Terminal mirror font. Sarasa Term leads: one font for Latin + CJK with
-   * CJK == 2× the cell, and box-drawing kept half-width (unlike Mono/Noto,
-   * which draw it full-width and overflow divider rules). Absent → plain
-   * monospace and CJK text misaligns; install Sarasa Term to fix. */
-  --term-font: "Sarasa Term SC", ui-monospace, "SF Mono", Menlo, monospace;
+  /* Terminal mirror font. Sarasa Fixed keeps CJK at 2× the cell and box-drawing
+   * half-width so columns align. Region variants listed so whichever is installed
+   * wins before the system-monospace fallback. */
+  --term-font: "Sarasa Fixed SC", "Sarasa Fixed TC", "Sarasa Fixed HC", "Sarasa Fixed J", "Sarasa Fixed K", ui-monospace, "SF Mono", Menlo, monospace;
 
   /* Semantic */
   --danger: #cf222e;

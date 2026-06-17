@@ -815,6 +815,12 @@ async function loadList() {
 
 // ---------- Detail view ----------
 
+// termPrefMode reads the persisted screen-mirror mode (default auto), so the
+// toggle paints its real state on first render instead of flashing off→auto.
+function termPrefMode() {
+  try { return localStorage.getItem('usher.term.mode') || 'auto'; } catch { return 'auto'; }
+}
+
 async function showDetail(id) {
   const epoch = ++detailEpoch;
   clearListInterval();
@@ -874,12 +880,12 @@ async function showDetail(id) {
             <div class="composer-tools">
               <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
                 aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
-                title="when on, every PreToolUse hook for this session is allowed without prompting">
+                title="ask: confirm each tool call · auto: run them automatically">
                 <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
               </button>
-              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="false"
-                title="terminal mirror — click to cycle off → auto → on. auto previews live output inline in the turn bubble (before it lands); on docks an interactive pane.">
-                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">off</span>
+              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${termPrefMode() === 'off' ? 'false' : 'true'}"
+                title="mirror of the live terminal — click to cycle off → auto → on">
+                <span class="t-icon">&gt;_</span><span class="t-full">screen:</span><span class="toggle-val">${termPrefMode()}</span>
               </button>
             </div>
             <div class="composer-send">
@@ -926,15 +932,15 @@ async function showDetail(id) {
 
   // Terminal mirror: a collapsible live pane docked above the input, driven by
   // a 3-state toggle that cycles off → auto → on (persisted in localStorage):
-  //   off  — hidden, no automatic behaviour (default)
-  //   auto — reveals on send (the un-flushed turn is starting) and hides again
-  //          after a deliberate scroll up into history; re-reveals next send
+  //   off  — hidden, no automatic behaviour
+  //   auto — (default) reveals on send (the un-flushed turn is starting) and hides
+  //          again after a deliberate scroll up into history; re-reveals next send
   //   on   — pinned open, never auto-hidden
   // The /screen stream runs only while actually shown, so background sessions
   // don't poll capture-pane. Soft keys wire once (the grid node is permanent).
   const termToggle = document.getElementById('term-toggle');
   const termPanel = document.getElementById('term-panel');
-  let termMode = (() => { try { return localStorage.getItem('usher.term.mode') || 'auto'; } catch { return 'auto'; } })();
+  let termMode = termPrefMode();
   let termShown = false;        // whether the docked panel is currently streaming/visible
   let termAppliedRows = 0;      // rows last applied — gates needless restreams
   let softKeysWired = false;
@@ -1404,10 +1410,11 @@ const TERM_BG = '#0d1117';
 const TERM_FG = '#c9d1d9';
 
 // ansiToHtml converts a `capture-pane -e` frame (plain text + SGR colour
-// escapes) into HTML spans. capture-pane -e emits only SGR (`ESC [ … m`), so
-// that's all we parse: bold/dim/italic/underline/inverse, the 16 base colours,
-// 256-colour, and truecolour. Inverse swaps fg/bg — that's how a TUI paints its
-// selected menu row, the whole reason this mirror exists.
+// escapes) into HTML spans. We style SGR (`ESC [ … m`): bold/dim/italic/
+// underline/inverse, the 16 base colours, 256-colour, and truecolour. Inverse
+// swaps fg/bg — that's how a TUI paints its selected menu row, the whole reason
+// this mirror exists. OSC sequences (e.g. OSC 8 hyperlinks) also slip into the
+// frame; we strip those whole rather than render them.
 function ansiToHtml(s) {
   const str = String(s);
   let fg = null, bg = null, bold = false, dim = false, ital = false, ul = false, inv = false;
@@ -1472,6 +1479,12 @@ function ansiToHtml(s) {
         i += m[0].length;
         continue;
       }
+    }
+    if (ch === '\x1b' && str[i + 1] === ']') {
+      // OSC (e.g. OSC 8 hyperlinks): skip through the string terminator (BEL or ESC\).
+      // capture-pane keeps these even though we only style SGR — strip whole, keep text.
+      const mo = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(str.slice(i));
+      if (mo) { i += mo[0].length; continue; }
     }
     if (ch === '\x1b') { i++; continue; } // drop a stray/unrecognised escape
     out += esc1(ch);
