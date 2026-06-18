@@ -219,6 +219,78 @@ func TestSend_ResumeNotReadyEmitsError(t *testing.T) {
 	}
 }
 
+func TestSend_CancelDuringWaitReadyEmitsExit(t *testing.T) {
+	// A cold resume still settling (composer not yet up) when the user hits ESC
+	// / cancel: waitReady is interrupted by the cancelled ctx before the tailer
+	// ever runs. The turn must still end with subprocess.exit, or the web UI
+	// leaves send disabled until a manual refresh.
+	f := &fakeTmux{captureOut: "loading session…\n"}
+	s, path := testSender(t, f, "esc-1")
+	// Keep waitReady blocked (not timing out) until the cancel lands, so we
+	// exercise the cancel path, not the error path.
+	tm := s.t
+	tm.resumeReady = 5 * time.Second
+	s.t = tm
+	s.backend = claudeBackend{p: s.pool, t: tm, projectsDir: s.projectsDir, claudeCmd: "claude"}
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := s.Send(ctx, "esc-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(60 * time.Millisecond) // let it emit started and enter waitReady
+		cancel()
+	}()
+
+	got := collect(t, ch, 6*time.Second)
+	ts := types(got)
+	if len(ts) == 0 || ts[len(ts)-1] != "subprocess.exit" {
+		t.Fatalf("cancel during waitReady must end with subprocess.exit; got %v", ts)
+	}
+	if n := f.countCmd("paste-buffer"); n != 0 {
+		t.Fatalf("must not paste a prompt when cancelled before readiness; got %d injects", n)
+	}
+}
+
+func TestSend_CancelMidTurnEmitsExit(t *testing.T) {
+	// The case actually hit in practice: a warm/active session streaming a turn
+	// when the user cancels (ESC). The tailer emits subprocess.exit, but the
+	// run goroutine forwards events through the now-cancelled ctx, whose select
+	// can drop that exit (~50% — "sometimes the button doesn't recover"). The
+	// cancel-path defer must still deliver a terminal exit.
+	f := &fakeTmux{captureOut: idleComposer}
+	s, path := testSender(t, f, "mid-1")
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := s.Send(ctx, "mid-1", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A partial turn with NO turn_duration, so the tailer stays running until we
+	// cancel it.
+	go appendLines(path, 20*time.Millisecond,
+		`{"type":"user","message":{"role":"user","content":"hi"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}`,
+	)
+	go func() {
+		time.Sleep(120 * time.Millisecond) // well past waitReady; mid-tail
+		cancel()
+	}()
+
+	got := collect(t, ch, 6*time.Second)
+	ts := types(got)
+	if len(ts) == 0 || ts[len(ts)-1] != "subprocess.exit" {
+		t.Fatalf("cancel mid-turn must end with subprocess.exit; got %v", ts)
+	}
+}
+
 func TestComposerReady(t *testing.T) {
 	// The mounted composer — even though tmux pads ~28 blank rows below it, so
 	// it sits at the bottom of the CONTENT, not the captured grid (real case).

@@ -70,6 +70,12 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 
 		f, ok := openWhenReady(ctx, path, cfg, out)
 		if !ok {
+			// Cancelled before the file appeared: emit exit so the UI
+			// finalizes the turn. The appearWait timeout (ctx not cancelled)
+			// already emitted an error, so skip it there.
+			if ctx.Err() != nil {
+				emitExit()
+			}
 			return
 		}
 		defer f.Close()

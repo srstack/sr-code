@@ -266,6 +266,13 @@ func (p *pool) inject(sessionID, prompt string) error {
 	if _, err := p.runner.runStdin(prompt, "load-buffer", "-b", buf, "-"); err != nil {
 		return fmt.Errorf("load-buffer: %w", err)
 	}
+	// Clear leftover before pasting: a turn interrupted before output restores
+	// its prompt into the box, which the next paste would append to. Ctrl-U is a
+	// no-op when empty (double Escape would break an empty composer). It misses
+	// earlier lines of multi-line leftover — a rare, accepted gap.
+	if _, err := p.runner.run("send-keys", "-t", target(sessionID), "C-u"); err != nil {
+		return fmt.Errorf("send-keys clear: %w", err)
+	}
 	if _, err := p.runner.run("paste-buffer", "-p", "-d", "-b", buf, "-t", target(sessionID)); err != nil {
 		return fmt.Errorf("paste-buffer: %w", err)
 	}

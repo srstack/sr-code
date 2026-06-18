@@ -266,6 +266,11 @@ func (s *Sender) StartCodexSession(ctx context.Context, tempID, prompt, cwd, mod
 	go func() {
 		defer close(out)
 		defer s.clearBusy(realID)
+		defer func() {
+			if ctx.Err() != nil {
+				emitTerminalExit(out)
+			}
+		}()
 		started, _ := json.Marshal(struct {
 			Cwd   string `json:"cwd"`
 			Fresh bool   `json:"fresh"`
@@ -378,6 +383,13 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 	go func() {
 		defer close(out)
 		defer s.clearBusy(sessionID)
+		// On cancel, guarantee a terminal event even if we returned before the
+		// tailer ran (ESC during waitReady) or its exit was dropped in transit.
+		defer func() {
+			if ctx.Err() != nil {
+				emitTerminalExit(out)
+			}
+		}()
 
 		started, _ := json.Marshal(struct {
 			Cwd   string `json:"cwd"`
@@ -538,6 +550,16 @@ func sendEvent(ctx context.Context, ch chan<- StreamEvent, ev StreamEvent) bool 
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// emitTerminalExit pushes a synthetic subprocess.exit so a client finalizes the
+// turn. It's the cancel-path backstop: a cancelled turn (cancel button / ESC)
+// can bail out before the tailer emits its own exit (e.g. during waitReady), or
+// drop it while forwarding through a now-cancelled ctx. Uses Background so the
+// cancelled turn ctx can't swallow this one too. Safe to call redundantly — the
+// web client handles subprocess.exit idempotently.
+func emitTerminalExit(out chan<- StreamEvent) {
+	sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage("{}")})
 }
 
 func emitError(ctx context.Context, out chan<- StreamEvent, msg string) {

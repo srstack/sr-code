@@ -135,3 +135,18 @@ func TestTailTurn_FileNeverAppears(t *testing.T) {
 		t.Fatalf("got %v, want [error]", types(got))
 	}
 }
+
+// Cancelling a send before the jsonl appears (a fast cancel on a brand-new
+// session) must still emit subprocess.exit — otherwise the web UI never
+// finalizes the turn and leaves send disabled until a manual refresh.
+func TestTailTurn_CancelBeforeFileAppears(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.jsonl")
+	ctx, cancel := context.WithCancel(context.Background())
+	// Long appearWait so the only way out is the cancel, not the timeout.
+	ch := tailTurn(ctx, path, 0, nil, tailConfig{poll: 10 * time.Millisecond, appearWait: 10 * time.Second})
+	cancel()
+	got := collect(t, ch, 2*time.Second)
+	if !eq(types(got), []string{"subprocess.exit"}) {
+		t.Fatalf("got %v, want [subprocess.exit]", types(got))
+	}
+}

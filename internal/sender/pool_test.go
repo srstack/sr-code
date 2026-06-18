@@ -343,7 +343,8 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sawLoad, sawPaste, sawEnter bool
-	for _, c := range f.cmds {
+	clearIdx, pasteIdx := -1, -1
+	for i, c := range f.cmds {
 		// The prompt must be loaded via stdin (load-buffer -), never as a
 		// set-buffer argument — a long paste there is "command too long".
 		if c[0] == "set-buffer" {
@@ -352,8 +353,12 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 		if c[0] == "load-buffer" && contains(c, "-") {
 			sawLoad = true
 		}
+		if c[0] == "send-keys" && contains(c, "C-u") && clearIdx == -1 {
+			clearIdx = i
+		}
 		if c[0] == "paste-buffer" && contains(c, "-p") {
 			sawPaste = true
+			pasteIdx = i
 		}
 		if c[0] == "send-keys" && contains(c, "Enter") {
 			sawEnter = true
@@ -361,6 +366,12 @@ func TestPool_InjectUsesBracketedPaste(t *testing.T) {
 	}
 	if !sawLoad || !sawPaste || !sawEnter {
 		t.Fatalf("inject should load-buffer (stdin), bracketed-paste, then Enter; cmds=%v", f.cmds)
+	}
+	// The composer clear must precede the paste, or a turn interrupted by ESC
+	// (claude restores the prompt to the input) would have the next prompt
+	// appended to the leftover.
+	if clearIdx == -1 || clearIdx > pasteIdx {
+		t.Fatalf("inject should clear the composer (C-u) before pasting; cmds=%v", f.cmds)
 	}
 	if !contains(f.stdins, "hello\nworld") {
 		t.Fatalf("inject should feed the prompt via stdin; stdins=%v", f.stdins)
