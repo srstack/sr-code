@@ -715,7 +715,7 @@ async function showList() {
   closeES();
   currentDetailId = null;
   currentDraftKey = null;
-  subtitle.textContent = 'discovered Claude Code sessions';
+  subtitle.textContent = 'discovered sessions';
   // Stable shell: pinned controls + a .list-scroll wrapper (the scroll
   // container — <main> is overflow:hidden). loadList only swaps the rows, so
   // the 5s poll doesn't disturb the controls.
@@ -786,7 +786,7 @@ async function loadList() {
       const dot = statusDot(s.status);
       return `
       <tr data-id="${esc(s.id)}" data-cwd="${esc(s.cwd || '')}" data-archived="${s.archived ? '1' : ''}" class="${s.archived ? 'archived' : ''}">
-        <td class="title" title="${esc(title)}">${dot ? dot + ' ' : ''}${esc(title)}</td>
+        <td class="title" title="${esc(title)}">${backendMark(s.backend)}${dot ? dot + ' ' : ''}${esc(title)}</td>
         <td class="cwd" title="${esc(s.cwd || '')}">${esc(s.cwd || '')}</td>
         <td>${esc(fmt(s.last_event_at))}</td>
         <td class="act"><button class="kebab-btn" type="button" data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}" data-status="${esc(s.status || '')}" aria-label="session actions" title="more">⋮</button></td>
@@ -1070,6 +1070,29 @@ function statusDot(status) {
   if (status === 'running') return '<span class="running-dot executing" title="executing">●</span>';
   if (status === 'live') return '<span class="running-dot" title="process live">●</span>';
   return '';
+}
+
+// Inner SVG for each backend mark (24x24 viewBox; sized/tinted via CSS).
+// claude: 10 round-capped spokes from the centre (12,12) out to radius 9.6,
+//   tilted 5deg clockwise.
+// codex: 6 outward 144deg arcs (radius 3.68) joining hexagon vertices on a
+//   radius-7 circle, filled, tilted 15deg clockwise.
+const BACKEND_MARKS = {
+  claude: '<g stroke="currentColor" stroke-width="2.1" stroke-linecap="round">'
+    + '<line x1="12" y1="12" x2="12.84" y2="2.44"/><line x1="12" y1="12" x2="18.30" y2="4.75"/>'
+    + '<line x1="12" y1="12" x2="21.35" y2="9.84"/><line x1="12" y1="12" x2="20.84" y2="15.75"/>'
+    + '<line x1="12" y1="12" x2="16.94" y2="20.23"/><line x1="12" y1="12" x2="11.16" y2="21.56"/>'
+    + '<line x1="12" y1="12" x2="5.70" y2="19.25"/><line x1="12" y1="12" x2="2.65" y2="14.16"/>'
+    + '<line x1="12" y1="12" x2="3.16" y2="8.25"/><line x1="12" y1="12" x2="7.06" y2="3.77"/></g>',
+  codex: '<path d="M13.81,5.24A3.680 3.680 0 0 1 18.76,10.19A3.680 3.680 0 0 1 16.95,16.95'
+    + 'A3.680 3.680 0 0 1 10.19,18.76A3.680 3.680 0 0 1 5.24,13.81A3.680 3.680 0 0 1 7.05,7.05'
+    + 'A3.680 3.680 0 0 1 13.81,5.24Z" fill="currentColor"/>',
+};
+
+// Unknown/empty backend falls back to claude, mirroring the router default.
+function backendMark(backend) {
+  const b = backend === 'codex' ? 'codex' : 'claude';
+  return `<svg class="backend-mark backend-mark--${b}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${BACKEND_MARKS[b]}</svg>`;
 }
 
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
@@ -1576,11 +1599,12 @@ async function showMainChat(id) {
 
 function renderSessionSubtitle(sess) {
   subtitle.innerHTML =
+    backendMark(sess.backend) +
     `<span class="subtitle-left">` +
       `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
-    `</span>` +
-    `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
-    `<span class="session-cwd">${esc(sess.cwd || '')}</span>`;
+      `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
+      `<span class="session-cwd">${esc(sess.cwd || '')}</span>` +
+    `</span>`;
 }
 
 // refreshSubtitle re-reads the session so the header picks up a title/cwd that

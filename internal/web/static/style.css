@@ -38,9 +38,9 @@
   /* Agent purple */
   --purple: #6e40c9;
 
-  /* Model-picker accents: Claude coral / Codex logo blue. */
+  /* Backend accents (marks + model picker): Claude coral / Codex periwinkle. */
   --claude: #bd5b3d;
-  --codex: #3429ff;
+  --codex: #6f76d6;
 
   /* Code */
   --inline-code-bg: #e4e7eb;
@@ -330,23 +330,26 @@ body {
   top: 0;
   z-index: 10;
 }
+/* Centred row of [backend mark][text group], so the mark sits on the header's
+ * vertical centre. The mark is a sibling of .subtitle-left (not inside it) so
+ * it stays out of the text baseline. */
 #subtitle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+/* The text group: title + id + cwd, baseline-aligned among themselves (id/cwd
+ * sit on the title's baseline) and centred as a whole by #subtitle. Holds no
+ * tall element, so its baseline is clean. .session-title carries the ellipsis. */
+.subtitle-left {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: baseline;
   gap: 0.5rem;
   overflow: hidden;
-}
-/* subtitle-left absorbs all shrink and truncates its (inline) title with
- * an ellipsis — the ellipsis lives here, not on session-title, since an
- * inline <strong> can't be clipped directly. */
-.subtitle-left {
-  min-width: 0;
-  flex-shrink: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 /* margin-left:auto pushes these to the right edge; flex-shrink:0 keeps
  * them intact so the title is what gets truncated, not the id/cwd. */
@@ -530,6 +533,10 @@ td.cwd { font-size: 0.82rem; }
   color: var(--text);
   font-weight: 600;
   font-size: 0.95rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .session-cwd, .session-id {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -862,6 +869,18 @@ pre.raw-markdown {
   color: var(--warning-border);
   font-size: 0.75rem;
 }
+
+/* Backend mark before a session title; tinted per backend via currentColor. */
+.backend-mark {
+  width: 1.35em;
+  height: 1.35em;
+  vertical-align: middle; /* table cell (inline); header row centres via flex */
+  margin-right: 0.36em;
+  flex: none;
+}
+.backend-mark--claude { color: var(--claude); }
+.backend-mark--codex { color: var(--codex); }
+.archived-row .backend-mark { opacity: 0.5; }
 
 .send-controls {
   display: flex;
@@ -1204,7 +1223,7 @@ pre.raw-markdown {
 
     --purple: #bc8cff;
     --claude: #e0916f;
-    --codex: #7c78ff;
+    --codex: #8e93e0;
 
     --inline-code-bg: rgba(110, 118, 129, 0.3);
     --code-block-bg: #0a0d12;
