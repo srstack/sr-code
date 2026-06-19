@@ -1,0 +1,27 @@
+# systemd user service for usher.
+#
+# 1. Copy to ~/.config/systemd/user/usher.service and edit paths below.
+# 2. Ensure PATH includes tmux and your CLI (claude / codex).
+# 3. Enable:
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now usher
+#      loginctl enable-linger $USER      # keep running after logout
+#    Logs:
+#      journalctl --user -u usher -f
+
+[Unit]
+Description=usher — Claude/Codex session router
+After=network.target
+
+[Service]
+Type=simple
+# %h expands to $HOME. Change if your binary is elsewhere.
+ExecStart=%h/go/bin/usher serve
+Restart=on-failure
+RestartSec=3
+Environment=PATH=%h/go/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Uncomment for LLM agent mode:
+# Environment=OPENAI_API_KEY=sk-xxx
+
+[Install]
+WantedBy=default.target

@@ -26,24 +26,30 @@ approve or deny tool-permission prompts — without being at the keyboard.
 
 ## Install
 
-Download a binary from the [latest release](https://github.com/nexustar/usher/releases),
-or install with Go:
+Needs `tmux` ≥ 2.6 and at least one of the `claude` or `codex` CLIs you've
+already signed in to. On Windows, run usher inside
+[WSL](https://learn.microsoft.com/en-us/windows/wsl/install).
+
+### One-line install (recommended)
+
+```
+curl -fsSL https://raw.githubusercontent.com/nexustar/usher/main/install.sh | bash
+```
+
+Installs the binary, registers permission hooks, and starts a user-level
+service (launchd / systemd). No `sudo` required.
+
+### Build from source
 
 ```
 go install github.com/nexustar/usher/cmd/usher@latest
+usher setup         # register permission hooks (once; --remove to undo)
+usher serve         # http://127.0.0.1:7777
 ```
 
-## Quickstart
-
-Needs `tmux` ≥ 2.6 (usher runs each session inside it) and at least one of
-the `claude` or `codex` CLIs you've already signed in to — install either or
-both.
-
-```
-usher setup         # register the permission hooks for whichever CLIs are installed (once; --remove to undo)
-usher set-password  # optional for local use; recommended before exposing it
-usher serve         # serve on http://127.0.0.1:7777
-```
+To run as a service, see the example files in
+[`docs/`](docs/) ([macOS plist](docs/io.github.nexustar.usher.plist),
+[Linux systemd](docs/usher.service)).
 
 To reach usher from another device, see [Remote access](#remote-access).
 
