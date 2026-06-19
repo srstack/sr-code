@@ -789,7 +789,11 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 		return "", err
 	}
 	backend := backendForModel(model)
-	snd := r.senderForBackend(backend)
+	snd, ok := r.senders[backend]
+	if !ok {
+		backend = r.defaultBackend
+		snd = r.senders[backend]
+	}
 	if !snd.PreAssignsID() {
 		// Codex assigns its own id; spawn, discover it, register under it.
 		return r.startDiscoveredSession(cwd, initialMsg, model, backend, snd)
@@ -815,7 +819,7 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 	}
 	r.sendMu.Unlock()
 
-	go r.runStart(ctx, sessionID, initialMsg, cwd, model, tok)
+	go r.runStart(ctx, sessionID, initialMsg, cwd, model, backend, tok)
 	return sessionID, nil
 }
 
@@ -862,15 +866,15 @@ func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, 
 	return realID, nil
 }
 
-func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken) {
+func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model, backend string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
-	ch, err := r.senderForBackend(backendForModel(model)).SendNew(ctx, sessionID, prompt, cwd, model)
+	ch, err := r.senderForBackend(backend).SendNew(ctx, sessionID, prompt, cwd, model)
 	if err != nil {
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
-	asm := newStreamAssembler(backendForModel(model))
+	asm := newStreamAssembler(backend)
 	for ev := range ch {
 		r.publishStream(sessionID, asm, ev)
 	}
