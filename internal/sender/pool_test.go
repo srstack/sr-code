@@ -382,23 +382,22 @@ func TestPool_SpawnPropagatesEnv(t *testing.T) {
 	f := &fakeTmux{}
 	p := newPool(f, "claude", nil, []string{"USHER_HOOK_SOCK=/tmp/x.sock"}, 8, quietLogger())
 	mustEnsure(t, p, "s1")
-	// The new-session command must carry -e USHER_HOOK_SOCK=... so the
-	// spawned claude's permission hooks route back to this instance.
-	var ok bool
+	// The env must be folded into the command's `env` prefix (so the spawned
+	// claude's permission hooks route back to this instance) rather than tmux's
+	// new-session -e, which only exists in tmux >= 3.0.
+	cmd := f.spawnCmd(t)
+	if !strings.HasPrefix(cmd, "env ") || !strings.Contains(cmd, "USHER_HOOK_SOCK=/tmp/x.sock") {
+		t.Fatalf("spawn command should carry env USHER_HOOK_SOCK; got: %s", cmd)
+	}
+	// And it must NOT use tmux's -e flag (old-tmux incompatible).
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, c := range f.cmds {
-		if len(c) == 0 || c[0] != "new-session" {
-			continue
-		}
-		for i, a := range c {
-			if a == "-e" && i+1 < len(c) && c[i+1] == "USHER_HOOK_SOCK=/tmp/x.sock" {
-				ok = true
+		if len(c) > 0 && (c[0] == "new-session" || c[0] == "new-window") {
+			if contains(c, "-e") {
+				t.Fatalf("spawn must not use tmux -e (incompatible with tmux < 3.0); cmds=%v", f.cmds)
 			}
 		}
-	}
-	f.mu.Unlock()
-	if !ok {
-		t.Fatalf("spawn should pass -e USHER_HOOK_SOCK; cmds=%v", f.cmds)
 	}
 }
 

@@ -35,7 +35,7 @@ go install github.com/nexustar/usher/cmd/usher@latest
 
 ## Quickstart
 
-Needs `tmux` (usher runs each session inside it) and at least one of
+Needs `tmux` ≥ 2.6 (usher runs each session inside it) and at least one of
 the `claude` or `codex` CLIs you've already signed in to — install either or
 both.
 

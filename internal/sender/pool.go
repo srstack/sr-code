@@ -219,13 +219,18 @@ func (p *pool) spawn(sessionID, cwd, model string, resume bool) error {
 		cmd = p.spawnOverride(sessionID, cwd, model, resume)
 	}
 
-	// -e propagates env (notably USHER_HOOK_SOCK) into the spawned claude, so
-	// its permission hooks route back to THIS usher instance rather than
-	// whatever owns the default-data-dir socket. The dedicated tmux server
-	// freezes its env at creation, so inheritance alone is not reliable.
-	envFlags := make([]string, 0, len(p.env)*2)
-	for _, kv := range p.env {
-		envFlags = append(envFlags, "-e", kv)
+	// Propagate env (notably USHER_HOOK_SOCK, so the spawned agent's permission
+	// hooks reach THIS usher; the tmux server freezes its env at creation, so
+	// inheritance is unreliable). Folded into the command rather than tmux's
+	// `new-session -e` to keep working on tmux < 3.0, which lacks -e.
+	if len(p.env) > 0 {
+		pairs := make([]string, 0, len(p.env))
+		for _, kv := range p.env {
+			pairs = append(pairs, shellQuote(kv))
+		}
+		// A separate `env`: env forbids options after assignments, and the
+		// builder's `env` leads with -u flags.
+		cmd = "env " + strings.Join(pairs, " ") + " " + cmd
 	}
 
 	var err error
@@ -237,13 +242,11 @@ func (p *pool) spawn(sessionID, cwd, model string, resume bool) error {
 		// but the mirror re-asserts it on open via resizeCanvas — so we leave
 		// window-size at its default (latest) here, keeping such an attach
 		// full-size for debugging.
-		args := append([]string{"new-session", "-d", "-s", tmuxSessionName,
-			"-n", sessionID, "-c", cwd, "-x", "80", "-y", "50"}, envFlags...)
-		_, err = p.runner.run(append(args, cmd)...)
+		_, err = p.runner.run("new-session", "-d", "-s", tmuxSessionName,
+			"-n", sessionID, "-c", cwd, "-x", "80", "-y", "50", cmd)
 	} else {
-		args := append([]string{"new-window", "-t", tmuxSessionName,
-			"-n", sessionID, "-c", cwd}, envFlags...)
-		_, err = p.runner.run(append(args, cmd)...)
+		_, err = p.runner.run("new-window", "-t", tmuxSessionName,
+			"-n", sessionID, "-c", cwd, cmd)
 	}
 	if err != nil {
 		return fmt.Errorf("spawn window for %s: %w", sessionID, err)

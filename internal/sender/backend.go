@@ -203,6 +203,10 @@ func (b codexBackend) spawnCommand(sessionID, cwd, model string, resume bool) st
 		parts = append(parts, "-u", v)
 	}
 	parts = append(parts, shellQuote(b.codexCmd))
+	// Suppress codex's startup "update available" chooser: left unanswered it
+	// eats the next send's keystrokes, and its default option self-updates via
+	// curl|sh. A global -c override, so it precedes any resume subcommand.
+	parts = append(parts, "-c", shellQuote("check_for_update_on_startup=false"))
 	// Codex won't run a config-declared hook until it's "trusted". usher persists
 	// that trust at `usher setup` time (writes the hook's trusted_hash into
 	// ~/.codex/config.toml's [hooks.state]; see setupCodexHook), so no

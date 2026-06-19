@@ -116,6 +116,9 @@ func TestCodexSpawnCommand(t *testing.T) {
 	if !strings.HasPrefix(got, "env -u CODEX_THREAD_ID") {
 		t.Errorf("env scrub prefix missing: %q", got)
 	}
+	if !strings.Contains(got, "-c 'check_for_update_on_startup=false'") {
+		t.Errorf("update-check suppression missing: %q", got)
+	}
 
 	// Resume: `codex resume <id>`, no model (resumed keeps its own).
 	got = b.spawnCommand("sess-123", "/tmp/p", "gpt-5.5", true)
