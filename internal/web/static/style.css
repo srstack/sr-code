@@ -80,15 +80,18 @@ body {
 /* ----- Sidebar ---------------------------------------------------------- */
 
 #sidebar {
-  width: 300px;
-  flex-shrink: 0;
+  width: min(320px, 30vw);
+  position: fixed;
+  left: 0;
+  top: 0;
+  height: 100dvh;
+  z-index: 100;
+  transform: translateX(0);
+  transition: transform 0.15s ease;
   border-right: 1px solid var(--border-muted);
   background: var(--bg-chrome);
   padding: 1rem 0.75rem;
   overflow-y: auto;
-  height: 100dvh;
-  position: sticky;
-  top: 0;
   font-size: 0.85rem;
   display: flex;
   flex-direction: column;
@@ -99,6 +102,9 @@ body {
   font-weight: 600;
   margin: 0 0 1rem;
   padding: 0 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 .sidebar-brand a { color: inherit; text-decoration: none; }
 .sidebar-mainchat {
@@ -318,6 +324,8 @@ body {
   display: flex;
   flex-direction: column;
   height: 100dvh;
+  margin-left: min(320px, 30vw);
+  transition: margin-left 0.15s ease;
 }
 .main-wrap > header {
   display: flex;
@@ -397,6 +405,26 @@ body {
   font-size: 0.95rem;
   color: var(--text-muted);
 }
+.sidebar-collapse {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.45rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+body.sidebar-collapsed #sidebar {
+  transform: translateX(-100%);
+}
+body.sidebar-collapsed .main-wrap {
+  margin-left: 0;
+}
+body.sidebar-collapsed .mobile-toggle {
+  display: inline-flex;
+  align-items: center;
+}
 
 #sidebar-backdrop { display: none; }
 
@@ -417,19 +445,16 @@ body {
     pointer-events: auto;
   }
   #sidebar {
-    position: fixed;
-    left: 0;
-    top: 0;
-    height: 100dvh;
     width: 300px;
     transform: translateX(-100%);
-    transition: transform 0.2s ease;
-    z-index: 100;
+  }
+  #sidebar.open {
+    transform: translateX(0);
     box-shadow: 2px 0 8px var(--shadow-sidebar);
   }
-  #sidebar.open { transform: translateX(0); }
-  .main-wrap { width: 100%; }
+  .main-wrap { width: 100%; margin-left: 0; }
   .mobile-toggle { display: inline-flex; align-items: center; }
+  .sidebar-collapse { display: none; }
 }
 .muted { color: var(--text-faint); font-size: 0.85rem; }
 .empty { color: var(--text-faint); padding: 3rem 0; text-align: center; }

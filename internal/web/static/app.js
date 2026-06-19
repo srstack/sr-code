@@ -381,13 +381,26 @@ function updateSidebarActive() {
   });
 }
 
-// Mobile sidebar toggle. The sidebar is fixed-position with a slide-in
-// transform under 720px wide; the hamburger button toggles .open.
+// Sidebar toggle. On mobile (<720px) the sidebar is a fixed slide-in drawer
+// toggled by the hamburger button. On desktop, a collapse button hides the
+// sidebar entirely; the hamburger then re-appears to restore it.
 const mobileToggle = document.getElementById('mobile-toggle');
 const sidebarEl = document.getElementById('sidebar');
+const sidebarCollapse = document.getElementById('sidebar-collapse');
 if (mobileToggle && sidebarEl) {
-  mobileToggle.addEventListener('click', () => sidebarEl.classList.toggle('open'));
+  mobileToggle.addEventListener('click', () => {
+    if (document.body.classList.contains('sidebar-collapsed')) {
+      document.body.classList.remove('sidebar-collapsed');
+    } else {
+      sidebarEl.classList.toggle('open');
+    }
+  });
   window.addEventListener('hashchange', () => sidebarEl.classList.remove('open'));
+}
+if (sidebarCollapse) {
+  sidebarCollapse.addEventListener('click', () => {
+    document.body.classList.add('sidebar-collapsed');
+  });
 }
 const sidebarBackdrop = document.getElementById('sidebar-backdrop');
 if (sidebarBackdrop && sidebarEl) {
