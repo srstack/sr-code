@@ -84,6 +84,17 @@ func (b *Broker) SubscribeAll() (<-chan Event, func()) {
 	return sub.ch, cancel
 }
 
+// HasViewers reports whether any per-session subscriber is currently attached
+// to sessionID — i.e. a browser has its /events stream open on that session.
+// Global (SubscribeAll) subscribers don't count, so the push dispatcher asking
+// this never sees itself. Used to suppress notifications for the session a user
+// is actively looking at.
+func (b *Broker) HasViewers(sessionID string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs[sessionID]) > 0
+}
+
 // Publish delivers ev to every current subscriber of ev.SessionID and to every
 // global (SubscribeAll) subscriber. The non-blocking sends run while holding the
 // read lock so a concurrent cancel — which closes a channel under the write lock

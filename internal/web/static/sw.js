@@ -43,6 +43,66 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// --- web push ------------------------------------------------------------
+//
+// The server (internal/push) sends an encrypted JSON notification on turn-end
+// and on a new permission prompt. We render the two kinds differently: a
+// permission prompt is sticky and carries inline Allow/Deny actions wired
+// straight to the interactions API; a turn-done is a quiet, collapsible note.
+
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) { d = {}; }
+
+  const opts = {
+    body: d.body || '',
+    tag: d.tag || 'usher',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    data: { url: d.url || '/', interaction_id: d.interaction_id || '' },
+  };
+  if (d.kind === 'permission') {
+    opts.requireInteraction = true; // stays until acted on (desktop)
+    opts.actions = [
+      { action: 'allow', title: 'Allow' },
+      { action: 'deny', title: 'Deny' },
+    ];
+  } else {
+    opts.silent = true; // turn-done is low-priority
+  }
+  e.waitUntil(self.registration.showNotification(d.title || 'usher', opts));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const data = e.notification.data || {};
+
+  // Inline Allow/Deny answers the pending interaction without opening the app.
+  // Same-origin fetch carries the auth cookie, so no extra credentials needed.
+  if ((e.action === 'allow' || e.action === 'deny') && data.interaction_id) {
+    e.waitUntil(fetch('/api/interactions/' + data.interaction_id + '/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ behavior: e.action, scope: 'once' }),
+    }).catch(() => {}));
+    return;
+  }
+
+  const url = data.url || '/';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
+      for (const c of cs) {
+        if ('focus' in c) {
+          c.focus();
+          c.postMessage({ type: 'navigate', url });
+          return undefined;
+        }
+      }
+      return self.clients.openWindow(url);
+    })
+  );
+});
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;

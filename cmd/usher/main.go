@@ -21,6 +21,7 @@ import (
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
+	"github.com/nexustar/usher/internal/push"
 	"github.com/nexustar/usher/internal/router"
 	"github.com/nexustar/usher/internal/sender"
 	"github.com/nexustar/usher/internal/web"
@@ -108,6 +109,10 @@ func serve(args []string) error {
 		"append a small-model enforcement block to the system prompt (recommended for haiku / mini / flash / 7B-class models)")
 	autoArchiveDays := fs.Int("auto-archive-days", 7,
 		"sessions whose jsonl mtime is older than this fall out of the sidebar's default view; 0 disables auto-archive (manual archive still works)")
+	disablePush := fs.Bool("disable-push", false,
+		"turn off Web Push browser notifications (turn-done + permission prompts). On by default, but "+
+			"inert until a browser opts in (which needs the user's notification-permission grant) — nothing "+
+			"is sent, and no push service is contacted, until then.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -187,11 +192,41 @@ func serve(args []string) error {
 		return err
 	}
 
+	// Web push: a second consumer of the broker/hook event seams, delivering
+	// turn-done and permission notifications to subscribed browsers. On by
+	// default but inert until a browser subscribes — which needs the user's
+	// explicit notification-permission grant, and until then nothing is sent and
+	// no push service is contacted. --disable-push skips it entirely (no VAPID
+	// key, routes 404). A keypair failure disables push but doesn't stop serving.
+	var pushMgr *push.Manager
+	if !*disablePush {
+		pushMgr, err = push.New(push.Config{
+			KeyPath:   filepath.Join(*dataDir, "vapid.json"),
+			StorePath: filepath.Join(*dataDir, "push-subscriptions.json"),
+			Lookup: func(id string) (push.SessionInfo, bool) {
+				sess, ok := r.GetSession(id)
+				return push.SessionInfo{Title: sess.Title, Cwd: sess.Cwd}, ok
+			},
+			Events:  b,
+			Pending: h,
+			Logger:  logger,
+		})
+		if err != nil {
+			logger.Warn("web push disabled", "err", err)
+			pushMgr = nil
+		}
+	}
+	logger.Info("web push", "enabled", pushMgr != nil)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	if err := d.Start(ctx); err != nil {
 		return err
+	}
+
+	if pushMgr != nil {
+		go pushMgr.Run(ctx)
 	}
 
 	logger.Info("agent backend",
@@ -205,7 +240,7 @@ func serve(args []string) error {
 		"loopback_bind", addrIsLoopback(*addr),
 	)
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, codexModelsPath, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, logger)
 	return srv.Run(ctx)
 }
 

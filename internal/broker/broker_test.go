@@ -135,6 +135,36 @@ func TestBroker_ConcurrentSubscribePublish(t *testing.T) {
 	wg.Wait()
 }
 
+func TestBroker_HasViewers(t *testing.T) {
+	b := New()
+	if b.HasViewers("s1") {
+		t.Fatal("no subscribers yet")
+	}
+	_, cancel := b.Subscribe("s1")
+	if !b.HasViewers("s1") {
+		t.Fatal("subscriber attached, want a viewer")
+	}
+	if b.HasViewers("s2") {
+		t.Fatal("s2 has no viewer")
+	}
+	cancel()
+	if b.HasViewers("s1") {
+		t.Fatal("viewer cancelled, want none")
+	}
+}
+
+// TestBroker_SubscribeAllNotAViewer guards the suppression seam: the push
+// dispatcher subscribes via SubscribeAll and must not register as a per-session
+// viewer, or it would suppress its own notifications.
+func TestBroker_SubscribeAllNotAViewer(t *testing.T) {
+	b := New()
+	_, cancel := b.SubscribeAll()
+	defer cancel()
+	if b.HasViewers("s1") {
+		t.Fatal("SubscribeAll must not count as a session viewer")
+	}
+}
+
 func TestBroker_SubscribeAllReceivesEverySession(t *testing.T) {
 	b := New()
 	all, cancel := b.SubscribeAll()

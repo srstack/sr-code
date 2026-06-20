@@ -37,6 +37,7 @@ import (
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/jsonl"
 	"github.com/nexustar/usher/internal/mainchat"
+	"github.com/nexustar/usher/internal/push"
 	"github.com/nexustar/usher/internal/router"
 )
 
@@ -65,6 +66,7 @@ type Server struct {
 	router       *router.Router
 	main         *mainchat.Store
 	agent        usheragent.Agent
+	push         *push.Manager
 	logger       *slog.Logger
 	// codexModelsPath is ~/.codex/models_cache.json (codex's per-account model
 	// catalog). "" when codex isn't enabled. Read per request so a plan change
@@ -79,6 +81,7 @@ func NewServer(
 	r *router.Router,
 	main *mainchat.Store,
 	agent usheragent.Agent,
+	pushMgr *push.Manager,
 	codexModelsPath string,
 	logger *slog.Logger,
 ) *Server {
@@ -92,6 +95,7 @@ func NewServer(
 		router:          r,
 		main:            main,
 		agent:           agent,
+		push:            pushMgr,
 		logger:          logger,
 		codexModelsPath: codexModelsPath,
 	}
@@ -223,6 +227,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	webMux.HandleFunc("GET /api/interactions", s.handleListInteractions)
 	webMux.HandleFunc("POST /api/interactions/{id}/respond", s.handleRespondInteraction)
+
+	webMux.HandleFunc("GET /api/push/vapid-key", s.handlePushVAPIDKey)
+	webMux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
+	webMux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
 
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -1318,4 +1326,50 @@ func (s *Server) handleRespondInteraction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// --- web push ------------------------------------------------------------
+
+// handlePushVAPIDKey returns the applicationServerKey the browser passes to
+// pushManager.subscribe(). 404 when push isn't available so the client can hide
+// the notifications toggle.
+func (s *Server) handlePushVAPIDKey(w http.ResponseWriter, r *http.Request) {
+	if s.push == nil {
+		writeErr(w, http.StatusNotFound, "push not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"key": s.push.VAPIDPublicKey()})
+}
+
+func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
+	if s.push == nil {
+		writeErr(w, http.StatusNotFound, "push not available")
+		return
+	}
+	var sub push.Subscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if err := s.push.Subscribe(sub); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "subscribed"})
+}
+
+func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	if s.push == nil {
+		writeErr(w, http.StatusNotFound, "push not available")
+		return
+	}
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	s.push.Unsubscribe(req.Endpoint)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "unsubscribed"})
 }
