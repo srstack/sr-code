@@ -23,12 +23,8 @@
     <stop offset="60%" stop-color="#E0E0DF"/>
     <stop offset="100%" stop-color="#E0E0DF"/>
   </linearGradient>
-  <clipPath id="shape">
-    <path d="M352.20 0.00 L671.80 0.00 C773.21 0.00 823.92 0.00 878.50 17.26 C938.10 38.95 985.05 85.90 1006.74 145.50 C1024.00 200.08 1024.00 250.79 1024.00 352.20 L1024.00 671.80 C1024.00 773.21 1024.00 823.92 1006.74 878.50 C985.05 938.10 938.10 985.05 878.50 1006.74 C823.92 1024.00 773.21 1024.00 671.80 1024.00 L352.20 1024.00 C250.79 1024.00 200.08 1024.00 145.50 1006.74 C85.90 985.05 38.95 938.10 17.26 878.50 C0.00 823.92 0.00 773.21 0.00 671.80 L0.00 352.20 C0.00 250.79 0.00 200.08 17.26 145.50 C38.95 85.90 85.90 38.95 145.50 17.26 C200.08 0.00 250.79 0.00 352.20 0.00 Z"/>
-  </clipPath>
 </defs>
-<g clip-path="url(#shape)">
-  <rect x="0" y="0" width="1024" height="1024" fill="#1F1F20"/>
+<rect x="0" y="0" width="1024" height="1024" fill="#1F1F20"/>
 
 <circle cx="256" cy="768" r="264" fill="url(#orb)"/>
 
@@ -45,5 +41,4 @@
 <path d="M 701 561 L 768 466 L 835 561" stroke="#E0E0DF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 <path d="M 768 466 L 768 648 C 768 714 714 768 648 768 L 420 768" stroke="url(#arrow-grad)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 
-</g>
 </svg>
