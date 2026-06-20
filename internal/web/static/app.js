@@ -399,7 +399,11 @@ if (mobileToggle && sidebarEl) {
 }
 if (sidebarCollapse) {
   sidebarCollapse.addEventListener('click', () => {
-    document.body.classList.add('sidebar-collapsed');
+    if (sidebarEl && sidebarEl.classList.contains('open')) {
+      sidebarEl.classList.remove('open');
+    } else {
+      document.body.classList.add('sidebar-collapsed');
+    }
   });
 }
 const sidebarBackdrop = document.getElementById('sidebar-backdrop');
@@ -500,6 +504,22 @@ window.addEventListener('resize', closeKebabPopover);
 // Listen on the sidebar's scroll container so a long sidebar scroll
 // doesn't leave the popover floating mid-air.
 if (sidebarEl) sidebarEl.addEventListener('scroll', closeKebabPopover, { passive: true });
+
+const settingsBtn = document.getElementById('settings-btn');
+const settingsMenu = document.getElementById('settings-menu');
+if (settingsBtn && settingsMenu) {
+  settingsBtn.addEventListener('click', () => {
+    settingsMenu.hidden = !settingsMenu.hidden;
+  });
+  document.addEventListener('click', (e) => {
+    if (!settingsMenu.hidden && !e.target.closest('.sidebar-footer')) {
+      settingsMenu.hidden = true;
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !settingsMenu.hidden) settingsMenu.hidden = true;
+  });
+}
 
 async function handleKebabAction(action, id) {
   closeKebabPopover();

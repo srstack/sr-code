@@ -18,20 +18,25 @@
 <body>
 <div id="sidebar-backdrop" aria-hidden="true"></div>
 <aside id="sidebar">
-  <h1 class="sidebar-brand"><a href="#/">usher</a> <button class="sidebar-collapse" id="sidebar-collapse" title="collapse sidebar" type="button">☰</button></h1>
+  <h1 class="sidebar-brand"><a href="#/">usher</a> <button class="sidebar-toggle sidebar-collapse" id="sidebar-collapse" title="Close sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button></h1>
   <a href="#/chat/default" class="sidebar-mainchat">main chat</a>
+  <div class="sidebar-heading">
+    <span>sessions <span id="sidebar-session-count" class="muted"></span></span>
+    <a href="#/new" class="sidebar-new" title="new session" aria-label="new session">+</a>
+  </div>
   <div class="sidebar-section">
-    <div class="sidebar-heading">
-      <span>sessions <span id="sidebar-session-count" class="muted"></span></span>
-      <a href="#/new" class="sidebar-new" title="new session" aria-label="new session">+</a>
-    </div>
     <div id="sidebar-sessions"></div>
   </div>
-  <a href="/logout" class="sidebar-logout" title="sign out">sign out</a>
+  <div class="sidebar-footer">
+    <div id="settings-menu" class="settings-menu" hidden>
+      <a href="/logout" class="settings-item settings-danger">Sign out</a>
+    </div>
+    <button id="settings-btn" class="settings-btn" type="button" title="settings">Settings</button>
+  </div>
 </aside>
 <div class="main-wrap">
   <header>
-    <button id="mobile-toggle" class="mobile-toggle" aria-label="toggle sidebar" type="button">☰</button>
+    <button id="mobile-toggle" class="sidebar-toggle mobile-toggle" aria-label="Open sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button>
     <span id="subtitle" class="muted">discovered sessions</span>
     <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering"><span class="render-mode-prefix">render:</span><span id="render-mode-val">md</span></button>
   </header>
