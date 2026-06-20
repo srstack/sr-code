@@ -91,6 +91,15 @@ type Manager struct {
 	autoMu      sync.Mutex
 	autoApprove map[string]bool // sessionID → true when blanket-allow is on
 	autoPath    string          // empty = no disk persistence (tests)
+
+	subMu       sync.Mutex
+	pendingSubs map[*pendingSub]struct{} // notified when a new interaction is submitted
+}
+
+// pendingSub subscribes to new-pending notifications. Buffered and drop-on-full,
+// like the broker: a stalled consumer never blocks Submit.
+type pendingSub struct {
+	ch chan Pending
 }
 
 // New constructs a Manager. autoPath is the file backing the auto-approve
@@ -103,6 +112,7 @@ func New(autoPath string) *Manager {
 		remembered:  map[string][]Rule{},
 		autoApprove: map[string]bool{},
 		autoPath:    autoPath,
+		pendingSubs: map[*pendingSub]struct{}{},
 	}
 	if autoPath != "" {
 		m.loadAutoApprove()
@@ -210,6 +220,7 @@ func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
 	m.mu.Lock()
 	m.pending[p.ID] = p
 	m.mu.Unlock()
+	m.notifyPending(p.Pending)
 
 	defer func() {
 		m.mu.Lock()
@@ -237,6 +248,44 @@ func (m *Manager) List() []Pending {
 		out = append(out, p.Pending)
 	}
 	return out
+}
+
+// SubscribePending returns a buffered channel that receives each new pending
+// interaction as it is submitted, plus a cancel function. The web UI polls
+// List() instead; this push path lets the web-push dispatcher surface permission
+// prompts as notifications without polling. Drop-on-full, so a slow consumer
+// never blocks Submit.
+func (m *Manager) SubscribePending() (<-chan Pending, func()) {
+	sub := &pendingSub{ch: make(chan Pending, 64)}
+	m.subMu.Lock()
+	m.pendingSubs[sub] = struct{}{}
+	m.subMu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			m.subMu.Lock()
+			delete(m.pendingSubs, sub)
+			m.subMu.Unlock()
+			close(sub.ch)
+		})
+	}
+	return sub.ch, cancel
+}
+
+func (m *Manager) notifyPending(p Pending) {
+	m.subMu.Lock()
+	chans := make([]chan Pending, 0, len(m.pendingSubs))
+	for s := range m.pendingSubs {
+		chans = append(chans, s.ch)
+	}
+	m.subMu.Unlock()
+	for _, ch := range chans {
+		select {
+		case ch <- p:
+		default:
+		}
+	}
 }
 
 // Respond delivers the user's decision to the matching pending interaction.

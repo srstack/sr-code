@@ -20,6 +20,7 @@ type Event struct {
 type Broker struct {
 	mu   sync.RWMutex
 	subs map[string]map[*subscriber]struct{} // sessionID -> set
+	all  map[*subscriber]struct{}            // subscribers to every session's events
 }
 
 type subscriber struct {
@@ -27,7 +28,10 @@ type subscriber struct {
 }
 
 func New() *Broker {
-	return &Broker{subs: map[string]map[*subscriber]struct{}{}}
+	return &Broker{
+		subs: map[string]map[*subscriber]struct{}{},
+		all:  map[*subscriber]struct{}{},
+	}
 }
 
 // Subscribe returns a buffered channel of events for sessionID and a cancel
@@ -58,22 +62,49 @@ func (b *Broker) Subscribe(sessionID string) (<-chan Event, func()) {
 	return sub.ch, cancel
 }
 
-// Publish delivers ev to every current subscriber of ev.SessionID.
+// SubscribeAll returns a buffered channel receiving events for EVERY session,
+// plus a cancel function. Used by consumers that watch all sessions at once
+// (the web-push dispatcher) rather than one open session (an SSE client). Same
+// drop-on-slow-consumer semantics as Subscribe.
+func (b *Broker) SubscribeAll() (<-chan Event, func()) {
+	sub := &subscriber{ch: make(chan Event, 256)}
+	b.mu.Lock()
+	b.all[sub] = struct{}{}
+	b.mu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			b.mu.Lock()
+			delete(b.all, sub)
+			b.mu.Unlock()
+			close(sub.ch)
+		})
+	}
+	return sub.ch, cancel
+}
+
+// Publish delivers ev to every current subscriber of ev.SessionID and to every
+// global (SubscribeAll) subscriber. The non-blocking sends run while holding the
+// read lock so a concurrent cancel — which closes a channel under the write lock
+// — can't close a channel mid-send. Each send is non-blocking (drop-on-full), so
+// holding the lock never stalls the publisher.
 func (b *Broker) Publish(ev Event) {
 	b.mu.RLock()
-	set := b.subs[ev.SessionID]
-	chans := make([]chan Event, 0, len(set))
-	for s := range set {
-		chans = append(chans, s.ch)
-	}
-	b.mu.RUnlock()
+	defer b.mu.RUnlock()
 
-	for _, c := range chans {
+	send := func(s *subscriber) {
 		select {
-		case c <- ev:
+		case s.ch <- ev:
 		default:
 			// Slow consumer: drop. Prefer recoverable behavior over
 			// blocking the publisher and stalling the whole pipeline.
 		}
+	}
+	for s := range b.subs[ev.SessionID] {
+		send(s)
+	}
+	for s := range b.all {
+		send(s)
 	}
 }

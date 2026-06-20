@@ -134,3 +134,13 @@ func TestBroker_ConcurrentSubscribePublish(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestBroker_SubscribeAllReceivesEverySession(t *testing.T) {
+	b := New()
+	all, cancel := b.SubscribeAll()
+	defer cancel()
+	b.Publish(Event{SessionID: "whatever", Type: "subprocess.exit"})
+	if ev, ok := recvWithin(t, all, time.Second); !ok || ev.SessionID != "whatever" {
+		t.Fatalf("SubscribeAll: ok=%v ev=%+v", ok, ev)
+	}
+}
