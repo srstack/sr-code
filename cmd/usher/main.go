@@ -109,6 +109,8 @@ func serve(args []string) error {
 		"append a small-model enforcement block to the system prompt (recommended for haiku / mini / flash / 7B-class models)")
 	autoArchiveDays := fs.Int("auto-archive-days", 7,
 		"sessions whose jsonl mtime is older than this fall out of the sidebar's default view; 0 disables auto-archive (manual archive still works)")
+	uiDir := fs.String("ui-dir", "",
+		"serve the web UI from this directory instead of the embedded copy")
 	disablePush := fs.Bool("disable-push", false,
 		"turn off Web Push browser notifications (turn-done + permission prompts). On by default, but "+
 			"inert until a browser opts in (which needs the user's notification-permission grant) — nothing "+
@@ -240,7 +242,7 @@ func serve(args []string) error {
 		"loopback_bind", addrIsLoopback(*addr),
 	)
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, *uiDir, logger)
 	return srv.Run(ctx)
 }
 

@@ -72,6 +72,7 @@ type Server struct {
 	// catalog). "" when codex isn't enabled. Read per request so a plan change
 	// (cache refetch) shows up without restarting usher.
 	codexModelsPath string
+	uiDir string
 }
 
 func NewServer(
@@ -83,6 +84,7 @@ func NewServer(
 	agent usheragent.Agent,
 	pushMgr *push.Manager,
 	codexModelsPath string,
+	uiDir string,
 	logger *slog.Logger,
 ) *Server {
 	if logger == nil {
@@ -98,6 +100,7 @@ func NewServer(
 		push:            pushMgr,
 		logger:          logger,
 		codexModelsPath: codexModelsPath,
+		uiDir:           uiDir,
 	}
 }
 
@@ -232,11 +235,18 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
 	webMux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
 
-	sub, err := fs.Sub(staticFS, "static")
-	if err != nil {
-		return err
+	var staticRoot fs.FS
+	if s.uiDir != "" {
+		staticRoot = os.DirFS(s.uiDir)
+		s.logger.Info("serving UI from disk", "dir", s.uiDir)
+	} else {
+		var err error
+		staticRoot, err = fs.Sub(staticFS, "static")
+		if err != nil {
+			return err
+		}
 	}
-	webMux.Handle("GET /", http.FileServer(http.FS(sub)))
+	webMux.Handle("GET /", http.FileServer(http.FS(staticRoot)))
 
 	hookMux := http.NewServeMux()
 	hookMux.HandleFunc("POST /hook/{event}", s.handleHook)
