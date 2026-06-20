@@ -89,6 +89,53 @@ let suppressAppendScroll = false;
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
 let lastSidebarHtml = '';
+
+// --- unread tracking ------------------------------------------------------
+// A session goes "unread" on a running -> settled transition (a turn finished)
+// while unviewed — keyed off the status change, not last_event_at, so a long
+// multi-round turn never flickers mid-flight. In-memory, clean on every load;
+// the app-away case is push's job.
+let viewingId = null;          // session whose detail is open
+let lastSessions = [];         // latest /api/sessions payload
+const prevStatus = {};         // id -> status at the previous poll
+const unreadIds = new Set();   // sessions with an unseen finished turn
+
+function isUnread(s) {
+  return unreadIds.has(s.id) && s.id !== viewingId && !s.archived;
+}
+
+// Mark unread on running -> settled; viewing/running/archived clears it. First
+// poll has no prior status, so nothing is marked (clean slate on load).
+function reconcileUnread(allSessions) {
+  for (const s of allSessions) {
+    const cur = s.status, prev = prevStatus[s.id];
+    if (s.id === viewingId || cur === 'running' || s.archived) {
+      unreadIds.delete(s.id);
+    } else if (prev === 'running') {
+      unreadIds.add(s.id);
+    }
+    prevStatus[s.id] = cur;
+  }
+}
+
+// Opening a session clears its unread and excludes it until the user leaves.
+function markViewing(id) {
+  viewingId = id;
+  unreadIds.delete(id);
+  if (lastSessions.length) renderSidebarSessions(lastSessions); // drop its dot now, don't wait for the poll
+  updateTabBadge();
+}
+function clearViewing() {
+  viewingId = null;
+  updateTabBadge();
+}
+
+// Unread count in the tab title, front-loaded so it survives truncation.
+function updateTabBadge() {
+  const n = lastSessions.filter(isUnread).length;
+  document.title = n > 0 ? `(${n}) usher` : 'usher';
+}
+
 // Last list-view rows HTML — same skip-when-unchanged trick as the sidebar,
 // so the 5s poll doesn't restart status-dot animations or fight the filter.
 let lastListRowsHtml = '';
@@ -221,6 +268,7 @@ function timeNow() {
 function closeES() {
   if (currentES) { currentES.close(); currentES = null; }
   closeScreenES();
+  clearViewing();
 }
 function closeScreenES() {
   if (currentScreenES) { currentScreenES.close(); currentScreenES = null; }
@@ -262,8 +310,11 @@ async function loadSidebar() {
     // trivial at this scale.
     const res = await fetch('/api/sessions?include_archived=1');
     const sessions = res.ok ? (await res.json() || []) : [];
+    lastSessions = sessions;
+    reconcileUnread(sessions);
     renderSidebarSessions(sessions);
     updateSidebarActive();
+    updateTabBadge();
   } catch {/* server may be down briefly */}
 }
 
@@ -316,7 +367,9 @@ function renderSidebarSessions(allSessions) {
 
   const renderItem = s => {
     const href = '#/s/' + encodeURIComponent(s.id);
-    const dot = statusDot(s.status);
+    const dot = isUnread(s)
+      ? '<span class="running-dot unread" title="new response">●</span>'
+      : statusDot(s.status);
     const auto = s.auto_approve
       ? '<span class="auto-dot" title="auto-approve enabled">ϟ</span>'
       : '';
@@ -861,6 +914,7 @@ async function showDetail(id) {
   // Fresh view: reset sync state so a prior session's signature/stream flag
   // can't suppress this one's first render.
   currentDetailId = id;
+  markViewing(id); // clear unread + exclude while open
   currentDraftKey = 's:' + id;
   lastTranscriptSig = '';
   renderedTurns = [];
