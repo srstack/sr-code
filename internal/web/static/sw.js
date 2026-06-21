@@ -26,7 +26,7 @@ const SHELL = [
   '/interaction.js',
   '/push.js',
   '/style.css',
-  '/vendor/marked.umd.min.js',
+  '/vendor/marked.umd.js',
   '/manifest.webmanifest',
   '/icons/icon.svg',
   '/icons/icon-192.png',
