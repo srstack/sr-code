@@ -12,11 +12,19 @@
 //     cache, refreshed in the background. A code change therefore propagates
 //     after one extra reload. Bump CACHE to force-evict everything.
 
-const CACHE = 'usher-shell-v2';
+const CACHE = 'usher-shell-v3';
 const SHELL = [
   '/',
   '/index.html',
   '/app.js',
+  '/state.js',
+  '/render.js',
+  '/sidebar.js',
+  '/list.js',
+  '/detail.js',
+  '/terminal.js',
+  '/interaction.js',
+  '/push.js',
   '/style.css',
   '/vendor/marked.umd.min.js',
   '/manifest.webmanifest',
