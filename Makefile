@@ -3,7 +3,7 @@
 # Plain GNU make. No build tool dependencies beyond `go` itself; this matches
 # the project's "stdlib-first, minimal toolchain" philosophy.
 
-.PHONY: build test vet check install run clean dist help
+.PHONY: build test vet check install run clean dist icons help
 
 OUTPUT  := usher
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -34,6 +34,10 @@ install:
 run: build
 	./$(OUTPUT) serve
 
+# Regenerate icon variants from the source SVG.
+icons:
+	python3 internal/web/icons-src/gen-icons.py
+
 # Remove build artifacts.
 clean:
 	rm -rf $(OUTPUT) dist
@@ -58,4 +62,5 @@ help:
 	@echo "  run      build + ./$(OUTPUT) serve"
 	@echo "  install  go install (into \$$GOBIN)"
 	@echo "  dist     cross-compile linux/darwin amd64+arm64 into dist/"
+	@echo "  icons    regenerate icon PNGs from icons-src/icon-raw.svg"
 	@echo "  clean    remove $(OUTPUT) and dist/"

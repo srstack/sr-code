@@ -28,22 +28,16 @@
   </clipPath>
 </defs>
 <g clip-path="url(#shape)">
-  <rect x="0" y="0" width="1024" height="1024" fill="#1F1F20"/>
-
+<rect x="0" y="0" width="1024" height="1024" fill="#1F1F20"/>
 <circle cx="256" cy="768" r="264" fill="url(#orb)"/>
-
 <circle cx="256" cy="256" r="64" fill="#8F8C87"/>
 <circle cx="512" cy="256" r="64" fill="#8A8987"/>
 <circle cx="256" cy="512" r="64" fill="#A49786"/>
 <circle cx="512" cy="512" r="64" fill="#9B9286"/>
-
 <path d="M730.55 136.00 L805.45 136.00 C829.22 136.00 841.11 136.00 853.90 140.05 C867.87 145.13 878.87 156.13 883.95 170.10 C888.00 182.89 888.00 194.78 888.00 218.55 L888.00 293.45 C888.00 317.22 888.00 329.11 883.95 341.90 C878.87 355.87 867.87 366.87 853.90 371.95 C841.11 376.00 829.22 376.00 805.45 376.00 L730.55 376.00 C706.78 376.00 694.89 376.00 682.10 371.95 C668.13 366.87 657.13 355.87 652.05 341.90 C648.00 329.11 648.00 317.22 648.00 293.45 L648.00 218.55 C648.00 194.78 648.00 182.89 652.05 170.10 C657.13 156.13 668.13 145.13 682.10 140.05 C694.89 136.00 706.78 136.00 730.55 136.00 Z" fill="#D97757"/>
-
 <path d="M 704 211 L 760 256 L 704 301" stroke="#FCF8F5" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 <path d="M 789 299 L 834 299" stroke="#FCF8F5" stroke-width="20" stroke-linecap="round" fill="none"/>
-
 <path d="M 701 561 L 768 466 L 835 561" stroke="#E0E0DF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 <path d="M 768 466 L 768 648 C 768 714 714 768 648 768 L 420 768" stroke="url(#arrow-grad)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-
 </g>
 </svg>
