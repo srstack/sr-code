@@ -261,15 +261,21 @@ func (s *Server) Run(ctx context.Context) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	webListener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("web listen %s: %w", s.addr, err)
+	}
+
 	sockListener, err := listenUnixSocket(s.hookSockPath)
 	if err != nil {
+		_ = webListener.Close()
 		return fmt.Errorf("hook socket: %w", err)
 	}
 
 	errCh := make(chan error, 2)
 	go func() {
 		s.logger.Info("usher web listening", "addr", s.addr)
-		errCh <- webSrv.ListenAndServe()
+		errCh <- webSrv.Serve(webListener)
 	}()
 	go func() {
 		s.logger.Info("usher hook listening", "socket", s.hookSockPath)
@@ -303,9 +309,6 @@ func listenUnixSocket(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	// Remove stale socket from a prior unclean shutdown. We intentionally
-	// don't check whether an instance is currently bound — net.Listen will
-	// fail loudly below if another process holds the address.
 	if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
 		_ = os.Remove(path)
 	}

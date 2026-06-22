@@ -15,22 +15,22 @@ import (
 // while the usher server is unreachable (e.g. mid-restart).
 const hookRetryInterval = time.Second
 
-// runHook is the worker for `usher hook <event>`. It is invoked by Claude Code
-// per the entry installed by `usher setup`. It reads the hook payload from
-// stdin, POSTs it to the usher server over its Unix domain socket, and writes
-// the server's JSON decision to stdout.
+// hookConnectTimeout caps retrying while the server is unreachable; past it we
+// fail open. (A connected request waits unbounded for a human — see runHook.)
+const hookConnectTimeout = 60 * time.Second
+
+// runHook is the worker for `usher hook <event>`: it reads the payload from
+// stdin, POSTs it to the usher server over its Unix socket, and writes the
+// JSON decision to stdout.
 //
-// Ownership is decided locally from the environment — no server round-trip
-// needed. usher spawns its sessions with USHER_HOOK_SOCK set (pool spawn -e),
-// so a claude that carries it is usher-managed; one that doesn't is the user's
-// own (terminal/IDE). For the latter we fail open immediately (print `{}`) and
-// let claude use its own permission flow — usher neither blocks nor awaits it.
+// USHER_HOOK_SOCK (set by usher on the sessions it spawns) marks a managed
+// session. Without it the session is the user's own (terminal/IDE), so we fail
+// open at once (`{}`) and let the backend prompt for itself.
 //
-// For a usher-managed session the only resolver is usher's web UI, so if the
-// server is unreachable we retry the connection indefinitely rather than fail
-// open into a tmux pane TUI nobody is watching. This rides out a usher restart
-// (it rebinds the same socket and re-adopts the session). The retry is bounded
-// by Claude Code's own hook timeout, which SIGKILLs us if usher never returns.
+// For a managed session the resolver is usher's web UI, so we retry an
+// unreachable server for up to hookConnectTimeout to ride out a restart, then
+// fail open so a dead usher can't freeze the tool. Once connected the wait is
+// unbounded — usher holds the request until a human answers in the UI.
 func runHook(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: usher hook <event-name>")
@@ -62,6 +62,8 @@ func runHook(args []string) error {
 	// "http://hook" is a placeholder authority; the unix dialer ignores it.
 	url := "http://hook/hook/" + event
 
+	deadline := time.Now().Add(hookConnectTimeout)
+
 	for {
 		// Rebuild per attempt — the body reader is consumed on use.
 		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
@@ -72,7 +74,12 @@ func runHook(args []string) error {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			// usher down / restarting → wait and retry (managed session).
+			// usher down / restarting → retry until we give up, then fail open.
+			if time.Now().After(deadline) {
+				fmt.Fprintln(os.Stderr, "usher hook: server unreachable for", hookConnectTimeout, "- failing open")
+				fmt.Println("{}")
+				return nil
+			}
 			time.Sleep(hookRetryInterval)
 			continue
 		}

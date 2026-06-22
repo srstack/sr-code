@@ -17,16 +17,30 @@ import (
 // preserved; previous usher entries (identified by command suffix) are
 // replaced so re-running is idempotent.
 //
-// The hook talks to usher over a Unix domain socket (see runHook). By
-// default `usher hook` resolves the socket path from the data dir at
-// runtime; pass --sock here to pin a specific path into the hook command
-// (useful if you run usher with a non-default --data-dir).
+// The hook talks to usher over a Unix domain socket at <data-dir>/hook.sock,
+// derived with the same helper the server uses so the two can't diverge. Pass
+// --data-dir only for a non-default one; we then pin the matching
+// USHER_HOOK_SOCK into the hook command. With the default we bake nothing —
+// usher injects USHER_HOOK_SOCK at spawn for managed sessions, and unmanaged
+// (terminal/IDE) sessions fail open.
 func runSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
-	sock := fs.String("sock", "", "USHER_HOOK_SOCK to set in the hook command (defaults to <data-dir>/hook.sock at runtime)")
+	dataDir := fs.String("data-dir", defaultDataDir(), "usher data directory (XDG_DATA_HOME/usher); hook socket is <data-dir>/hook.sock")
 	remove := fs.Bool("remove", false, "remove the usher hook from settings.json")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// Must be absolute: the baked path lands in the global hook config and runs
+	// from claude's CWD (like exe below), so a relative --data-dir would resolve
+	// differently than at server start.
+	dir, err := filepath.Abs(*dataDir)
+	if err != nil {
+		return err
+	}
+	sock := ""
+	if dir != defaultDataDir() {
+		sock = hookSockPath(dir)
 	}
 
 	home, err := os.UserHomeDir()
@@ -51,14 +65,14 @@ func runSetup(args []string) error {
 	}
 
 	if claudePresent {
-		if err := setupClaudeHook(home, exe, *sock, *remove); err != nil {
+		if err := setupClaudeHook(home, exe, sock, *remove); err != nil {
 			return err
 		}
 	} else if !*remove {
 		fmt.Println("claude not detected (~/.claude absent); skipped claude hook.")
 	}
 
-	if err := setupCodexHook(home, exe, *sock, *remove); err != nil {
+	if err := setupCodexHook(home, exe, sock, *remove); err != nil {
 		fmt.Fprintln(os.Stderr, "codex hook setup:", err)
 	}
 
