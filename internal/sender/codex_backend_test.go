@@ -83,7 +83,7 @@ func TestCodexSend_ResumeStreamsTurn(t *testing.T) {
 }
 
 func TestNewCodexWiring(t *testing.T) {
-	s := NewCodex("codex", "/home/u/.codex/sessions", "", "", []string{"--sandbox", "workspace-write"}, 8, quietLogger())
+	s := NewCodex("codex", "/home/u/.codex/sessions", "", "", []string{"--sandbox", "workspace-write"}, 8, true, quietLogger())
 	if s.pool.spawnOverride == nil {
 		t.Error("NewCodex must route spawn through codexBackend.spawnCommand")
 	}

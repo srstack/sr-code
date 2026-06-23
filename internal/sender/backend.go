@@ -187,6 +187,10 @@ type codexBackend struct {
 	codexCmd    string   // path to the codex binary
 	sessionsDir string   // ~/.codex/sessions
 	extraArgs   []string // e.g. ["--sandbox","workspace-write"]
+	// mcpConfArgs are `-c` override VALUES (no leading -c / shell quoting)
+	// registering the show_image MCP server, or nil under --disable-usher-tools.
+	// Per-spawn (not a global config.toml write) so only usher sessions get it.
+	mcpConfArgs []string
 }
 
 func (b codexBackend) preAssignsID() bool            { return false }
@@ -207,6 +211,18 @@ func (b codexBackend) spawnCommand(sessionID, cwd, model string, resume bool) st
 	// eats the next send's keystrokes, and its default option self-updates via
 	// curl|sh. A global -c override, so it precedes any resume subcommand.
 	parts = append(parts, "-c", shellQuote("check_for_update_on_startup=false"))
+	// Register the show_image MCP server via global -c overrides (before any
+	// resume subcommand).
+	for _, v := range b.mcpConfArgs {
+		parts = append(parts, "-c", shellQuote(v))
+	}
+	if len(b.mcpConfArgs) > 0 {
+		// Run it in the session cwd so its path checks + dimension reads match
+		// /image (codex, unlike claude, forwards neither env nor cwd to MCP children).
+		tomlCwd := strings.ReplaceAll(cwd, `\`, `\\`)
+		tomlCwd = strings.ReplaceAll(tomlCwd, `"`, `\"`)
+		parts = append(parts, "-c", shellQuote(`mcp_servers.usher.cwd="`+tomlCwd+`"`))
+	}
 	// Codex won't run a config-declared hook until it's "trusted". usher persists
 	// that trust at `usher setup` time (writes the hook's trusted_hash into
 	// ~/.codex/config.toml's [hooks.state]; see setupCodexHook), so no

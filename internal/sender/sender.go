@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +85,39 @@ func (s *Sender) lockCwd(cwd string) func() {
 	return m.Unlock
 }
 
+// claudeMCPConfigArgs writes an MCP config registering `usher mcp-stdio` next to
+// the hook socket and returns the `--mcp-config` flags to load it. Returns nil
+// (disabling the feature, not erroring) if the executable can't be resolved, so
+// a write hiccup never blocks spawns.
+func claudeMCPConfigArgs(hookSock string, logger *slog.Logger) []string {
+	if hookSock == "" {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.Abs(exe)
+	}
+	if err != nil {
+		logger.Warn("mcp config: cannot resolve usher executable; show_image disabled", "err", err)
+		return nil
+	}
+	// alwaysLoad exempts the server from Claude Code's Tool Search deferral so the
+	// tool is always loaded, not hidden behind a ToolSearch step.
+	cfg := map[string]any{"mcpServers": map[string]any{
+		"usher": map[string]any{"command": exe, "args": []string{"mcp-stdio"}, "alwaysLoad": true},
+	}}
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(filepath.Dir(hookSock), "mcp.json")
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+		logger.Warn("mcp config: write failed; show_image disabled", "path", path, "err", err)
+		return nil
+	}
+	return []string{"--mcp-config", path}
+}
+
 // New builds a Sender. claudeCmd is the claude binary; permissionMode (if
 // non-empty) is passed through as --permission-mode; projectsDir is Claude
 // Code's projects root (used to locate session jsonl files by their globally
@@ -91,7 +125,7 @@ func (s *Sender) lockCwd(cwd string) func() {
 // non-empty, is set as USHER_HOOK_SOCK on spawned claude processes so their
 // permission hooks route back to this instance; maxLive caps concurrent live
 // processes (LRU-evicted beyond it).
-func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, logger *slog.Logger) *Sender {
+func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, injectMCPTools bool, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -107,6 +141,11 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	env := []string{"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"}
 	if hookSock != "" {
 		env = append(env, "USHER_HOOK_SOCK="+hookSock)
+	}
+	// Register the show_image MCP server (unless --disable-usher-tools). Additive
+	// — no --strict-mcp-config — so the user's own MCP servers are untouched.
+	if injectMCPTools {
+		extra = append(extra, claudeMCPConfigArgs(hookSock, logger)...)
 	}
 	runner := execRunner{bin: "tmux", socket: socket}
 	t := timing{
@@ -132,6 +171,29 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	return s
 }
 
+// codexMCPConfigArgs returns the `-c` override VALUES registering the show_image
+// MCP server on a codex spawn — command, args, and env_vars (which both delivers
+// and gates USHER_HOOK_SOCK, since codex doesn't forward env to MCP children).
+// Values are TOML (exe as a basic string, arrays as TOML arrays); each is later
+// emitted as `-c <shellQuote(value)>`. Returns nil if the exe can't be resolved.
+func codexMCPConfigArgs(logger *slog.Logger) []string {
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.Abs(exe)
+	}
+	if err != nil {
+		logger.Warn("codex mcp: cannot resolve usher executable; show_image disabled", "err", err)
+		return nil
+	}
+	tomlExe := strings.ReplaceAll(exe, `\`, `\\`)
+	tomlExe = strings.ReplaceAll(tomlExe, `"`, `\"`)
+	return []string{
+		`mcp_servers.usher.command="` + tomlExe + `"`,
+		`mcp_servers.usher.args=["mcp-stdio"]`,
+		`mcp_servers.usher.env_vars=["USHER_HOOK_SOCK"]`,
+	}
+}
+
 // NewCodex builds a Sender that drives interactive `codex` instead of `claude`.
 // codexCmd is the codex binary; sessionsDir is ~/.codex/sessions (the rollout
 // root, used to locate logs); sandboxArgs are extra codex flags (e.g.
@@ -140,7 +202,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 //
 // Resume goes straight in (`codex resume <id>`, no chooser); a brand-new session
 // (Codex assigns its own id) is created via StartCodexSession.
-func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []string, maxLive int, logger *slog.Logger) *Sender {
+func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []string, maxLive int, injectMCPTools bool, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -160,8 +222,12 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		confirm:       8 * time.Second,
 		poll:          150 * time.Millisecond,
 	}
+	var mcpConf []string
+	if injectMCPTools && hookSock != "" {
+		mcpConf = codexMCPConfigArgs(logger)
+	}
 	p := newPool(runner, codexCmd, nil, env, maxLive, logger)
-	b := codexBackend{p: p, t: t, codexCmd: codexCmd, sessionsDir: sessionsDir, extraArgs: sandboxArgs}
+	b := codexBackend{p: p, t: t, codexCmd: codexCmd, sessionsDir: sessionsDir, extraArgs: sandboxArgs, mcpConfArgs: mcpConf}
 	// Codex's command differs from the Claude default; route spawn through it.
 	p.spawnOverride = b.spawnCommand
 	s := &Sender{

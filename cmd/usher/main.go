@@ -56,6 +56,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usher set-password:", err)
 			os.Exit(1)
 		}
+	case "mcp-stdio":
+		if err := runMCPStdio(args); err != nil {
+			fmt.Fprintln(os.Stderr, "usher mcp-stdio:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(Version)
 	case "-h", "--help", "help":
@@ -115,6 +120,10 @@ func serve(args []string) error {
 		"turn off Web Push browser notifications (turn-done + permission prompts). On by default, but "+
 			"inert until a browser opts in (which needs the user's notification-permission grant) — nothing "+
 			"is sent, and no push service is contacted, until then.")
+	disableUsherTools := fs.Bool("disable-usher-tools", false,
+		"do not register usher's own MCP tools (currently just show_image, which renders an image inline "+
+			"in the web UI) on spawned claude sessions. On by default; the tools self-gate to usher-managed "+
+			"sessions and don't touch the user's own MCP servers.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -151,13 +160,13 @@ func serve(args []string) error {
 
 	if dir := *projectsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewClaudeSource(dir))
-		senders["claude"] = sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, logger)
+		senders["claude"] = sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, logger)
 		defaultBackend = "claude"
 		logger.Info("claude backend enabled", "projects_dir", dir)
 	}
 	if dir := *codexSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewCodexSource(dir))
-		senders["codex"] = sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, logger)
+		senders["codex"] = sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, logger)
 		// codex's per-account model catalog sits next to the sessions dir.
 		codexModelsPath = filepath.Join(filepath.Dir(dir), "models_cache.json")
 		if defaultBackend == "" {

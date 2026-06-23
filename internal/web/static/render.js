@@ -2,7 +2,7 @@
 
 import {
   esc, renderMode, setRenderModeValue, renderModeBtn,
-  isNearBottom, suppressAppendScroll,
+  isNearBottom, suppressAppendScroll, currentDetailId,
 } from './state.js';
 
 // renderMarkdown turns assistant/user content into safe HTML using the
@@ -79,9 +79,42 @@ if (renderModeBtn) {
 
 // renderToolPart renders a single tool part as a collapsible <details> element.
 // Edit/Write expand by default; others collapse.
+// parseImageDims pulls {w,h} out of the show_image tool's JSON result. We extract
+// the first {…} span (codex fences tool output) rather than parsing the whole
+// string. Returns null if absent/unparseable.
+function parseImageDims(content) {
+  if (!content) return null;
+  const a = content.indexOf('{');
+  const b = content.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  try {
+    const o = JSON.parse(content.slice(a, b + 1));
+    const w = parseInt(o.w, 10);
+    const h = parseInt(o.h, 10);
+    if (w > 0 && h > 0) return { w, h };
+  } catch (_) { /* not dims JSON — just skip space reservation */ }
+  return null;
+}
+
 export function renderToolPart(p) {
   const name = p.toolName || 'tool';
   const target = p.toolTarget || '';
+  // show_image renders as an inline image (not a collapsible tool block). The
+  // path travels only as an encodeURIComponent'd query param, so it can't break
+  // out of the attribute; /image resolves+validates it against the session cwd.
+  if (target && currentDetailId && /(^|__)show_image$/.test(name)) {
+    const src = '/api/sessions/' + encodeURIComponent(currentDetailId) +
+      '/image?path=' + encodeURIComponent(target);
+    const fname = target.split('/').pop() || 'image';
+    // width/height reserve layout space so the image doesn't reflow on load.
+    const dims = parseImageDims(p.content);
+    const dimAttrs = dims ? ' width="' + dims.w + '" height="' + dims.h + '"' : '';
+    // <a> opens the full-size image (inline view is capped via .tool-image CSS).
+    return '<div class="tool-image">' +
+      '<a href="' + esc(src) + '" target="_blank" rel="noopener">' +
+      '<img loading="lazy" decoding="async" alt="' + esc(fname) + '" src="' + esc(src) + '"' + dimAttrs + '>' +
+      '</a></div>';
+  }
   const expandByDefault = /^(Edit|Write)$/i.test(name);
   const openAttr = expandByDefault ? ' open' : '';
   const label = target ? esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' : esc(name);
@@ -189,3 +222,33 @@ export function backendMark(backend) {
   const b = backend === 'codex' ? 'codex' : 'claude';
   return `<svg class="backend-mark backend-mark--${b}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${BACKEND_MARKS[b]}</svg>`;
 }
+
+// ---------- show_image lightbox ----------
+// Click an inline image to view it full-size in an overlay. The <a href> stays
+// as the fallback: ctrl/cmd/shift-click (and no-JS) opens it in a new tab.
+function openLightbox(src) {
+  let ov = document.getElementById('img-lightbox');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'img-lightbox';
+    ov.innerHTML = '<img alt="">';
+    ov.addEventListener('click', () => ov.classList.remove('open'));
+    document.body.appendChild(ov);
+  }
+  ov.querySelector('img').src = src;
+  ov.classList.add('open');
+}
+
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('.tool-image a');
+  if (!a) return;
+  if (e.metaKey || e.ctrlKey || e.shiftKey) return; // let the new-tab default win
+  e.preventDefault();
+  openLightbox(a.getAttribute('href'));
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const ov = document.getElementById('img-lightbox');
+  if (ov) ov.classList.remove('open');
+});
