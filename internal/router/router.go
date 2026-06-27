@@ -302,15 +302,7 @@ func (r *Router) DeleteSession(id string) error {
 	}
 	// Release any in-flight turn first so its tail goroutine stops before the
 	// file is pulled out from under it.
-	r.sendMu.Lock()
-	tok := r.activeSend[id]
-	r.sendMu.Unlock()
-	if tok != nil {
-		tok.cancel()
-	}
-	if err := r.senderFor(id).Kill(id); err != nil {
-		slog.Warn("kill session window on delete", "session", id, "err", err)
-	}
+	r.stopLive(id)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete session file: %w", err)
 	}
@@ -332,6 +324,13 @@ func (r *Router) PauseSession(id string) error {
 	if _, ok := r.discovery.Path(id); !ok {
 		return errors.New("session not found")
 	}
+	r.stopLive(id)
+	return nil
+}
+
+// stopLive drops a session to idle: cancels any in-flight turn and kills its
+// live window. Best-effort; idempotent. Shared by PauseSession/DeleteSession.
+func (r *Router) stopLive(id string) {
 	r.sendMu.Lock()
 	tok := r.activeSend[id]
 	r.sendMu.Unlock()
@@ -339,9 +338,8 @@ func (r *Router) PauseSession(id string) error {
 		tok.cancel()
 	}
 	if err := r.senderFor(id).Kill(id); err != nil {
-		slog.Warn("kill session window on pause", "session", id, "err", err)
+		slog.Warn("kill session window", "session", id, "err", err)
 	}
-	return nil
 }
 
 // --- session writes ------------------------------------------------------
