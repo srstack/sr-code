@@ -39,6 +39,11 @@ type Event struct {
 	// to produce a session title.
 	Title string `json:"title,omitempty"`
 
+	// IsMeta marks harness-injected context (e.g. skill content loaded after
+	// a Skill tool call). These are user-role messages but not real user input.
+	IsMeta           bool   `json:"isMeta,omitempty"`
+	SourceToolUseID  string `json:"sourceToolUseID,omitempty"`
+
 	Raw json.RawMessage `json:"-"`
 }
 
@@ -110,6 +115,7 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 			// A genuine typed prompt — not a tool_result echo or the
 			// "[Request interrupted ...]" marker claude writes on Ctrl-C.
 			if !ev.Timestamp.IsZero() && !hasToolResult(ev.Message) &&
+				!ev.IsMeta &&
 				!strings.HasPrefix(content, "[Request interrupted") {
 				meta.LastInputAt = ev.Timestamp
 			}
@@ -181,6 +187,8 @@ type TurnPart struct {
 	Content    string `json:"content"`              // rendered markdown (text) or tool output
 	ToolName   string `json:"toolName,omitempty"`   // for type=="tool": Edit, Bash, Read, …
 	ToolTarget string `json:"toolTarget,omitempty"` // file path, command, or pattern
+
+	toolUseID string // internal: matches isMeta follow-ups to their tool part
 }
 
 // Turn is a grouped, display-ready projection of one conversational exchange.
@@ -223,7 +231,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		return nil, nil
 	}
 
-	if ev.Type == "user" && !hasToolResult(ev.Message) {
+	if ev.Type == "user" && !hasToolResult(ev.Message) && !(ev.IsMeta && ev.SourceToolUseID != "") {
 		// Real user prompt — flush any in-progress assistant turn.
 		if t := a.Flush(); t != nil {
 			completed = append(completed, *t)
@@ -236,6 +244,39 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 			})
 		}
 		return completed, nil
+	}
+
+	// isMeta user message with sourceToolUseID (e.g. skill content after a
+	// Skill tool call): append text to the matching tool part.
+	if ev.IsMeta && ev.SourceToolUseID != "" && ev.Type == "user" {
+		text := extractUserText(ev.Message)
+		if text == "" {
+			return nil, nil
+		}
+		if a.cur == nil {
+			a.cur = &Turn{Role: "assistant", Time: ev.Timestamp}
+		}
+		if ev.UUID != "" {
+			a.cur.UUID = ev.UUID
+		}
+		if ev.SourceToolUseID != "" {
+			for i := len(a.cur.Parts) - 1; i >= 0; i-- {
+				if a.cur.Parts[i].Type == "tool" && a.cur.Parts[i].toolUseID == ev.SourceToolUseID {
+					a.cur.Parts[i].Content += "\n" + text
+					return nil, &a.cur.Parts[i]
+				}
+			}
+		}
+		ti := a.toolMap[ev.SourceToolUseID]
+		p := TurnPart{
+			Type:       "tool",
+			Content:    text,
+			ToolName:   ti.name,
+			ToolTarget: ti.target,
+			toolUseID:  ev.SourceToolUseID,
+		}
+		a.cur.Parts = append(a.cur.Parts, p)
+		return nil, &p
 	}
 
 	// Start a new assistant turn if needed (tool_result lines carry no model;
@@ -272,12 +313,13 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	if content == "" {
 		return nil, nil
 	}
-	ti := matchToolInfo(ev.Message, a.toolMap)
+	ti, tuID := matchToolInfo(ev.Message, a.toolMap)
 	p := TurnPart{
 		Type:       "tool",
 		Content:    content,
 		ToolName:   ti.name,
 		ToolTarget: ti.target,
+		toolUseID:  tuID,
 	}
 	a.cur.Parts = append(a.cur.Parts, p)
 	return nil, &p
@@ -379,26 +421,27 @@ func collectToolUses(msg json.RawMessage, dst map[string]toolInfo) {
 }
 
 // matchToolInfo looks up the tool name+target for the first tool_result block.
-func matchToolInfo(msg json.RawMessage, names map[string]toolInfo) toolInfo {
+// It also returns the tool_use_id for isMeta follow-up matching.
+func matchToolInfo(msg json.RawMessage, names map[string]toolInfo) (toolInfo, string) {
 	var m struct {
 		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(msg, &m); err != nil {
-		return toolInfo{}
+		return toolInfo{}, ""
 	}
 	var blocks []struct {
 		Type      string `json:"type"`
 		ToolUseID string `json:"tool_use_id"`
 	}
 	if err := json.Unmarshal(m.Content, &blocks); err != nil {
-		return toolInfo{}
+		return toolInfo{}, ""
 	}
 	for _, b := range blocks {
 		if b.Type == "tool_result" && b.ToolUseID != "" {
-			return names[b.ToolUseID]
+			return names[b.ToolUseID], b.ToolUseID
 		}
 	}
-	return toolInfo{}
+	return toolInfo{}, ""
 }
 
 // extractUserText gets the text content from a real user message (not tool_result).

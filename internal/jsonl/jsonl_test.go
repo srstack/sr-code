@@ -349,6 +349,46 @@ func TestReadTurns_ToolTarget(t *testing.T) {
 	}
 }
 
+func TestReadTurns_IsMetaSkillContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lines := []string{
+		`{"type":"user","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"user","content":"load skill"}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"sk1","name":"Skill","input":{"skill":"zero-stack"}}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"sk1","content":"Launching skill: zero-stack"}]}}`,
+		`{"type":"user","timestamp":"2026-04-26T10:00:03.000Z","isMeta":true,"sourceToolUseID":"sk1","message":{"role":"user","content":[{"type":"text","text":"# zero-stack\n\nFull skill content here."}]}}`,
+		`{"type":"assistant","timestamp":"2026-04-26T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"skill loaded"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, _, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// user + assistant (tool+text) = 2 turns; isMeta must NOT create a user turn.
+	if len(turns) != 2 {
+		t.Fatalf("got %d turns, want 2: %+v", len(turns), turns)
+	}
+	if turns[0].Role != "user" || turns[0].Content != "load skill" {
+		t.Errorf("turns[0] = %+v", turns[0])
+	}
+	at := turns[1]
+	if at.Role != "assistant" || len(at.Parts) != 2 {
+		t.Fatalf("turns[1] role=%q parts=%d", at.Role, len(at.Parts))
+	}
+	tp := at.Parts[0]
+	if tp.Type != "tool" || tp.ToolName != "Skill" {
+		t.Errorf("parts[0] = %+v", tp)
+	}
+	if !strings.Contains(tp.Content, "Full skill content here.") {
+		t.Errorf("isMeta content not appended to tool part: %q", tp.Content)
+	}
+	if at.Parts[1].Type != "text" || at.Parts[1].Content != "skill loaded" {
+		t.Errorf("parts[1] = %+v", at.Parts[1])
+	}
+}
+
 // TestAssembler_MatchesReadTurns feeds the sample fixtures line-by-line
 // through an Assembler and checks the streamed view (completed turns + the
 // final flush, with every emitted part) reproduces exactly what ReadTurns
