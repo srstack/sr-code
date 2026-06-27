@@ -1051,6 +1051,22 @@ function renderFocus(focus) {
     `<a href="#/s/${esc(focus.session_id)}" class="subtitle-focus">focus: ${sid}</a>`;
 }
 
+// Preserve the reader's place across resize / orientation change.
+let _anchorEl = null;
+let _anchorOff = 0;
+document.addEventListener('scroll', (e) => {
+  if (e.target.id !== 'chat-scroll') return;
+  const r = e.target.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + 1);
+  const msg = hit && hit.closest('#chat-scroll > .chat-message');
+  if (msg) { _anchorEl = msg; _anchorOff = msg.offsetTop - e.target.scrollTop; }
+}, true);
+window.addEventListener('resize', () => {
+  const el = document.getElementById('chat-scroll');
+  if (!el) return;
+  if (_anchorEl && _anchorEl.isConnected) el.scrollTop = _anchorEl.offsetTop - _anchorOff;
+});
+
 // Fork click delegate. No confirmation: the fork is a pure server-side file
 // copy (the source session is untouched) — success navigates into the branch.
 document.addEventListener('click', async (e) => {
