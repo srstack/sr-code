@@ -8,17 +8,12 @@ import (
 
 const sevenDays = 7 * 24 * time.Hour
 
-func newTestStore(t *testing.T) (*Store, string) {
-	dir := t.TempDir()
-	return New(
-		filepath.Join(dir, "archived.json"),
-		filepath.Join(dir, "pinned.json"),
-		sevenDays,
-	), dir
+func newTestStore(t *testing.T) *Store {
+	return New(filepath.Join(t.TempDir(), "sessions.json"), sevenDays)
 }
 
 func TestIsArchived_DefaultsToActivityWindow(t *testing.T) {
-	s, _ := newTestStore(t)
+	s := newTestStore(t)
 	now := time.Now()
 
 	if s.IsArchived("a", now.Add(-1*time.Hour), now) {
@@ -33,7 +28,7 @@ func TestIsArchived_DefaultsToActivityWindow(t *testing.T) {
 }
 
 func TestIsArchived_ManualOverridesActivity(t *testing.T) {
-	s, _ := newTestStore(t)
+	s := newTestStore(t)
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
@@ -49,7 +44,7 @@ func TestIsArchived_ManualOverridesActivity(t *testing.T) {
 }
 
 func TestUnarchive_FreshSessionDeletesEntry(t *testing.T) {
-	s, _ := newTestStore(t)
+	s := newTestStore(t)
 	now := time.Now()
 	fresh := now.Add(-1 * time.Hour)
 	stale := now.Add(-30 * 24 * time.Hour)
@@ -66,7 +61,7 @@ func TestUnarchive_FreshSessionDeletesEntry(t *testing.T) {
 }
 
 func TestAutoArchiveDisabled(t *testing.T) {
-	s := New("", "", 0)
+	s := New("", 0)
 	now := time.Now()
 	stale := now.Add(-365 * 24 * time.Hour)
 
@@ -85,19 +80,18 @@ func TestAutoArchiveDisabled(t *testing.T) {
 	}
 }
 
-func TestArchivePersistence(t *testing.T) {
-	dir := t.TempDir()
-	ap := filepath.Join(dir, "archived.json")
-	pp := filepath.Join(dir, "pinned.json")
+func TestPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
-	s1 := New(ap, pp, sevenDays)
+	s1 := New(path, sevenDays)
 	s1.Archive("a")
 	s1.Unarchive("b", stale, now)
 	s1.Archive("c")
+	s1.Pin("x")
 
-	s2 := New(ap, pp, sevenDays)
+	s2 := New(path, sevenDays)
 	if !s2.IsArchived("a", now, now) {
 		t.Errorf("a should be archived after rehydrate")
 	}
@@ -107,29 +101,30 @@ func TestArchivePersistence(t *testing.T) {
 	if !s2.IsArchived("c", now, now) {
 		t.Errorf("c should be archived after rehydrate")
 	}
+	if !s2.IsPinned("x") {
+		t.Errorf("x should be pinned after rehydrate")
+	}
 }
 
 func TestArchive_Idempotent(t *testing.T) {
-	dir := t.TempDir()
-	ap := filepath.Join(dir, "archived.json")
-	pp := filepath.Join(dir, "pinned.json")
+	path := filepath.Join(t.TempDir(), "sessions.json")
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
-	s := New(ap, pp, sevenDays)
+	s := New(path, sevenDays)
 	s.Archive("a")
 	s.Archive("a")
 	s.Unarchive("a", stale, now)
 	s.Unarchive("a", stale, now)
 
-	s2 := New(ap, pp, sevenDays)
+	s2 := New(path, sevenDays)
 	if s2.IsArchived("a", stale, now) {
 		t.Errorf("after Archive → Unarchive on stale, session should stay visible")
 	}
 }
 
 func TestPin(t *testing.T) {
-	s, _ := newTestStore(t)
+	s := newTestStore(t)
 
 	if s.IsPinned("a") {
 		t.Errorf("should not be pinned by default")
@@ -144,23 +139,8 @@ func TestPin(t *testing.T) {
 	}
 }
 
-func TestPinPersistence(t *testing.T) {
-	dir := t.TempDir()
-	ap := filepath.Join(dir, "archived.json")
-	pp := filepath.Join(dir, "pinned.json")
-
-	s1 := New(ap, pp, sevenDays)
-	s1.Pin("x")
-	s1.Pin("y")
-
-	s2 := New(ap, pp, sevenDays)
-	if !s2.IsPinned("x") || !s2.IsPinned("y") {
-		t.Errorf("pins should survive rehydrate")
-	}
-}
-
 func TestForget(t *testing.T) {
-	s, _ := newTestStore(t)
+	s := newTestStore(t)
 	now := time.Now()
 
 	s.Archive("a")

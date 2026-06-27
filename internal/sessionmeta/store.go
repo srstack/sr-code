@@ -1,5 +1,5 @@
 // Package sessionmeta persists per-session user decisions (archive, pin)
-// in archived.json and pinned.json under <data-dir>/.
+// in sessions.json under <data-dir>/.
 package sessionmeta
 
 import (
@@ -20,116 +20,88 @@ const (
 	decisionShown    archiveDecision = "shown"
 )
 
+type fileFormat struct {
+	Archived map[string]archiveDecision `json:"archived,omitempty"`
+	Pinned   []string                   `json:"pinned,omitempty"`
+}
+
 type Store struct {
-	archivePath string
-	pinPath     string
-	autoAfter   time.Duration
+	path      string
+	autoAfter time.Duration
 
 	mu       sync.Mutex
 	archived map[string]archiveDecision
 	pinned   map[string]bool
 }
 
-func New(archivePath, pinPath string, autoAfter time.Duration) *Store {
+func New(path string, autoAfter time.Duration) *Store {
 	if autoAfter < 0 {
 		autoAfter = 0
 	}
 	s := &Store{
-		archivePath: archivePath,
-		pinPath:     pinPath,
-		autoAfter:   autoAfter,
-		archived:    map[string]archiveDecision{},
-		pinned:      map[string]bool{},
+		path:      path,
+		autoAfter: autoAfter,
+		archived:  map[string]archiveDecision{},
+		pinned:    map[string]bool{},
 	}
-	s.loadArchive()
-	s.loadPin()
+	s.load()
 	return s
 }
 
-
-func (s *Store) loadArchive() {
-	if s.archivePath == "" {
+func (s *Store) load() {
+	if s.path == "" {
 		return
 	}
-	data, err := os.ReadFile(s.archivePath)
+	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Warn("sessionmeta: read archive", "path", s.archivePath, "err", err)
+			slog.Warn("sessionmeta: read", "path", s.path, "err", err)
 		}
 		return
 	}
-	var loaded map[string]archiveDecision
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		slog.Warn("sessionmeta: decode archive", "path", s.archivePath, "err", err)
+	var f fileFormat
+	if err := json.Unmarshal(data, &f); err != nil {
+		slog.Warn("sessionmeta: decode", "path", s.path, "err", err)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k, v := range loaded {
+	for k, v := range f.Archived {
 		if v == decisionArchived || v == decisionShown {
 			s.archived[k] = v
 		}
 	}
-}
-
-func (s *Store) loadPin() {
-	if s.pinPath == "" {
-		return
-	}
-	data, err := os.ReadFile(s.pinPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("sessionmeta: read pin", "path", s.pinPath, "err", err)
-		}
-		return
-	}
-	var loaded []string
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		slog.Warn("sessionmeta: decode pin", "path", s.pinPath, "err", err)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, id := range loaded {
+	for _, id := range f.Pinned {
 		s.pinned[id] = true
 	}
 }
 
-func (s *Store) persistArchive() {
-	persistJSON(s.archivePath, s.archived, "archive")
-}
-
-func (s *Store) persistPin() {
-	ids := make([]string, 0, len(s.pinned))
+func (s *Store) persist() {
+	if s.path == "" {
+		return
+	}
+	pinned := make([]string, 0, len(s.pinned))
 	for id := range s.pinned {
-		ids = append(ids, id)
+		pinned = append(pinned, id)
 	}
-	persistJSON(s.pinPath, ids, "pin")
-}
-
-func persistJSON(path string, v any, label string) {
-	if path == "" {
-		return
-	}
-	data, err := json.Marshal(v)
+	data, err := json.Marshal(fileFormat{Archived: s.archived, Pinned: pinned})
 	if err != nil {
-		slog.Warn("sessionmeta: encode "+label, "err", err)
+		slog.Warn("sessionmeta: encode", "err", err)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		slog.Warn("sessionmeta: mkdir "+label, "err", err)
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		slog.Warn("sessionmeta: mkdir", "err", err)
 		return
 	}
-	tmp := path + ".tmp"
+	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		slog.Warn("sessionmeta: write "+label, "err", err)
+		slog.Warn("sessionmeta: write", "err", err)
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		slog.Warn("sessionmeta: rename "+label, "err", err)
+	if err := os.Rename(tmp, s.path); err != nil {
+		slog.Warn("sessionmeta: rename", "err", err)
 	}
 }
-
 
 func (s *Store) Archive(id string) {
 	s.mu.Lock()
@@ -138,7 +110,7 @@ func (s *Store) Archive(id string) {
 		return
 	}
 	s.archived[id] = decisionArchived
-	s.persistArchive()
+	s.persist()
 }
 
 func (s *Store) Unarchive(id string, lastEventAt time.Time, now time.Time) {
@@ -157,7 +129,7 @@ func (s *Store) Unarchive(id string, lastEventAt time.Time, now time.Time) {
 		}
 		s.archived[id] = decisionShown
 	}
-	s.persistArchive()
+	s.persist()
 }
 
 func (s *Store) IsArchived(id string, lastEventAt time.Time, now time.Time) bool {
@@ -173,7 +145,6 @@ func (s *Store) IsArchived(id string, lastEventAt time.Time, now time.Time) bool
 	return now.Sub(lastEventAt) > s.autoAfter
 }
 
-
 func (s *Store) Pin(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -181,7 +152,7 @@ func (s *Store) Pin(id string) {
 		return
 	}
 	s.pinned[id] = true
-	s.persistPin()
+	s.persist()
 }
 
 func (s *Store) Unpin(id string) {
@@ -191,7 +162,7 @@ func (s *Store) Unpin(id string) {
 		return
 	}
 	delete(s.pinned, id)
-	s.persistPin()
+	s.persist()
 }
 
 func (s *Store) IsPinned(id string) bool {
@@ -211,10 +182,5 @@ func (s *Store) Forget(id string) {
 	}
 	delete(s.archived, id)
 	delete(s.pinned, id)
-	if hasArchive {
-		s.persistArchive()
-	}
-	if hasPin {
-		s.persistPin()
-	}
+	s.persist()
 }

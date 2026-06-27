@@ -194,8 +194,7 @@ func serve(args []string) error {
 	b := broker.New()
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	meta := sessionmeta.New(
-		filepath.Join(*dataDir, "archived.json"),
-		filepath.Join(*dataDir, "pinned.json"),
+		filepath.Join(*dataDir, "sessions.json"),
 		time.Duration(*autoArchiveDays)*24*time.Hour,
 	)
 	r := router.New(d, senders, defaultBackend, b, h, meta)
