@@ -120,7 +120,7 @@ body {
   background: var(--bg-canvas);
   border-radius: 6px;
   font-size: 0.85rem;
-  margin-bottom: 1rem;
+  margin-bottom: var(--sidebar-pad-x);
   color: var(--accent);
   text-decoration: none;
 }
@@ -128,12 +128,13 @@ body {
 .sidebar-mainchat.active { background: var(--bg-accent); border-color: var(--accent-border); font-weight: 500; }
 .sidebar-section { margin-bottom: 0; flex: 1; overflow-y: auto; min-height: 0; padding: 0 var(--sidebar-pad-x); }
 .sidebar-heading {
+  border-top: 1px solid var(--border-muted);
   font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-faint);
   font-weight: 500;
-  padding: 0 calc(var(--sidebar-pad-x) + 0.5rem) 0.3rem;
+  padding: 0.5rem calc(var(--sidebar-pad-x) + 0.5rem) 0.3rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -288,6 +289,7 @@ body {
   font-size: 0.8rem;
   font-style: italic;
 }
+#sidebar-pinned:not(:empty) { margin-bottom: 0.75rem; }
 .cwd-group { margin-bottom: 0.4rem; }
 .cwd-label {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -964,6 +966,9 @@ pre.raw-markdown {
   margin-right: 0.25rem;
   color: var(--warning-border);
   font-size: 0.75rem;
+}
+.pinned-label {
+  color: var(--text-disabled);
 }
 
 /* Backend mark before a session title; tinted per backend via currentColor. */

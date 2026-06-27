@@ -83,7 +83,9 @@ export async function loadList() {
     const res = await fetch('/api/sessions?include_archived=1');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = (await res.json()) || [];
-    const html = data.length ? data.map(s => {
+    const sorted = data.slice().sort((a, b) =>
+      (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+    const html = sorted.length ? sorted.map(s => {
       const title = s.title || '(untitled)';
       const dot = statusDot(s.status);
       return `
@@ -91,7 +93,7 @@ export async function loadList() {
         <td class="title" title="${esc(title)}">${backendMark(s.backend)}${dot ? dot + ' ' : ''}${esc(title)}</td>
         <td class="cwd" title="${esc(s.cwd || '')}">${esc(s.cwd || '')}</td>
         <td>${esc(fmt(s.last_event_at))}</td>
-        <td class="act"><button class="kebab-btn" type="button" data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}" data-status="${esc(s.status || '')}" aria-label="session actions" title="more">⋮</button></td>
+        <td class="act"><button class="kebab-btn" type="button" data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}" data-pinned="${s.pinned ? '1' : '0'}" data-status="${esc(s.status || '')}" aria-label="session actions" title="more">⋮</button></td>
       </tr>`;
     }).join('') : '<tr><td colspan="4" class="muted" style="padding:0.75rem">no sessions found</td></tr>';
     // Skip the rebuild when unchanged so status-dot animations don't restart

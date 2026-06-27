@@ -15,13 +15,13 @@ import (
 	"time"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
-	"github.com/nexustar/usher/internal/archive"
 	"github.com/nexustar/usher/internal/auth"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/push"
+	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/router"
 	"github.com/nexustar/usher/internal/sender"
 	"github.com/nexustar/usher/internal/web"
@@ -187,11 +187,12 @@ func serve(args []string) error {
 	}
 	b := broker.New()
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
-	archiveStore := archive.New(
+	meta := sessionmeta.New(
 		filepath.Join(*dataDir, "archived.json"),
+		filepath.Join(*dataDir, "pinned.json"),
 		time.Duration(*autoArchiveDays)*24*time.Hour,
 	)
-	r := router.New(d, senders, defaultBackend, b, h, archiveStore)
+	r := router.New(d, senders, defaultBackend, b, h, meta)
 
 	mainStore, err := mainchat.NewStore(filepath.Join(*dataDir, "mainchats"))
 	if err != nil {

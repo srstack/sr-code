@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexustar/usher/internal/archive"
 	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/discovery"
@@ -43,7 +43,7 @@ type Router struct {
 	defaultBackend string
 	broker         *broker.Broker
 	hooks          *hook.Manager
-	archive        *archive.Store
+	meta           *sessionmeta.Store
 
 	sendMu     sync.Mutex
 	activeSend map[string]*sendToken   // sessionID -> latest send's cancel handle
@@ -61,14 +61,14 @@ type sendToken struct {
 // backend name ("claude"/"codex") to its Sender; defaultBackend names the one to
 // fall back to for unknown/empty backends and is the new-session default — it
 // must be a key in senders.
-func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBackend string, b *broker.Broker, h *hook.Manager, archiveStore *archive.Store) *Router {
+func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBackend string, b *broker.Broker, h *hook.Manager, meta *sessionmeta.Store) *Router {
 	return &Router{
 		discovery:      d,
 		senders:        senders,
 		defaultBackend: defaultBackend,
 		broker:         b,
 		hooks:          h,
-		archive:        archiveStore,
+		meta:           meta,
 		activeSend:     map[string]*sendToken{},
 		creating:       map[string]core.Session{},
 	}
@@ -270,38 +270,22 @@ func staleClock(s core.Session) time.Time {
 	return s.LastEventAt
 }
 
-// IsArchived reports whether sessionID is archived in the default
-// sidebar view. Wraps archive.Store.IsArchived with the session's
-// last-input time from discovery; returns false for unknown ids.
 func (r *Router) IsArchived(sessionID string) bool {
-	if r.archive == nil {
-		return false
-	}
 	sess, ok := r.discovery.Get(sessionID)
 	if !ok {
 		return false
 	}
-	return r.archive.IsArchived(sessionID, staleClock(sess), time.Now())
+	return r.meta.IsArchived(sessionID, staleClock(sess), time.Now())
 }
 
-// Archive marks sessionID as manually archived.
-func (r *Router) Archive(sessionID string) {
-	if r.archive != nil {
-		r.archive.Archive(sessionID)
-	}
-}
+func (r *Router) Archive(sessionID string)   { r.meta.Archive(sessionID) }
+func (r *Router) IsPinned(sessionID string) bool { return r.meta.IsPinned(sessionID) }
+func (r *Router) Pin(sessionID string)       { r.meta.Pin(sessionID) }
+func (r *Router) Unpin(sessionID string)     { r.meta.Unpin(sessionID) }
 
-// Unarchive removes the archive decision for sessionID. Looks up the
-// session's last_event_at from discovery so the store can pick between
-// "delete entry" (fresh — let auto-archive resume later) and "write DecisionShown"
-// (stale — would otherwise re-archive on next IsArchived call). A missing
-// session leaves lastEventAt zero, which the store treats as stale.
 func (r *Router) Unarchive(sessionID string) {
-	if r.archive == nil {
-		return
-	}
 	sess, _ := r.discovery.Get(sessionID)
-	r.archive.Unarchive(sessionID, staleClock(sess), time.Now())
+	r.meta.Unarchive(sessionID, staleClock(sess), time.Now())
 }
 
 // DeleteSession permanently removes a session: it cancels any in-flight turn,
@@ -333,9 +317,7 @@ func (r *Router) DeleteSession(id string) error {
 	// Forget it synchronously so the id stops resolving immediately instead of
 	// racing the fsnotify Remove event (mirror of fork's Upsert).
 	r.discovery.Remove(id)
-	if r.archive != nil {
-		r.archive.Forget(id)
-	}
+	r.meta.Forget(id)
 	r.hooks.SetAutoApprove(id, false)
 	r.hooks.ForgetSessionRules(id)
 	return nil

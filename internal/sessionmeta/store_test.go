@@ -1,4 +1,4 @@
-package archive
+package sessionmeta
 
 import (
 	"path/filepath"
@@ -8,8 +8,17 @@ import (
 
 const sevenDays = 7 * 24 * time.Hour
 
+func newTestStore(t *testing.T) (*Store, string) {
+	dir := t.TempDir()
+	return New(
+		filepath.Join(dir, "archived.json"),
+		filepath.Join(dir, "pinned.json"),
+		sevenDays,
+	), dir
+}
+
 func TestIsArchived_DefaultsToActivityWindow(t *testing.T) {
-	s := New("", sevenDays)
+	s, _ := newTestStore(t)
 	now := time.Now()
 
 	if s.IsArchived("a", now.Add(-1*time.Hour), now) {
@@ -24,18 +33,15 @@ func TestIsArchived_DefaultsToActivityWindow(t *testing.T) {
 }
 
 func TestIsArchived_ManualOverridesActivity(t *testing.T) {
-	s := New("", sevenDays)
+	s, _ := newTestStore(t)
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
-	// Manual archive beats fresh activity.
 	s.Archive("fresh")
 	if !s.IsArchived("fresh", now, now) {
 		t.Errorf("manual archive should override fresh activity")
 	}
 
-	// Unarchive on a stale session must override the auto rule —
-	// otherwise it would auto-archive on the next check.
 	s.Unarchive("stale", stale, now)
 	if s.IsArchived("stale", stale, now) {
 		t.Errorf("unarchive on stale should leave it visible")
@@ -43,7 +49,7 @@ func TestIsArchived_ManualOverridesActivity(t *testing.T) {
 }
 
 func TestUnarchive_FreshSessionDeletesEntry(t *testing.T) {
-	s := New("", sevenDays)
+	s, _ := newTestStore(t)
 	now := time.Now()
 	fresh := now.Add(-1 * time.Hour)
 	stale := now.Add(-30 * 24 * time.Hour)
@@ -51,53 +57,47 @@ func TestUnarchive_FreshSessionDeletesEntry(t *testing.T) {
 	s.Archive("a")
 	s.Unarchive("a", fresh, now)
 
-	// Visible now (no manual entry, fresh).
 	if s.IsArchived("a", fresh, now) {
 		t.Errorf("a should be visible after unarchive on fresh")
 	}
-	// Later, when it goes stale, auto-archive resumes — the unarchive
-	// did NOT leave a permanent DecisionShown override behind.
 	if !s.IsArchived("a", stale, now) {
 		t.Errorf("fresh-unarchive must not leave an override; stale should auto-archive again")
 	}
 }
 
 func TestAutoArchiveDisabled(t *testing.T) {
-	s := New("", 0)
+	s := New("", "", 0)
 	now := time.Now()
 	stale := now.Add(-365 * 24 * time.Hour)
 
-	// No auto-archive: even ancient sessions stay visible by default.
 	if s.IsArchived("untouched", stale, now) {
 		t.Errorf("autoAfter=0 must never auto-archive")
 	}
 
-	// Manual archive still works.
 	s.Archive("manual")
 	if !s.IsArchived("manual", now, now) {
 		t.Errorf("manual archive should still take effect with autoAfter=0")
 	}
 
-	// Unarchive: nothing is "stale" when auto is off, so unarchive just
-	// deletes the entry — no need to write DecisionShown.
 	s.Unarchive("manual", stale, now)
 	if s.IsArchived("manual", stale, now) {
 		t.Errorf("unarchive should clear the manual archive even with autoAfter=0")
 	}
 }
 
-func TestPersistence(t *testing.T) {
+func TestArchivePersistence(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "archived.json")
+	ap := filepath.Join(dir, "archived.json")
+	pp := filepath.Join(dir, "pinned.json")
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
-	s1 := New(path, sevenDays)
+	s1 := New(ap, pp, sevenDays)
 	s1.Archive("a")
-	s1.Unarchive("b", stale, now) // stale → DecisionShown override
+	s1.Unarchive("b", stale, now)
 	s1.Archive("c")
 
-	s2 := New(path, sevenDays)
+	s2 := New(ap, pp, sevenDays)
 	if !s2.IsArchived("a", now, now) {
 		t.Errorf("a should be archived after rehydrate")
 	}
@@ -111,19 +111,66 @@ func TestPersistence(t *testing.T) {
 
 func TestArchive_Idempotent(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "archived.json")
+	ap := filepath.Join(dir, "archived.json")
+	pp := filepath.Join(dir, "pinned.json")
 	now := time.Now()
 	stale := now.Add(-30 * 24 * time.Hour)
 
-	s := New(path, sevenDays)
+	s := New(ap, pp, sevenDays)
 	s.Archive("a")
-	s.Archive("a") // second call must not crash or duplicate
+	s.Archive("a")
 	s.Unarchive("a", stale, now)
 	s.Unarchive("a", stale, now)
 
-	// Stale unarchive writes DecisionShown; survives rehydrate.
-	s2 := New(path, sevenDays)
+	s2 := New(ap, pp, sevenDays)
 	if s2.IsArchived("a", stale, now) {
 		t.Errorf("after Archive → Unarchive on stale, session should stay visible")
+	}
+}
+
+func TestPin(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	if s.IsPinned("a") {
+		t.Errorf("should not be pinned by default")
+	}
+	s.Pin("a")
+	if !s.IsPinned("a") {
+		t.Errorf("should be pinned after Pin")
+	}
+	s.Unpin("a")
+	if s.IsPinned("a") {
+		t.Errorf("should not be pinned after Unpin")
+	}
+}
+
+func TestPinPersistence(t *testing.T) {
+	dir := t.TempDir()
+	ap := filepath.Join(dir, "archived.json")
+	pp := filepath.Join(dir, "pinned.json")
+
+	s1 := New(ap, pp, sevenDays)
+	s1.Pin("x")
+	s1.Pin("y")
+
+	s2 := New(ap, pp, sevenDays)
+	if !s2.IsPinned("x") || !s2.IsPinned("y") {
+		t.Errorf("pins should survive rehydrate")
+	}
+}
+
+func TestForget(t *testing.T) {
+	s, _ := newTestStore(t)
+	now := time.Now()
+
+	s.Archive("a")
+	s.Pin("a")
+	s.Forget("a")
+
+	if s.IsArchived("a", now, now) {
+		t.Errorf("archive state should be cleared after Forget")
+	}
+	if s.IsPinned("a") {
+		t.Errorf("pin state should be cleared after Forget")
 	}
 }

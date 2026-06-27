@@ -223,6 +223,8 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/archive", s.handleUnarchive)
+	webMux.HandleFunc("POST /api/sessions/{id}/pin", s.handlePin)
+	webMux.HandleFunc("DELETE /api/sessions/{id}/pin", s.handleUnpin)
 
 	webMux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
 	webMux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
@@ -475,6 +477,7 @@ type sessionDTO struct {
 	core.Session
 	AutoApprove bool `json:"auto_approve"`
 	Archived    bool `json:"archived"`
+	Pinned      bool `json:"pinned"`
 }
 
 // handleListSessions returns sessions visible by default, or the full
@@ -493,6 +496,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			Session:     sess,
 			AutoApprove: s.router.IsAutoApprove(sess.ID),
 			Archived:    archived,
+			Pinned:      s.router.IsPinned(sess.ID),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -565,6 +569,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		Session:     sess,
 		AutoApprove: s.router.IsAutoApprove(id),
 		Archived:    s.router.IsArchived(id),
+		Pinned:      s.router.IsPinned(id),
 	})
 }
 
@@ -611,6 +616,26 @@ func (s *Server) handleUnarchive(w http.ResponseWriter, r *http.Request) {
 	}
 	s.router.Unarchive(id)
 	writeJSON(w, http.StatusOK, map[string]bool{"archived": false})
+}
+
+func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	s.router.Pin(id)
+	writeJSON(w, http.StatusOK, map[string]bool{"pinned": true})
+}
+
+func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	s.router.Unpin(id)
+	writeJSON(w, http.StatusOK, map[string]bool{"pinned": false})
 }
 
 type autoApproveRequest struct {

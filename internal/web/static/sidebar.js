@@ -15,6 +15,7 @@ import { loadList } from './list.js';
 // the innerHTML rewrite when nothing changed keeps the live-dot CSS animation
 // from restarting (jumping back to its bright peak) on every poll.
 let lastSidebarHtml = '';
+let lastPinnedHtml = '';
 
 // ---------- Sidebar ----------
 //
@@ -99,16 +100,29 @@ export function renderSidebarSessions(allSessions) {
       <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
       <button class="kebab-btn" type="button"
         data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}"
+        data-pinned="${s.pinned ? '1' : '0'}"
         data-status="${esc(s.status || '')}"
         aria-label="session actions" title="more">⋮</button>
     </li>`;
   };
 
+  // Pinned sessions: fixed group above the scroll container.
+  const pinnedEl = document.getElementById('sidebar-pinned');
+  const pinnedItems = allSessions.filter(s => s.pinned && !s.archived).sort(byRecent);
+  const pinnedHtml = pinnedItems.length
+    ? `<div class="cwd-label"><span class="cwd-label-text pinned-label">Pinned</span></div>
+       <ul class="sidebar-list">${pinnedItems.map(renderItem).join('')}</ul>` : '';
+  if (pinnedEl && pinnedHtml !== lastPinnedHtml) {
+    lastPinnedHtml = pinnedHtml;
+    pinnedEl.innerHTML = pinnedHtml;
+  }
+
   const html = cwds.map(cwd => {
     const all = groups.get(cwd);
-    const visibleItems = all.filter(s => !s.archived).sort(byRecent);
+    const visibleItems = all.filter(s => !s.archived && !s.pinned).sort(byRecent);
     const archivedItems = all.filter(s => s.archived).sort(byRecent);
     const expanded = cwdExpanded.has(cwd);
+    if (!visibleItems.length && !archivedItems.length) return '';
     let lis = visibleItems.map(renderItem).join('');
     if (expanded) lis += archivedItems.map(renderItem).join('');
     const toggleRow = archivedItems.length === 0
@@ -211,6 +225,9 @@ function openKebabPopover(btn) {
   const archived = btn.dataset.archived === '1';
   const action = archived ? 'unarchive' : 'archive';
   const label = archived ? 'Unarchive' : 'Archive';
+  const pinned = btn.dataset.pinned === '1';
+  const pinAction = pinned ? 'unpin' : 'pin';
+  const pinLabel = pinned ? 'Unpin' : 'Pin';
   // Pause only applies to a session with a live window; an idle one has
   // nothing to tear down, so we hide it rather than offer a no-op.
   const status = btn.dataset.status;
@@ -218,6 +235,7 @@ function openKebabPopover(btn) {
     ? `<button type="button" class="kebab-item" data-action="pause" data-id="${esc(id)}">Pause</button>`
     : '';
   kebabPopover.innerHTML =
+    `<button type="button" class="kebab-item" data-action="${pinAction}" data-id="${esc(id)}">${pinLabel}</button>` +
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
     pauseItem +
     `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`;
@@ -306,6 +324,18 @@ async function handleKebabAction(action, id) {
   }
   if (action === 'pause') {
     pauseSession(id);
+    return;
+  }
+  if (action === 'pin' || action === 'unpin') {
+    const method = action === 'pin' ? 'POST' : 'DELETE';
+    try {
+      const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/pin', { method });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      loadSidebar();
+      loadList();
+    } catch (e) {
+      console.warn('pin/unpin failed', e);
+    }
     return;
   }
   const method = action === 'archive' ? 'POST' : 'DELETE';
