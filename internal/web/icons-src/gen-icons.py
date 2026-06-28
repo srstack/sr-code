@@ -7,7 +7,7 @@ Outputs:
   static/icons/icon-192.png          — 192x192 RGBA, Apple corners + padding
   static/icons/icon-512.png          — 512x512 RGBA, Apple corners + padding
   static/icons/icon-maskable-512.png — 512x512 RGB full bleed
-  static/icons/apple-touch-icon.png  — 180x180 RGB full bleed
+  static/icons/apple-touch-icon.png  — 180x180 RGB, no clip (iOS masks)
 """
 
 import os, io, re
@@ -85,9 +85,7 @@ def shift_svg(svg_text, dx):
     return result
 
 
-def build_icon_svg(raw_svg_text):
-    clip_path = apple_rect_path(0, 0, CONTENT, CONTENT, CONTENT * 0.225)
-
+def build_shifted_body(raw_svg_text):
     defs_match = re.search(r"<defs>(.*?)</defs>", raw_svg_text, re.DOTALL)
     defs_inner = shift_svg(defs_match.group(1), -OFFSET) if defs_match else ""
 
@@ -99,6 +97,12 @@ def build_icon_svg(raw_svg_text):
         '<rect x="0" y="0" width="1024" height="1024" fill="#1F1F20"/>',
         body,
     )
+    return defs_inner, body
+
+
+def build_icon_svg(raw_svg_text):
+    clip_path = apple_rect_path(0, 0, CONTENT, CONTENT, CONTENT * 0.225)
+    defs_inner, body = build_shifted_body(raw_svg_text)
 
     clip_block = f'  <clipPath id="shape">\n    <path d="{clip_path}"/>\n  </clipPath>'
 
@@ -110,6 +114,20 @@ def build_icon_svg(raw_svg_text):
         f'<g clip-path="url(#shape)">\n'
         f'{body.strip()}\n'
         f'</g>\n'
+        f'</svg>\n'
+    )
+
+
+def build_fullbleed_svg(raw_svg_text):
+    """1024x1024 content, no clip path — for apple-touch-icon (iOS applies its own mask)."""
+    defs_inner, body = build_shifted_body(raw_svg_text)
+
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{CONTENT}" height="{CONTENT}" viewBox="0 0 {CONTENT} {CONTENT}">\n'
+        f'<defs>{defs_inner}\n'
+        f'</defs>\n'
+        f'{body.strip()}\n'
         f'</svg>\n'
     )
 
@@ -126,6 +144,7 @@ def main():
 
     icon_svg = build_icon_svg(raw_svg)
     icon_bytes = icon_svg.encode()
+    fullbleed_bytes = build_fullbleed_svg(raw_svg).encode()
 
     with open(os.path.join(ICONS_DIR, "icon.svg"), "w") as f:
         f.write(icon_svg)
@@ -144,7 +163,7 @@ def main():
     render_png(raw_bytes, 512, "RGB").save(os.path.join(ICONS_DIR, "icon-maskable-512.png"))
     print("  icon-maskable-512.png")
 
-    render_png(raw_bytes, 180, "RGB").save(os.path.join(ICONS_DIR, "apple-touch-icon.png"))
+    render_png(fullbleed_bytes, 180, "RGB").save(os.path.join(ICONS_DIR, "apple-touch-icon.png"))
     print("  apple-touch-icon.png")
 
     print("done")
