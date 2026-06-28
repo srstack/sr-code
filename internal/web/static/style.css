@@ -13,8 +13,8 @@
   --bg-chrome: #ffffff;       /* sidebar, header, modal, inputs */
   --bg-subtle: #f6f8fa;         /* table hover, render-mode hover, modal tool-input */
   --bg-faint: #fcfcfc;          /* raw-markdown container */
+  --bg-mainchat: #f0f2f5;        /* sidebar main-chat fill */
   --bg-hover: #eef0f3;          /* sidebar item hover, sidebar-new hover */
-  --bg-mainchat-hover: #f0f3f6; /* sidebar-mainchat button hover */
   --bg-accent: #e3edf9;         /* sidebar mainchat/list/new active */
 
   /* Text — three muted levels, plus a faint empty-state shade */
@@ -116,16 +116,16 @@ body {
   padding: 0.45rem 0.6rem;
   margin-left: var(--sidebar-pad-x);
   margin-right: var(--sidebar-pad-x);
-  border: 1px solid var(--border);
-  background: var(--bg-canvas);
+  border: none;
+  background: var(--bg-mainchat);
   border-radius: 6px;
   font-size: 0.85rem;
-  margin-bottom: var(--sidebar-pad-x);
+  margin-bottom: 0.5rem;
   color: var(--accent);
   text-decoration: none;
 }
-.sidebar-mainchat:hover { background: var(--bg-mainchat-hover); }
-.sidebar-mainchat.active { background: var(--bg-accent); border-color: var(--accent-border); font-weight: 500; }
+.sidebar-mainchat:hover { background: var(--bg-hover); }
+.sidebar-mainchat.active { background: var(--bg-accent); font-weight: 500; }
 .sidebar-section { margin-bottom: 0; flex: 1; overflow-y: auto; min-height: 0; padding: 0 var(--sidebar-pad-x); }
 .sidebar-heading {
   border-top: 1px solid var(--border-muted);
@@ -185,6 +185,10 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 0.9rem;
+  /* Long-press opens the actions menu (sidebar.js); suppress the iOS callout. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .sidebar-list li.sidebar-item a.active { background: var(--bg-accent); color: var(--accent); }
 .sidebar-list li.sidebar-item a .running-dot {
@@ -230,6 +234,13 @@ body {
   }
   .kebab-btn:hover { color: var(--text); }
   .sidebar-list li.sidebar-item a.active ~ .kebab-btn:hover { color: var(--accent); }
+}
+
+/* The row whose actions popover is open — needed on touch, where the kebab
+ * never reveals and the native selection cue is suppressed. */
+.sidebar-list li.sidebar-item.kebab-active {
+  background: var(--bg-hover);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 /* Archived sessions revealed via the per-cwd disclosure: dim the row so
@@ -339,7 +350,8 @@ body {
   display: flex;
   align-items: center;
   gap: 0.25rem;
-  padding: 0.6rem;
+  padding: 0 0.45rem 0 0.6rem;
+  height: 42px;
   border-bottom: 1px solid var(--border-muted);
   background: var(--bg-chrome);
   position: sticky;
@@ -406,15 +418,18 @@ body {
 .sidebar-toggle {
   background: none;
   border: none;
-  padding: 0.5rem;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
   cursor: pointer;
   color: var(--text-muted);
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
 }
 .sidebar-toggle:hover { color: var(--text); background: var(--bg-hover); border-radius: 6px; }
-.mobile-toggle { display: none; }
+.mobile-toggle { display: none; margin-left: -0.3rem; }
 body.sidebar-collapsed #sidebar {
   transform: translateX(-100%);
 }
@@ -715,48 +730,42 @@ td.cwd { font-size: 0.82rem; }
   border-color: var(--border-strong);
   cursor: not-allowed;
 }
-.render-mode {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 0.72rem;
-  padding: 0.2rem 0.5rem;
-  border: 1px solid var(--border);
-  background: var(--bg-canvas);
-  border-radius: 4px;
-  cursor: pointer;
-  color: var(--text-muted);
+.render-pill {
+  display: inline-flex;
+  background: var(--bg-mainchat);
+  border-radius: 6px;
+  padding: 2px;
   margin-left: 0.25rem;
 }
-/* Fixed-width value slot (fits "raw") so toggling md ↔ raw never reflows
- * the button. Right-aligned: the shorter "md" gets a leading space so its
- * right edge lines up with "raw" — front and back read consistently. */
-#render-mode-val {
-  display: inline-block;
-  min-width: 3ch;
-  text-align: right;
+.render-pill-opt {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.5rem;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-faint);
+  line-height: 1.4;
 }
-.render-mode:hover { background: var(--bg-subtle); }
-.render-mode[aria-pressed="true"] {
-  background: var(--bg-subtle);
-  border-color: var(--purple);
-  color: var(--purple);
-}
-@media (max-width: 720px) {
-  .render-mode-prefix { display: none; }
-  /* prefix gone — center the bare value in its fixed-width slot */
-  #render-mode-val { text-align: center; }
+.render-pill-opt:hover { color: var(--text-muted); }
+.render-pill-opt[aria-pressed="true"] {
+  background: var(--bg-chrome);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
 .sidebar-footer {
   flex-shrink: 0;
-  padding: 0.5rem;
+  padding: 0.35rem;
   border-top: 1px solid var(--border-muted);
   position: relative;
 }
 .settings-btn {
   display: block;
   width: 100%;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--border-muted);
+  padding: 0.35rem 0.5rem;
+  border: none;
   border-radius: 6px;
   color: var(--text-faint);
   font-size: 0.85rem;
@@ -768,9 +777,9 @@ td.cwd { font-size: 0.82rem; }
 .settings-btn:hover { color: var(--text); background: var(--bg-hover); }
 .settings-menu {
   position: absolute;
-  bottom: calc(100% - 0.5rem);
-  left: 0.5rem;
-  right: 0.5rem;
+  bottom: calc(100% - 0.3rem);
+  left: 0.35rem;
+  right: 0.35rem;
   background: var(--bg-chrome);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1309,8 +1318,8 @@ pre.raw-markdown {
     --bg-chrome: #0d1117;
     --bg-subtle: #21262d;
     --bg-faint: #1c2128;
+    --bg-mainchat: #1c2128;
     --bg-hover: #21262d;
-    --bg-mainchat-hover: #21262d;
     --bg-accent: rgba(56, 139, 253, 0.15);
 
     --text: #e6edf3;
@@ -1348,5 +1357,9 @@ pre.raw-markdown {
     --shadow-sidebar: rgba(0, 0, 0, 0.5);
     --shadow-modal: rgba(0, 0, 0, 0.6);
     --modal-overlay: rgba(0, 0, 0, 0.65);
+  }
+  .render-pill-opt[aria-pressed="true"] {
+    background: #2d333b;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   }
 }

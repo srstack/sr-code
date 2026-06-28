@@ -40,7 +40,7 @@
   <header>
     <button id="mobile-toggle" class="sidebar-toggle mobile-toggle" aria-label="Open sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button>
     <span id="subtitle" class="muted">discovered sessions</span>
-    <button id="render-mode-btn" class="render-mode" type="button" title="toggle markdown rendering"><span class="render-mode-prefix">render:</span><span id="render-mode-val">md</span></button>
+    <span class="render-pill" role="radiogroup" aria-label="render mode"><button id="render-pill-md" class="render-pill-opt" type="button" aria-pressed="true">md</button><button id="render-pill-raw" class="render-pill-opt" type="button" aria-pressed="false">raw</button></span>
   </header>
   <main id="root"></main>
 </div>

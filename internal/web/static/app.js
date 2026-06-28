@@ -2,7 +2,7 @@
 // Hash-based routing between session list, detail view, new session, and main chat.
 
 import { closeES, clearListInterval } from './state.js';
-import './render.js'; // side-effect: sets up marked, renderModeBtn listener
+import './render.js'; // side-effect: sets up marked, render-pill listeners
 import { loadSidebar, updateSidebarActive } from './sidebar.js';
 import { showList, loadList } from './list.js';
 import { showDetail, showNewSession, showMainChat } from './detail.js';

@@ -22,7 +22,8 @@ window.fetch = async (...args) => {
 // --- DOM anchors (used by multiple views) ---
 export const root = document.getElementById('root');
 export const subtitle = document.getElementById('subtitle');
-export const renderModeBtn = document.getElementById('render-mode-btn');
+export const renderPillMd = document.getElementById('render-pill-md');
+export const renderPillRaw = document.getElementById('render-pill-raw');
 
 // --- cross-module mutable state ---
 

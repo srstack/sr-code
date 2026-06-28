@@ -215,13 +215,18 @@ function closeKebabPopover() {
   if (!kebabPopover) return;
   kebabPopover.hidden = true;
   kebabPopover.innerHTML = '';
-  if (kebabOpenBtn) kebabOpenBtn.classList.remove('open');
+  if (kebabOpenBtn) {
+    kebabOpenBtn.classList.remove('open');
+    kebabOpenBtn.closest('.sidebar-item')?.classList.remove('kebab-active');
+  }
   kebabOpenBtn = null;
   kebabOpenFor = null;
 }
 
 function openKebabPopover(btn) {
   if (!kebabPopover) return;
+  // Switching kebab-to-kebab skips closeKebabPopover, so clear the old row here.
+  closeKebabPopover();
   const id = btn.dataset.id;
   const archived = btn.dataset.archived === '1';
   const action = archived ? 'unarchive' : 'archive';
@@ -259,6 +264,8 @@ function openKebabPopover(btn) {
   // .open keeps the kebab visible after the cursor leaves its row — the
   // user is now interacting with the popover, not the row.
   btn.classList.add('open');
+  // Highlight the owning row — on touch the kebab itself stays invisible.
+  btn.closest('.sidebar-item')?.classList.add('kebab-active');
   kebabOpenBtn = btn;
 }
 
@@ -301,6 +308,86 @@ window.addEventListener('resize', closeKebabPopover);
 // Listen on the sidebar's scroll container so a long sidebar scroll
 // doesn't leave the popover floating mid-air.
 if (sidebarEl) sidebarEl.addEventListener('scroll', closeKebabPopover, { passive: true });
+
+// ---------- Mobile long-press → actions menu ----------
+//
+// Touch never reveals the hover-gated kebab (see style.css), so a long-press
+// on the row stands in for it: hold ~480ms to open the same popover, anchored
+// to the row's invisible kebab button.
+const LONG_PRESS_MS = 480;
+const MOVE_CANCEL_PX = 10;
+let lpTimer = null;
+let lpKebab = null;
+let lpStartX = 0, lpStartY = 0;
+let recentTouch = false;   // distinguishes touch long-press from desktop right-click
+let suppressNextClick = false; // swallow the click the finger-lift synthesises
+
+function cancelLongPress() {
+  if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+  lpKebab = null;
+}
+
+if (sidebarEl) {
+  sidebarEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    const li = e.target.closest('.sidebar-item');
+    const kebab = li && li.querySelector('.kebab-btn');
+    if (!kebab) return;
+    recentTouch = true;
+    lpKebab = kebab;
+    lpStartX = e.touches[0].clientX;
+    lpStartY = e.touches[0].clientY;
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      if (!lpKebab) return;
+      suppressNextClick = true;
+      openKebabPopover(lpKebab);
+      lpKebab = null;
+      if (navigator.vibrate) navigator.vibrate(10);
+    }, LONG_PRESS_MS);
+  }, { passive: true });
+
+  // A scroll/drag past the threshold means the user is panning, not pressing.
+  sidebarEl.addEventListener('touchmove', (e) => {
+    if (!lpTimer) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - lpStartX) > MOVE_CANCEL_PX ||
+        Math.abs(t.clientY - lpStartY) > MOVE_CANCEL_PX) {
+      cancelLongPress();
+    }
+  }, { passive: true });
+
+  sidebarEl.addEventListener('touchend', () => {
+    cancelLongPress();
+    setTimeout(() => { recentTouch = false; }, 800);
+  }, { passive: true });
+  sidebarEl.addEventListener('touchcancel', () => {
+    cancelLongPress();
+    setTimeout(() => { recentTouch = false; }, 800);
+  }, { passive: true });
+
+  // Kill the native menu (Android long-press, desktop right-click). Desktop has
+  // no touch path so right-click also opens the popover; Android's timer already did.
+  sidebarEl.addEventListener('contextmenu', (e) => {
+    const li = e.target.closest('.sidebar-item');
+    const kebab = li && li.querySelector('.kebab-btn');
+    if (!kebab) return;
+    e.preventDefault();
+    if (recentTouch) return;
+    openKebabPopover(kebab);
+  });
+}
+
+// Lifting the finger after a long-press synthesises a click on the <a>; swallow
+// that one click (capture phase, before it navigates) so the row doesn't open too.
+document.addEventListener('click', (e) => {
+  if (!suppressNextClick) return;
+  suppressNextClick = false;
+  if (e.target.closest('.sidebar-item')) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
 
 const settingsBtn = document.getElementById('settings-btn');
 const settingsMenu = document.getElementById('settings-menu');

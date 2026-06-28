@@ -1,7 +1,7 @@
 // usher SPA: markdown + turn rendering + appendChatMessage.
 
 import {
-  esc, renderMode, setRenderModeValue, renderModeBtn,
+  esc, renderMode, setRenderModeValue, renderPillMd, renderPillRaw,
   isNearBottom, suppressAppendScroll, currentDetailId,
 } from './state.js';
 
@@ -62,16 +62,14 @@ export function setRenderMode(mode) {
 }
 
 export function updateRenderModeBtn() {
-  if (!renderModeBtn) return;
-  const val = document.getElementById('render-mode-val');
-  if (val) val.textContent = renderMode;
-  renderModeBtn.setAttribute('aria-pressed', renderMode === 'raw');
+  if (!renderPillMd || !renderPillRaw) return;
+  renderPillMd.setAttribute('aria-pressed', renderMode === 'md');
+  renderPillRaw.setAttribute('aria-pressed', renderMode === 'raw');
 }
 
-if (renderModeBtn) {
-  renderModeBtn.addEventListener('click', () => {
-    setRenderMode(renderMode === 'md' ? 'raw' : 'md');
-  });
+if (renderPillMd && renderPillRaw) {
+  renderPillMd.addEventListener('click', () => setRenderMode('md'));
+  renderPillRaw.addEventListener('click', () => setRenderMode('raw'));
   updateRenderModeBtn();
 }
 
