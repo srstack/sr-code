@@ -6,6 +6,7 @@ import {
   setLastSessions,
   updateTabBadge,
   registerRenderSidebarSessions,
+  refreshSubtitle, currentDetailId,
 } from './state.js';
 import { statusDot, backendMark } from './render.js';
 import { loadList } from './list.js';
@@ -235,6 +236,7 @@ function openKebabPopover(btn) {
     ? `<button type="button" class="kebab-item" data-action="pause" data-id="${esc(id)}">Pause</button>`
     : '';
   kebabPopover.innerHTML =
+    `<button type="button" class="kebab-item" data-action="rename" data-id="${esc(id)}">Rename</button>` +
     `<button type="button" class="kebab-item" data-action="${pinAction}" data-id="${esc(id)}">${pinLabel}</button>` +
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
     pauseItem +
@@ -318,6 +320,10 @@ if (settingsBtn && settingsMenu) {
 
 async function handleKebabAction(action, id) {
   closeKebabPopover();
+  if (action === 'rename') {
+    renameSession(id);
+    return;
+  }
   if (action === 'delete') {
     deleteSession(id);
     return;
@@ -382,5 +388,23 @@ async function pauseSession(id) {
   } catch (e) {
     console.warn('pause failed', e);
     alert('Failed to pause session.');
+  }
+}
+
+async function renameSession(id) {
+  const title = prompt('Rename session (empty to reset):');
+  if (title === null) return;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    loadSidebar();
+    loadList();
+    if (id === currentDetailId) refreshSubtitle(id);
+  } catch (e) {
+    console.warn('rename failed', e);
   }
 }

@@ -30,8 +30,11 @@ func TestReadSessionMeta(t *testing.T) {
 	if meta.Cwd != "/tmp/codex-probe" {
 		t.Errorf("Cwd = %q", meta.Cwd)
 	}
-	if !strings.HasPrefix(meta.Title, "Read the file sample.txt") {
-		t.Errorf("Title = %q, want it to start with the user prompt", meta.Title)
+	if meta.Title != "" {
+		t.Errorf("Title = %q, want empty (codex has no ai-title)", meta.Title)
+	}
+	if !strings.HasPrefix(meta.Prompt, "Read the file sample.txt") {
+		t.Errorf("Prompt = %q, want it to start with the user prompt", meta.Prompt)
 	}
 	if meta.StartedAt.IsZero() {
 		t.Error("StartedAt is zero")

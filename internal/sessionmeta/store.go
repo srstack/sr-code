@@ -23,6 +23,7 @@ const (
 type fileFormat struct {
 	Archived map[string]archiveDecision `json:"archived,omitempty"`
 	Pinned   []string                   `json:"pinned,omitempty"`
+	Titles   map[string]string          `json:"titles,omitempty"`
 }
 
 type Store struct {
@@ -32,6 +33,7 @@ type Store struct {
 	mu       sync.Mutex
 	archived map[string]archiveDecision
 	pinned   map[string]bool
+	titles   map[string]string
 }
 
 func New(path string, autoAfter time.Duration) *Store {
@@ -43,6 +45,7 @@ func New(path string, autoAfter time.Duration) *Store {
 		autoAfter: autoAfter,
 		archived:  map[string]archiveDecision{},
 		pinned:    map[string]bool{},
+		titles:    map[string]string{},
 	}
 	s.load()
 	return s
@@ -74,6 +77,9 @@ func (s *Store) load() {
 	for _, id := range f.Pinned {
 		s.pinned[id] = true
 	}
+	for id, t := range f.Titles {
+		s.titles[id] = t
+	}
 }
 
 func (s *Store) persist() {
@@ -84,7 +90,11 @@ func (s *Store) persist() {
 	for id := range s.pinned {
 		pinned = append(pinned, id)
 	}
-	data, err := json.Marshal(fileFormat{Archived: s.archived, Pinned: pinned})
+	var titles map[string]string
+	if len(s.titles) > 0 {
+		titles = s.titles
+	}
+	data, err := json.Marshal(fileFormat{Archived: s.archived, Pinned: pinned, Titles: titles})
 	if err != nil {
 		slog.Warn("sessionmeta: encode", "err", err)
 		return
@@ -171,16 +181,35 @@ func (s *Store) IsPinned(id string) bool {
 	return s.pinned[id]
 }
 
+func (s *Store) Rename(id, title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if title == "" {
+		delete(s.titles, id)
+	} else {
+		s.titles[id] = title
+	}
+	s.persist()
+}
+
+func (s *Store) CustomTitle(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.titles[id]
+}
+
 // Forget drops all state for id.
 func (s *Store) Forget(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, hasArchive := s.archived[id]
 	hasPin := s.pinned[id]
-	if !hasArchive && !hasPin {
+	_, hasTitle := s.titles[id]
+	if !hasArchive && !hasPin && !hasTitle {
 		return
 	}
 	delete(s.archived, id)
 	delete(s.pinned, id)
+	delete(s.titles, id)
 	s.persist()
 }

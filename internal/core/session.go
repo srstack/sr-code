@@ -23,6 +23,7 @@ type Session struct {
 	ID          string    `json:"id"`
 	Cwd         string    `json:"cwd"`
 	Title       string    `json:"title"`
+	Prompt      string    `json:"-"`
 	Status      Status    `json:"status"`
 	StartedAt   time.Time `json:"started_at"`
 	LastEventAt time.Time `json:"last_event_at"`

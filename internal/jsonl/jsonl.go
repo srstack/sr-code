@@ -34,10 +34,7 @@ type Event struct {
 	// message.content does not, so it is the source for rendering tool turns.
 	ToolUseResult json.RawMessage `json:"toolUseResult,omitempty"`
 
-	// Title appears on type=ai-title events. Field name is opportunistic —
-	// if Claude Code uses a different key we will fall back to other heuristics
-	// to produce a session title.
-	Title string `json:"title,omitempty"`
+	AITitle string `json:"aiTitle,omitempty"`
 
 	// IsMeta marks harness-injected context (e.g. skill content loaded after
 	// a Skill tool call). These are user-role messages but not real user input.
@@ -61,7 +58,8 @@ func ParseLine(line []byte) (Event, error) {
 type SessionMeta struct {
 	ID          string
 	Cwd         string
-	Title       string
+	Title       string // from ai-title events only
+	Prompt      string // truncated first user prompt (fallback when Title is empty)
 	StartedAt   time.Time
 	LastEventAt time.Time
 	// LastInputAt is the time of the last genuine user prompt (see
@@ -104,8 +102,8 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		if meta.Cwd == "" && ev.Cwd != "" {
 			meta.Cwd = ev.Cwd
 		}
-		if ev.Type == "ai-title" && ev.Title != "" {
-			meta.Title = ev.Title
+		if ev.Type == "ai-title" && ev.AITitle != "" {
+			meta.Title = ev.AITitle
 		}
 		if ev.Type == "user" && len(ev.Message) > 0 {
 			content := extractUserContent(ev.Message)
@@ -122,8 +120,8 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		}
 	}
 
-	if meta.Title == "" && firstUserPrompt != "" {
-		meta.Title = truncate(firstUserPrompt, 60)
+	if firstUserPrompt != "" {
+		meta.Prompt = truncate(firstUserPrompt, 60)
 	}
 	return meta, sc.Err()
 }

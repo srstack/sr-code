@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,11 +24,16 @@ func newTestDiscovery(t *testing.T, root string) *Discovery {
 
 func writeJSONL(t *testing.T, path, sessionID, cwd, prompt string) {
 	t.Helper()
+	writeJSONLAt(t, path, sessionID, cwd, prompt, "2026-04-26T10:00:00.000Z")
+}
+
+func writeJSONLAt(t *testing.T, path, sessionID, cwd, prompt, ts string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	line := `{"type":"user","sessionId":"` + sessionID + `","cwd":"` + cwd +
-		`","timestamp":"2026-04-26T10:00:00.000Z","message":{"role":"user","content":"` +
+		`","timestamp":"` + ts + `","message":{"role":"user","content":"` +
 		prompt + `"},"uuid":"u1"}` + "\n"
 	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
 		t.Fatal(err)
@@ -84,6 +91,67 @@ func TestDiscovery_GetAndPath(t *testing.T) {
 	if _, ok := d.Get("missing"); ok {
 		t.Error("Get returned ok for unknown id")
 	}
+}
+
+// TestDiscovery_LateAITitle covers ai-title surfacing on a live session.
+// Claude writes the ai-title some turns AFTER the first user prompt, so upsert
+// must keep re-reading while Title is empty and pick it up on a later Write —
+// without waiting for a full re-scan.
+func TestDiscovery_LateAITitle(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "-tmp-x", "late.jsonl")
+	writeJSONL(t, path, "late", "/tmp/x", "first prompt")
+
+	d := newTestDiscovery(t, tmp)
+	d.Upsert(path) // first ingest: only the prompt is on disk
+
+	sess, ok := d.Get("late")
+	if !ok {
+		t.Fatal("session late not found")
+	}
+	if sess.Title != "first prompt" {
+		t.Fatalf("after first ingest Title = %q, want prompt fallback", sess.Title)
+	}
+
+	// ai-title lands later, as it does in a real session.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"type":"ai-title","sessionId":"late","aiTitle":"Real AI Title","timestamp":"2026-04-26T10:05:00.000Z"}` + "\n")
+	f.Close()
+
+	d.Upsert(path) // a normal fsnotify Write after the ai-title line
+
+	sess, _ = d.Get("late")
+	if sess.Title != "Real AI Title" {
+		t.Errorf("ai-title not surfaced on later Write: Title = %q, want %q", sess.Title, "Real AI Title")
+	}
+}
+
+// TestDiscovery_ConcurrentUpsert exercises upsert/List/Get from several
+// goroutines at once. Run under -race it guards the map accesses in upsert
+// against the watch goroutine racing a synchronous Upsert (e.g. ForkSession).
+func TestDiscovery_ConcurrentUpsert(t *testing.T) {
+	tmp := t.TempDir()
+	d := newTestDiscovery(t, tmp)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		id := "s" + strconv.Itoa(i)
+		path := filepath.Join(tmp, "-p", id+".jsonl")
+		writeJSONL(t, path, id, "/tmp/p", "hi")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				d.Upsert(path)
+				d.List()
+				d.Get(id)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestDiscovery_Remove(t *testing.T) {
@@ -230,14 +298,10 @@ func TestDiscovery_ListSorted(t *testing.T) {
 	tmp := t.TempDir()
 	older := filepath.Join(tmp, "-p", "older.jsonl")
 	newer := filepath.Join(tmp, "-p", "newer.jsonl")
-	writeJSONL(t, older, "older", "/tmp/p", "old")
-	writeJSONL(t, newer, "newer", "/tmp/p", "new")
-
-	// Set distinct mtimes so sort order is deterministic.
-	past := time.Now().Add(-1 * time.Hour)
-	if err := os.Chtimes(older, past, past); err != nil {
-		t.Fatal(err)
-	}
+	// Distinct user-input timestamps: List sorts by LastInputAt (sortKey), so
+	// the prompt times — not mtime — must differ for a deterministic order.
+	writeJSONLAt(t, older, "older", "/tmp/p", "old", "2026-04-26T09:00:00.000Z")
+	writeJSONLAt(t, newer, "newer", "/tmp/p", "new", "2026-04-26T11:00:00.000Z")
 
 	d := newTestDiscovery(t, tmp)
 	if err := d.scan(); err != nil {

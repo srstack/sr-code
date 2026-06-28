@@ -6,6 +6,7 @@ import {
   setSuppressAppendScroll,
   isNearBottom, markViewing, setCurrentES, currentScreenES,
   restoreDraft, clearDraft, growPrompt,
+  registerRefreshSubtitle,
 } from './state.js';
 import {
   renderMarkdown, appendChatMessage, renderToolPart,
@@ -280,7 +281,6 @@ export async function showDetail(id) {
 
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
-      <div class="chat-loading muted" style="padding:0.5rem">loading…</div>
       <section class="send-anchor">
         <div id="term-panel" class="term-panel" hidden>
           <div class="term-screen"><pre id="term-grid" class="term-grid muted">connecting…</pre></div>
@@ -489,6 +489,8 @@ export async function showDetail(id) {
     // created by openEventStream on subprocess.started. Marked .optimistic so
     // the turn.user event (or a truth-up fetch) replaces it with the
     // canonical turn — same text, server timestamp.
+    const el = document.getElementById('chat-scroll');
+    if (el) el.querySelectorAll(':scope > .chat-loading').forEach(n => n.remove());
     const userNode = appendChatMessage({ role: 'user', content: text });
     if (userNode) userNode.classList.add('optimistic');
     try {
@@ -834,6 +836,7 @@ async function refreshSubtitle(id) {
     renderSessionSubtitle(sess);
   } catch {/* ignore */}
 }
+registerRefreshSubtitle(refreshSubtitle);
 
 // ----- live turn (streamed parts) -----
 
@@ -945,6 +948,7 @@ async function loadTranscript(id, opts) {
     // Drop the loading stub and any optimistic bubbles (the in-flight turn's
     // user/assistant placeholders) — they're about to be represented by their
     // canonical turns from this fetch.
+    const hadOptimistic = !!el.querySelector(':scope > .chat-message.optimistic');
     el.querySelectorAll(':scope > .chat-loading, :scope > .chat-message.optimistic').forEach(n => n.remove());
     const committed = () => el.querySelectorAll(':scope > .chat-message:not(.optimistic)');
     // Self-heal: if our tracked turns drifted from what's actually in the DOM
@@ -956,6 +960,7 @@ async function loadTranscript(id, opts) {
       renderedTurns = [];
     }
     if (!turns.length) {
+      if (hadOptimistic) return;
       renderedTurns.forEach(r => r.node.remove());
       renderedTurns = [];
       const empty = document.createElement('div');

@@ -96,6 +96,10 @@ export function reconcileUnread(allSessions) {
 let _renderSidebarSessionsFn = null;
 export function registerRenderSidebarSessions(fn) { _renderSidebarSessionsFn = fn; }
 
+let _refreshSubtitleFn = null;
+export function registerRefreshSubtitle(fn) { _refreshSubtitleFn = fn; }
+export function refreshSubtitle(id) { if (_refreshSubtitleFn) _refreshSubtitleFn(id); }
+
 export function markViewing(id) {
   viewingId = id;
   unreadIds.delete(id);

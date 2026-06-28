@@ -189,12 +189,12 @@ func (r *Router) ListSessions() []core.Session {
 		} else if live[sessions[i].ID] {
 			sessions[i].Status = core.StatusLive
 		}
+		r.applyCustomTitle(&sessions[i])
 	}
-	// Prepend sessions still being created (newest, not yet on disk) so a
-	// just-created session shows in the list before its first jsonl write.
 	var pending []core.Session
 	for id, s := range r.creating {
 		if !known[id] {
+			r.applyCustomTitle(&s)
 			pending = append(pending, s)
 		}
 	}
@@ -210,6 +210,9 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 		r.sendMu.Lock()
 		sess, ok = r.creating[id]
 		r.sendMu.Unlock()
+		if ok {
+			r.applyCustomTitle(&sess)
+		}
 		return sess, ok
 	}
 	r.sendMu.Lock()
@@ -220,6 +223,7 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 	} else if r.senderForBackend(sess.Backend).Has(id) {
 		sess.Status = core.StatusLive
 	}
+	r.applyCustomTitle(&sess)
 	return sess, true
 }
 
@@ -278,10 +282,17 @@ func (r *Router) IsArchived(sessionID string) bool {
 	return r.meta.IsArchived(sessionID, staleClock(sess), time.Now())
 }
 
-func (r *Router) Archive(sessionID string)   { r.meta.Archive(sessionID) }
-func (r *Router) IsPinned(sessionID string) bool { return r.meta.IsPinned(sessionID) }
-func (r *Router) Pin(sessionID string)       { r.meta.Pin(sessionID) }
-func (r *Router) Unpin(sessionID string)     { r.meta.Unpin(sessionID) }
+func (r *Router) Archive(sessionID string)        { r.meta.Archive(sessionID) }
+func (r *Router) IsPinned(sessionID string) bool  { return r.meta.IsPinned(sessionID) }
+func (r *Router) Pin(sessionID string)            { r.meta.Pin(sessionID) }
+func (r *Router) Unpin(sessionID string)          { r.meta.Unpin(sessionID) }
+func (r *Router) Rename(sessionID, title string)  { r.meta.Rename(sessionID, title) }
+
+func (r *Router) applyCustomTitle(s *core.Session) {
+	if t := r.meta.CustomTitle(s.ID); t != "" {
+		s.Title = t
+	}
+}
 
 func (r *Router) Unarchive(sessionID string) {
 	sess, _ := r.discovery.Get(sessionID)
@@ -399,12 +410,16 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 
 	ch, err := r.senderFor(sessionID).Send(ctx, sessionID, prompt, cwd)
 	if err != nil {
+		r.markSendIdle(sessionID, tok)
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
 	asm := newStreamAssembler(r.backendOf(sessionID))
 	for ev := range ch {
+		if ev.Type == "subprocess.exit" {
+			r.markSendIdle(sessionID, tok)
+		}
 		r.publishStream(sessionID, asm, ev)
 	}
 }
@@ -541,6 +556,26 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 	delete(r.creating, sessionID) // discovery owns it once the turn hit disk
 	r.sendMu.Unlock()
 	tok.cancel()
+}
+
+// markSendIdle clears the running-state bit before publishing a terminal
+// event. The creating overlay stays in place until releaseSend, so a just-born
+// session remains addressable while the browser receives error/exit.
+func (r *Router) markSendIdle(sessionID string, tok *sendToken) {
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	cur, ok := r.activeSend[sessionID]
+	if ok && cur != tok {
+		return
+	}
+	if ok {
+		delete(r.activeSend, sessionID)
+	}
+	if sess, ok := r.creating[sessionID]; ok {
+		sess.Status = core.StatusIdle
+		sess.LastEventAt = time.Now()
+		r.creating[sessionID] = sess
+	}
 }
 
 // CancelSend stops the in-flight turn for sessionID. It both cancels usher's
@@ -804,6 +839,7 @@ func (r *Router) StartSession(cwd, initialMsg, model string) (string, error) {
 	// jsonl line, so without this the detail view 404s. Dropped in releaseSend.
 	r.creating[sessionID] = core.Session{
 		ID:          sessionID,
+		Title:       truncateRunes(initialMsg, 60),
 		Cwd:         cwd,
 		Status:      core.StatusRunning,
 		StartedAt:   now,
@@ -841,6 +877,7 @@ func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, 
 	r.activeSend[realID] = tok
 	r.creating[realID] = core.Session{
 		ID:          realID,
+		Title:       truncateRunes(initialMsg, 60),
 		Cwd:         cwd,
 		Status:      core.StatusRunning,
 		StartedAt:   now,
@@ -854,6 +891,9 @@ func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, 
 		defer r.releaseSend(realID, tok)
 		asm := newStreamAssembler(backend)
 		for ev := range ch {
+			if ev.Type == "subprocess.exit" {
+				r.markSendIdle(realID, tok)
+			}
 			r.publishStream(realID, asm, ev)
 		}
 	}()
@@ -864,12 +904,16 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model, ba
 	defer r.releaseSend(sessionID, tok)
 	ch, err := r.senderForBackend(backend).SendNew(ctx, sessionID, prompt, cwd, model)
 	if err != nil {
+		r.markSendIdle(sessionID, tok)
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
 		return
 	}
 	asm := newStreamAssembler(backend)
 	for ev := range ch {
+		if ev.Type == "subprocess.exit" {
+			r.markSendIdle(sessionID, tok)
+		}
 		r.publishStream(sessionID, asm, ev)
 	}
 }
@@ -899,6 +943,14 @@ func validateCreateInputs(cwd, initialMsg string) (string, error) {
 		return "", fmt.Errorf("cwd %q: %w", cwd, err)
 	}
 	return cwd, nil
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // CreateSession spawns a brand-new Claude Code session in cwd and waits for

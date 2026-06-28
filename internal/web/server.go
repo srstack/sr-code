@@ -223,6 +223,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
 	webMux.HandleFunc("POST /api/sessions/{id}/keys", s.handleKeys)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
+	webMux.HandleFunc("POST /api/sessions/{id}/rename", s.handleRename)
 	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/archive", s.handleUnarchive)
 	webMux.HandleFunc("POST /api/sessions/{id}/pin", s.handlePin)
@@ -600,6 +601,24 @@ func (s *Server) handlePauseSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"paused": true})
 }
 
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	title := strings.TrimSpace(req.Title)
+	s.router.Rename(id, title)
+	writeJSON(w, http.StatusOK, map[string]string{"title": title})
+}
+
 func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.router.GetSession(id); !ok {
@@ -724,6 +743,11 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	}
 	turns, total, err := s.router.ReadTurns(id, limit)
 	if errors.Is(err, router.ErrSessionNotFound) {
+		if _, ok := s.router.GetSession(id); ok {
+			w.Header().Set("X-Transcript-Total", "0")
+			writeJSON(w, http.StatusOK, []jsonl.Turn{})
+			return
+		}
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}

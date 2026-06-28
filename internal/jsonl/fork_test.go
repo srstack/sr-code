@@ -24,7 +24,7 @@ func forkFixture(t *testing.T, openTail bool) (path string, lines []string) {
 	l(`{"type":"mode","mode":"default",%s}`, sid)
 	l(`{"type":"file-history-snapshot","messageId":"m1","snapshot":{}}`) // no sessionId, like the real thing
 	l(`{"type":"user",%s,"uuid":"u1","parentUuid":null,"timestamp":"2026-06-12T00:00:01Z","cwd":"/tmp/p","message":{"role":"user","content":"first question"}}`, sid)
-	l(`{"type":"ai-title",%s,"title":"t"}`, sid)
+	l(`{"type":"ai-title",%s,"aiTitle":"t"}`, sid)
 	l(`{"type":"assistant",%s,"uuid":"a1","parentUuid":"u1","timestamp":"2026-06-12T00:00:02Z","message":{"role":"assistant","model":"opus","content":[{"type":"text","text":"first answer mentioning %s"}]}}`, sid, srcID)
 	l(`{"type":"system","subtype":"turn_duration",%s,"uuid":"s1","parentUuid":"a1","durationMs":1000}`, sid)
 	l(`{"type":"last-prompt",%s,"lastPrompt":"first question","leafUuid":"a1"}`, sid)

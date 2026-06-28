@@ -84,11 +84,11 @@ func TestReadSessionMeta_TitleFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Title == "" {
-		t.Error("expected first-prompt fallback title")
+	if meta.Title != "" {
+		t.Errorf("Title = %q, want empty (no ai-title)", meta.Title)
 	}
-	if meta.Title != "Reply with exactly: APPLE" {
-		t.Errorf("Title = %q", meta.Title)
+	if meta.Prompt != "Reply with exactly: APPLE" {
+		t.Errorf("Prompt = %q", meta.Prompt)
 	}
 }
 

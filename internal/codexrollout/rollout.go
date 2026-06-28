@@ -115,7 +115,7 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 		}
 	}
 	if firstPrompt != "" {
-		meta.Title = truncate(firstPrompt, 60)
+		meta.Prompt = truncate(firstPrompt, 60)
 	}
 	return meta, sc.Err()
 }

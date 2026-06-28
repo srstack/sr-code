@@ -155,10 +155,11 @@ func (d *Discovery) upsert(path string) {
 
 	if known {
 		existing.LastEventAt = info.ModTime()
-		// cwd/title come from jsonl content written after the file appears, so
-		// the first read can miss them; re-read while either is still empty
-		// (self-limiting once both are set — no re-parse on every later write).
-		if existing.Cwd == "" || existing.Title == "" || existing.LastInputAt.IsZero() {
+		// cwd/prompt/title land in jsonl written after the file appears; re-read
+		// while any is empty. Title is set once and never cleared, so this
+		// self-limits. Codex has no ai-title, so exclude it from the title re-read.
+		needTitle := existing.Title == "" && existing.Backend != "codex"
+		if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 			if meta, err := src.ReadMeta(path); err == nil {
 				if existing.Cwd == "" {
 					existing.Cwd = meta.Cwd
@@ -166,11 +167,12 @@ func (d *Discovery) upsert(path string) {
 				if existing.Title == "" {
 					existing.Title = meta.Title
 				}
+				if existing.Prompt == "" {
+					existing.Prompt = meta.Prompt
+				}
 				if existing.StartedAt.IsZero() {
 					existing.StartedAt = meta.StartedAt
 				}
-				// Fill input time only until the first prompt lands; after that
-				// MarkInput owns it and we never re-read content on writes.
 				if existing.LastInputAt.IsZero() {
 					existing.LastInputAt = meta.LastInputAt
 				}
@@ -191,6 +193,7 @@ func (d *Discovery) upsert(path string) {
 		ID:          id,
 		Cwd:         meta.Cwd,
 		Title:       meta.Title,
+		Prompt:      meta.Prompt,
 		Status:      core.StatusIdle,
 		StartedAt:   meta.StartedAt,
 		LastEventAt: info.ModTime(),
@@ -287,6 +290,7 @@ func (d *Discovery) List() []core.Session {
 	d.mu.RLock()
 	out := make([]core.Session, 0, len(d.sessions))
 	for _, s := range d.sessions {
+		resolveTitle(&s)
 		out = append(out, s)
 	}
 	d.mu.RUnlock()
@@ -310,7 +314,17 @@ func (d *Discovery) Get(id string) (core.Session, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	s, ok := d.sessions[id]
+	if ok {
+		resolveTitle(&s)
+	}
 	return s, ok
+}
+
+// resolveTitle fills Title from Prompt when no ai-title has been seen yet.
+func resolveTitle(s *core.Session) {
+	if s.Title == "" && s.Prompt != "" {
+		s.Title = s.Prompt
+	}
 }
 
 // Path returns the on-disk jsonl path for a session ID.
