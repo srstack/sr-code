@@ -220,6 +220,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
 	webMux.HandleFunc("GET /api/sessions/{id}/screen", s.handleScreen)
 	webMux.HandleFunc("GET /api/sessions/{id}/image", s.handleSessionImage)
+	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
 	webMux.HandleFunc("POST /api/sessions/{id}/keys", s.handleKeys)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
@@ -793,6 +794,59 @@ func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	http.ServeContent(w, r, filepath.Base(full), info.ModTime(), f)
+}
+
+const maxUploadSize = 20 << 20 // 20 MB
+
+// handleUpload accepts a multipart file upload and stores it in the session's
+// working directory. Returns the absolute path so the user can reference it
+// in a prompt for Claude to Read.
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.router.GetSession(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+		writeErr(w, http.StatusBadRequest, "file too large or invalid multipart")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "missing file field")
+		return
+	}
+	defer file.Close()
+
+	name := filepath.Base(header.Filename)
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	dst := filepath.Join(sess.Cwd, name)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(dst); err != nil {
+			break
+		}
+		name = fmt.Sprintf("%s_%d%s", base, i, ext)
+		dst = filepath.Join(sess.Cwd, name)
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create file")
+		return
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, file); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to write file")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"path": dst})
 }
 
 // sseForward is the event vocabulary the web client consumes. Raw jsonl

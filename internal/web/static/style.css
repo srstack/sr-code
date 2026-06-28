@@ -996,7 +996,11 @@ pre.raw-markdown {
  * accent send button. State shows via text color: muted off, amber when
  * auto-approve is armed, accent for the terminal mirror. */
 .auto-approve-toggle,
-.term-toggle {
+.term-toggle,
+.upload-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
   font-size: 0.78rem;
   padding: 0.25rem 0.4rem;
   border: none;
@@ -1007,13 +1011,15 @@ pre.raw-markdown {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 .auto-approve-toggle:hover,
-.term-toggle:hover { background: var(--bg-subtle); }
-.auto-approve-toggle:disabled { opacity: 0.6; cursor: progress; }
+.term-toggle:hover,
+.upload-btn:hover { background: var(--bg-subtle); }
+.auto-approve-toggle:disabled,
+.upload-btn:disabled { opacity: 0.6; cursor: progress; }
+.upload-btn { color: var(--text); }
 .auto-approve-toggle[aria-pressed="true"] { color: var(--warning-text); }
 .term-toggle[aria-pressed="true"] { color: var(--accent); }
 /* Glyph shows at every width; the full word (.t-full) is a desktop bonus,
  * dropped on phones. Always-on glyph = no breakpoint toggle, no cascade trap. */
-.t-icon { margin-right: 0.3rem; }
 @media (max-width: 720px) { .t-full { display: none; } }
 
 /* ----- Terminal mirror (read-only, inline above the input) ------------- */

@@ -298,6 +298,10 @@ export async function showDetail(id) {
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
             <div class="composer-tools">
+              <button id="upload-btn" class="upload-btn" type="button" title="upload file">
+                <span class="t-icon">+</span><span class="t-full">upload</span>
+              </button>
+              <input id="upload-input" type="file" hidden>
               <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
                 aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
                 title="ask: confirm each tool call · auto: run them automatically">
@@ -437,6 +441,40 @@ export async function showDetail(id) {
       cancelBtn.disabled = false;
     }
   });
+
+  const uploadBtn = document.getElementById('upload-btn');
+  const uploadInput = document.getElementById('upload-input');
+  if (uploadBtn && uploadInput) {
+    uploadBtn.addEventListener('click', () => uploadInput.click());
+    uploadInput.addEventListener('change', async () => {
+      const file = uploadInput.files[0];
+      if (!file) return;
+      uploadBtn.disabled = true;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/upload', {
+          method: 'POST', body: form,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          appendChatMessage({ role: 'error', content: 'upload failed: ' + (err.error || 'HTTP ' + res.status), ts: new Date().toISOString() });
+          return;
+        }
+        const { path } = await res.json();
+        const prefix = promptEl.value && !promptEl.value.endsWith('\n') ? '\n' : '';
+        promptEl.value += prefix + '[file: ' + path + '] ';
+        promptEl.focus();
+        growPrompt(promptEl);
+        appendChatMessage({ role: 'system', content: 'uploaded ' + file.name, ts: new Date().toISOString() });
+      } catch (e) {
+        appendChatMessage({ role: 'error', content: 'upload failed: ' + String(e), ts: new Date().toISOString() });
+      } finally {
+        uploadBtn.disabled = false;
+        uploadInput.value = '';
+      }
+    });
+  }
 
   evStream = openEventStream(id, chatEl, sendBtn, cancelBtn, () => termMode);
 
