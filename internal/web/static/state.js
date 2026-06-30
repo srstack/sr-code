@@ -175,7 +175,10 @@ export function fmt(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   if (isNaN(d)) return '';
-  return d.toLocaleString();
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
 }
 
 // --- teardown helpers (used by multiple views on route change) ---

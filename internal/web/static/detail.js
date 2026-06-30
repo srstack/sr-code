@@ -740,7 +740,7 @@ export async function showMainChat(id) {
   setCurrentDetailId(null);
   setCurrentDraftKey('c:' + id);
   closeES();
-  subtitle.innerHTML = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
+  subtitle.innerHTML = `<span class="subtitle-left"><strong class="session-title">Router</strong></span>`;
 
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
@@ -1083,7 +1083,7 @@ async function loadMainChatInfo(id) {
 }
 
 function renderFocus(focus) {
-  const left = `<span class="subtitle-left"><strong class="session-title">main chat</strong></span>`;
+  const left = `<span class="subtitle-left"><strong class="session-title">Router</strong></span>`;
   if (!focus || !focus.session_id) {
     subtitle.innerHTML = left;
     return;
