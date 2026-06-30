@@ -39,6 +39,13 @@ func ResolveWithinDir(dir, rel string) (string, bool) {
 	return realFull, true
 }
 
+func ResolveImagePath(cwd, rel string) (string, bool) {
+	if p, ok := ResolveWithinDir(cwd, rel); ok {
+		return p, true
+	}
+	return ResolveWithinDir("/tmp", rel)
+}
+
 func withinDir(dir, path string) bool {
 	rp, err := filepath.Rel(dir, path)
 	if err != nil {

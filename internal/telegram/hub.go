@@ -529,16 +529,15 @@ func (h *Hub) sendSilentHTML(ctx context.Context, thread int64, htmlText, plain 
 	return err
 }
 
-// mirrorImage uploads a show_image attachment (silently). The path is resolved
-// strictly inside the session cwd (pathutil), never a general file read.
+// mirrorImage uploads a show_image attachment (silently).
 func (h *Hub) mirrorImage(ctx context.Context, sessionID string, thread int64, ref string) {
 	sess, ok := h.router.GetSession(sessionID)
 	if !ok {
 		return
 	}
-	full, ok := pathutil.ResolveWithinDir(sess.Cwd, ref)
+	full, ok := pathutil.ResolveImagePath(sess.Cwd, ref)
 	if !ok {
-		h.logger.Warn("telegram: image outside session cwd", "session", sessionID, "path", ref)
+		h.logger.Warn("telegram: image outside allowed dirs", "session", sessionID, "path", ref)
 		return
 	}
 	if !imageExts[strings.ToLower(filepath.Ext(full))] {

@@ -776,11 +776,8 @@ var imageContentTypes = map[string]string{
 	".webp": "image/webp",
 }
 
-// handleSessionImage serves an image file from a session's working directory.
-// The ?path may be absolute or relative to the session cwd; it is validated to
-// resolve (after symlink evaluation) strictly inside that cwd, so this is not a
-// general file-read primitive. The content type is forced from the extension
-// and never sniffed. Auth is the surrounding cookie middleware.
+// handleSessionImage serves an image file from a session's working directory or
+// /tmp. Auth is the surrounding cookie middleware.
 func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, ok := s.router.GetSession(id)
@@ -798,7 +795,7 @@ func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "not a supported image type")
 		return
 	}
-	full, ok := pathutil.ResolveWithinDir(sess.Cwd, rel)
+	full, ok := pathutil.ResolveImagePath(sess.Cwd, rel)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "image not found")
 		return
