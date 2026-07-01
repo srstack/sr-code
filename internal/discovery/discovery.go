@@ -272,9 +272,22 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 			return
 		}
 		if info.IsDir() {
-			if err := d.watcher.Add(ev.Name); err != nil {
-				d.logger.Warn("watch new subdir", "path", ev.Name, "err", err)
-			}
+			// Walk the new tree: MkdirAll may have created nested dirs
+			// (e.g. 2026/07/01/) before fsnotify delivered this event,
+			// so we must watch subdirs and ingest files that already exist.
+			_ = filepath.Walk(ev.Name, func(path string, fi os.FileInfo, err error) error {
+				if err != nil {
+					return nil
+				}
+				if fi.IsDir() {
+					if err := d.watcher.Add(path); err != nil {
+						d.logger.Warn("watch new subdir", "path", path, "err", err)
+					}
+				} else {
+					d.upsert(path)
+				}
+				return nil
+			})
 			return
 		}
 		d.upsert(ev.Name) // upsert resolves the owning source, no-ops if none

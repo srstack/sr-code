@@ -294,6 +294,42 @@ func TestDiscovery_RereadsMetaWhenInitiallyEmpty(t *testing.T) {
 	}
 }
 
+// TestDiscovery_WatchPicksUpNestedMkdirAll covers the case where a backend
+// creates deeply nested directories in one shot (MkdirAll) and writes a session
+// file before fsnotify has delivered the intermediate directory Create events.
+// This is the exact scenario for Codex on the first day of a new month:
+// the watcher knows about <root>/2026/ but 07/01/ doesn't exist yet, and
+// MkdirAll + WriteFile can land before the 07/ Create event is processed.
+func TestDiscovery_WatchPicksUpNestedMkdirAll(t *testing.T) {
+	tmp := t.TempDir()
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)), NewCodexSource(tmp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate Codex creating a brand-new month directory and writing a session
+	// in one shot, as MkdirAll + WriteFile would.
+	roll := filepath.Join(tmp, "2026", "07", "01",
+		"rollout-2026-07-01T00-00-00-"+codexUUID+".jsonl")
+	writeFile(t, roll, codexRollout)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := d.Get(codexUUID); ok {
+			return // success
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("codex session in new month dir not discovered; list=%v", d.List())
+}
+
 func TestDiscovery_ListSorted(t *testing.T) {
 	tmp := t.TempDir()
 	older := filepath.Join(tmp, "-p", "older.jsonl")
