@@ -73,6 +73,69 @@ func (f *fakeAPI) ReadSessionTranscript(id string, limit int) ([]core.Transcript
 	}
 	return turns, nil
 }
+func (f *fakeAPI) ReadSessionTranscriptPage(id string, offset, limit int) ([]core.TranscriptTurn, int, int, error) {
+	turns, ok := f.transcripts[id]
+	if !ok {
+		return nil, 0, 0, fmt.Errorf("no transcript for %q", id)
+	}
+	total := len(turns)
+	if limit <= 0 {
+		limit = 1
+	}
+	start := offset
+	if start < 0 {
+		start = total - limit
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	return turns[start:end], start, total, nil
+}
+func (f *fakeAPI) SearchSessionTranscript(id, query string, maxHits, _ int) ([]core.TranscriptSearchHit, bool, error) {
+	turns, ok := f.transcripts[id]
+	if !ok {
+		return nil, false, fmt.Errorf("no transcript for %q", id)
+	}
+	var hits []core.TranscriptSearchHit
+	matched := 0
+	for i, t := range turns {
+		if !strings.Contains(strings.ToLower(t.Content), strings.ToLower(query)) {
+			continue
+		}
+		matched++
+		if len(hits) >= maxHits {
+			continue
+		}
+		hits = append(hits, core.TranscriptSearchHit{Role: t.Role, Time: t.Time, TurnIndex: i, Occurrences: 1, Snippet: t.Content})
+	}
+	return hits, matched > len(hits), nil
+}
+func (f *fakeAPI) SearchAllSessions(query string, maxSessions, _ int) ([]core.SessionSearchResult, bool, error) {
+	var out []core.SessionSearchResult
+	for _, s := range f.sessions {
+		count := 0
+		for _, t := range f.transcripts[s.ID] {
+			if strings.Contains(strings.ToLower(t.Content), strings.ToLower(query)) {
+				count++
+			}
+		}
+		if count > 0 {
+			out = append(out, core.SessionSearchResult{SessionID: s.ID, Title: s.Title, Cwd: s.Cwd, HitCount: count})
+		}
+	}
+	truncated := false
+	if maxSessions > 0 && len(out) > maxSessions {
+		out, truncated = out[:maxSessions], true
+	}
+	return out, truncated, nil
+}
 func (f *fakeAPI) SendToSessionAndWait(_ context.Context, id, text string, _ time.Duration) (string, error) {
 	f.waitedFor = append(f.waitedFor, id)
 	_ = text

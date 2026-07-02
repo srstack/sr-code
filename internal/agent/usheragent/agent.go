@@ -38,6 +38,29 @@ type AgentAPI interface {
 	// pass a sane default (the LLM agent uses 20 with a 200 ceiling).
 	ReadSessionTranscript(id string, limit int) ([]core.TranscriptTurn, error)
 
+	// ReadSessionTranscriptPage returns one page of the transcript: up to
+	// limit turns starting at absolute index offset (negative offset = the
+	// most recent page), plus the resolved start offset and the total turn
+	// count. This is how a caller pages past ReadSessionTranscript's last-N
+	// window to reach a deep search hit — no hard depth wall, just page size.
+	ReadSessionTranscriptPage(id string, offset, limit int) ([]core.TranscriptTurn, int, int, error)
+
+	// SearchSessionTranscript scans the entire transcript for a
+	// case-insensitive substring of query in the user/assistant text and
+	// returns at most maxHits matching turns, each with a bounded snippet of
+	// contextChars runes of context on either side of the first occurrence.
+	// The bool reports whether more turns matched than were returned. This is
+	// the locate primitive that avoids read_session_transcript's fixed window
+	// truncating away the match.
+	SearchSessionTranscript(id, query string, maxHits, contextChars int) ([]core.TranscriptSearchHit, bool, error)
+
+	// SearchAllSessions runs the same substring search across every session
+	// and returns one compact result per matching session (hit count + a
+	// snippet at the first hit), ranked by hit count. The bool reports whether
+	// more sessions matched than maxSessions returned. This is the "which
+	// session mentioned X?" primitive — one call instead of per-session fan-out.
+	SearchAllSessions(query string, maxSessions, contextChars int) ([]core.SessionSearchResult, bool, error)
+
 	// SendToSessionAndWait spawns the same fire-and-forget claude subprocess
 	// as SendToSession but blocks until the assistant turn completes (or
 	// timeout/ctx cancel), returning the accumulated assistant text.
@@ -85,9 +108,11 @@ const strictModeAddendum = `
 
 ## Strict mode (small-model enforcement)
 
-Every user message ends with a <current_state> block listing all sessions
-(full id, cwd, status, title) and the current focus with cwd + title.
-This block is the ground truth.
+Every user message ends with a <current_state> block: the current time
+(now), all sessions (full id, cwd, status, last_active, title), and the
+current focus with cwd + title. This block is the ground truth. last_active
+is how long ago the user last talked to that session, already computed
+against now — read recency straight off it, never do timestamp math.
 
 ### Your role: router, not assistant
 
@@ -109,7 +134,8 @@ not for answering the user yourself.
 
 You only answer locally when ALL of the following hold:
 - The question is trivia readable from <current_state> (count / cwd /
-  title / status / focus / pending count), OR
+  title / status / focus / pending count / current time / how recently a
+  session was active), OR
 - It is a meta question about usher itself ("what tools do you have?",
   "/help"), OR
 - It is a routing decision ("which session is best for X?"), OR
@@ -117,9 +143,9 @@ You only answer locally when ALL of the following hold:
 
 ### Grounding rules
 
-- Trivia (count / cwd / title / status / focus) → answer straight from
-  <current_state>. Do NOT call list_sessions; the answer is already in
-  the message.
+- Trivia (count / cwd / title / status / focus / current time /
+  last_active recency) → answer straight from <current_state>. Do NOT
+  call list_sessions; the answer is already in the message.
 - Never narrate a tool outcome you did not invoke this turn. If you
   say "I created session X", "I sent your message to Y", "I switched
   to Z", "I read the transcript of W", the corresponding tool

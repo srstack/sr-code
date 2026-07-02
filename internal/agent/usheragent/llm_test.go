@@ -98,6 +98,75 @@ func (f *fakeAgentAPI) ReadSessionTranscript(id string, limit int) ([]core.Trans
 	}
 	return turns, nil
 }
+func (f *fakeAgentAPI) ReadSessionTranscriptPage(id string, offset, limit int) ([]core.TranscriptTurn, int, int, error) {
+	turns, ok := f.transcripts[id]
+	if !ok {
+		return nil, 0, 0, errors.New("session not found")
+	}
+	total := len(turns)
+	if limit <= 0 {
+		limit = 1
+	}
+	start := offset
+	if start < 0 {
+		start = total - limit
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	return turns[start:end], start, total, nil
+}
+func (f *fakeAgentAPI) SearchSessionTranscript(id, query string, maxHits, _ int) ([]core.TranscriptSearchHit, bool, error) {
+	turns, ok := f.transcripts[id]
+	if !ok {
+		return nil, false, errors.New("session not found")
+	}
+	var hits []core.TranscriptSearchHit
+	matched := 0
+	for i, t := range turns {
+		if !strings.Contains(strings.ToLower(t.Content), strings.ToLower(query)) {
+			continue
+		}
+		matched++
+		if len(hits) >= maxHits {
+			continue
+		}
+		hits = append(hits, core.TranscriptSearchHit{Role: t.Role, Time: t.Time, TurnIndex: i, Occurrences: 1, Snippet: t.Content})
+	}
+	return hits, matched > len(hits), nil
+}
+func (f *fakeAgentAPI) SearchAllSessions(query string, maxSessions, _ int) ([]core.SessionSearchResult, bool, error) {
+	var out []core.SessionSearchResult
+	for _, s := range f.sessions {
+		turns := f.transcripts[s.ID]
+		count := 0
+		firstIdx, firstSnip := 0, ""
+		for i, t := range turns {
+			if strings.Contains(strings.ToLower(t.Content), strings.ToLower(query)) {
+				if count == 0 {
+					firstIdx, firstSnip = i, t.Content
+				}
+				count++
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		out = append(out, core.SessionSearchResult{SessionID: s.ID, Title: s.Title, Cwd: s.Cwd, HitCount: count, TurnIndex: firstIdx, Snippet: firstSnip})
+	}
+	truncated := false
+	if maxSessions > 0 && len(out) > maxSessions {
+		out, truncated = out[:maxSessions], true
+	}
+	return out, truncated, nil
+}
 func (f *fakeAgentAPI) SendToSessionAndWait(_ context.Context, id, text string, _ time.Duration) (string, error) {
 	f.waitedFor = append(f.waitedFor, sendCall{id, text})
 	if err, ok := f.waitErrs[id]; ok && err != nil {

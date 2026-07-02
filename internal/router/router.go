@@ -18,15 +18,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/nexustar/usher/internal/broker"
-	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/jsonl"
 	"github.com/nexustar/usher/internal/sender"
+	"github.com/nexustar/usher/internal/sessionmeta"
 )
 
 // ErrSessionNotFound is returned when an operation targets a session with no
@@ -282,11 +283,11 @@ func (r *Router) IsArchived(sessionID string) bool {
 	return r.meta.IsArchived(sessionID, staleClock(sess), time.Now())
 }
 
-func (r *Router) Archive(sessionID string)        { r.meta.Archive(sessionID) }
-func (r *Router) IsPinned(sessionID string) bool  { return r.meta.IsPinned(sessionID) }
-func (r *Router) Pin(sessionID string)            { r.meta.Pin(sessionID) }
-func (r *Router) Unpin(sessionID string)          { r.meta.Unpin(sessionID) }
-func (r *Router) Rename(sessionID, title string)  { r.meta.Rename(sessionID, title) }
+func (r *Router) Archive(sessionID string)       { r.meta.Archive(sessionID) }
+func (r *Router) IsPinned(sessionID string) bool { return r.meta.IsPinned(sessionID) }
+func (r *Router) Pin(sessionID string)           { r.meta.Pin(sessionID) }
+func (r *Router) Unpin(sessionID string)         { r.meta.Unpin(sessionID) }
+func (r *Router) Rename(sessionID, title string) { r.meta.Rename(sessionID, title) }
 
 func (r *Router) applyCustomTitle(s *core.Session) {
 	if t := r.meta.CustomTitle(s.ID); t != "" {
@@ -720,9 +721,258 @@ func (r *Router) ReadSessionTranscript(id string, limit int) ([]core.TranscriptT
 	}
 	out := make([]core.TranscriptTurn, len(turns))
 	for i, t := range turns {
-		out[i] = core.TranscriptTurn{Role: t.Role, Content: t.Content, Time: t.Time}
+		out[i] = core.TranscriptTurn{Role: t.Role, Content: flattenTurnText(t, true), Time: t.Time}
 	}
 	return out, nil
+}
+
+// ReadSessionTranscriptPage returns one page of the transcript: up to limit
+// turns starting at absolute index offset (0-based from the start of the
+// session). A negative offset means "the most recent page". It also returns
+// the resolved start offset and the total turn count, so a caller can page in
+// either direction and know when it has reached an end. Because the jsonl is
+// append-only, an absolute index is a stable cursor even as the session grows.
+//
+// This is the primitive behind read_session_transcript's paging: the per-call
+// limit bounds how much enters the agent's context, while offset + total keep
+// any depth reachable — there is no hard wall, only a page boundary.
+func (r *Router) ReadSessionTranscriptPage(id string, offset, limit int) ([]core.TranscriptTurn, int, int, error) {
+	path, ok := r.discovery.Path(id)
+	if !ok {
+		return nil, 0, 0, ErrSessionNotFound
+	}
+	turns, _, err := readTurnsForBackend(path, r.backendOf(id), 0)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	total := len(turns)
+	start, end := pageBounds(offset, limit, total)
+	out := make([]core.TranscriptTurn, end-start)
+	for i := start; i < end; i++ {
+		t := turns[i]
+		out[i-start] = core.TranscriptTurn{Role: t.Role, Content: flattenTurnText(t, true), Time: t.Time}
+	}
+	return out, start, total, nil
+}
+
+// pageBounds resolves [start, end) into a slice of length total for a page of
+// up to limit items beginning at offset. A negative offset selects the last
+// page (start = total-limit). Everything is clamped to [0, total], so an
+// offset past the end yields an empty page rather than a panic.
+func pageBounds(offset, limit, total int) (start, end int) {
+	if limit <= 0 {
+		limit = 1
+	}
+	start = offset
+	if start < 0 {
+		start = total - limit
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end = start + limit
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+// flattenTurnText renders a jsonl.Turn to plain text. User turns carry their
+// text in Content; assistant turns carry it in Parts (text blocks interleaved
+// with tool annotations). When includeTools is set, tool parts are inlined as
+// `[tool: Name target]` markers — matching what read_session_transcript
+// advertises. Search passes includeTools=false so it only matches the
+// user/assistant prose, not tool names or command/file targets.
+func flattenTurnText(t jsonl.Turn, includeTools bool) string {
+	if t.Role != "assistant" {
+		return t.Content
+	}
+	var b strings.Builder
+	for _, p := range t.Parts {
+		switch p.Type {
+		case "text":
+			if p.Content == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(p.Content)
+		case "tool":
+			if !includeTools {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString("[tool: ")
+			b.WriteString(p.ToolName)
+			if p.ToolTarget != "" {
+				b.WriteString(" ")
+				b.WriteString(p.ToolTarget)
+			}
+			b.WriteString("]")
+		}
+	}
+	return b.String()
+}
+
+// SearchSessionTranscript scans the whole transcript for a case-insensitive
+// substring of query in the user/assistant text (tool annotations excluded),
+// returning at most maxHits matching turns with a bounded snippet around each
+// first occurrence. The bool reports whether more turns matched than were
+// returned. limit-style truncation of read_session_transcript is exactly what
+// this avoids: it looks at every turn but returns only small located snippets.
+func (r *Router) SearchSessionTranscript(id, query string, maxHits, contextChars int) ([]core.TranscriptSearchHit, bool, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, false, errors.New("query is required")
+	}
+	path, ok := r.discovery.Path(id)
+	if !ok {
+		return nil, false, ErrSessionNotFound
+	}
+	turns, _, err := readTurnsForBackend(path, r.backendOf(id), 0)
+	if err != nil {
+		return nil, false, err
+	}
+	hits, matched := scanTurnsForQuery(turns, []rune(query), maxHits, contextChars)
+	return hits, matched > len(hits), nil
+}
+
+// SearchAllSessions runs the same substring search across every discovered
+// session and returns one compact result per session that has a match: its
+// total hit count and a snippet at the first hit. It is the routing primitive
+// for "which session mentioned X?" — the alternative, calling
+// SearchSessionTranscript per session, costs a tool round-trip each. Sessions
+// are ranked by hit count (most matches first); the bool reports whether more
+// matched than maxSessions returned. Every session's jsonl is read once, so
+// this is heavier than a single-session search — meant for user-driven lookup.
+func (r *Router) SearchAllSessions(query string, maxSessions, contextChars int) ([]core.SessionSearchResult, bool, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, false, errors.New("query is required")
+	}
+	q := []rune(query)
+	var results []core.SessionSearchResult
+	for _, s := range r.ListSessions() {
+		path, ok := r.discovery.Path(s.ID)
+		if !ok {
+			continue
+		}
+		turns, _, err := readTurnsForBackend(path, r.backendOf(s.ID), 0)
+		if err != nil {
+			continue
+		}
+		hits, matched := scanTurnsForQuery(turns, q, 1, contextChars)
+		if matched == 0 {
+			continue
+		}
+		res := core.SessionSearchResult{
+			SessionID: s.ID,
+			Title:     s.Title,
+			Cwd:       s.Cwd,
+			HitCount:  matched,
+		}
+		if len(hits) > 0 {
+			res.TurnIndex = hits[0].TurnIndex
+			res.Snippet = hits[0].Snippet
+		}
+		results = append(results, res)
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].HitCount > results[j].HitCount
+	})
+	truncated := false
+	if maxSessions > 0 && len(results) > maxSessions {
+		results = results[:maxSessions]
+		truncated = true
+	}
+	return results, truncated, nil
+}
+
+// scanTurnsForQuery scans decoded turns for a case-insensitive substring of q
+// in the user/assistant prose (tool annotations excluded), returning up to
+// maxHits located snippets and the total count of matching turns. Shared by
+// the single-session and cross-session searches.
+func scanTurnsForQuery(turns []jsonl.Turn, q []rune, maxHits, contextChars int) (hits []core.TranscriptSearchHit, matched int) {
+	for i, t := range turns {
+		text := []rune(flattenTurnText(t, false))
+		first, count := foldFindAll(text, q)
+		if first < 0 {
+			continue
+		}
+		matched++
+		if len(hits) >= maxHits {
+			continue
+		}
+		hits = append(hits, core.TranscriptSearchHit{
+			Role:        t.Role,
+			Time:        t.Time,
+			TurnIndex:   i,
+			Occurrences: count,
+			Snippet:     snippetAround(text, first, len(q), contextChars),
+		})
+	}
+	return hits, matched
+}
+
+// foldFindAll returns the index of the first case-insensitive occurrence of
+// needle in hay (rune slices) and the total non-overlapping occurrence count.
+// Rune-based to stay correct with multibyte (e.g. CJK) content, where mixing
+// byte offsets from strings.ToLower would risk splitting a character.
+func foldFindAll(hay, needle []rune) (first, count int) {
+	first = -1
+	if len(needle) == 0 {
+		return -1, 0
+	}
+	for i := 0; i+len(needle) <= len(hay); {
+		if foldEqualAt(hay, needle, i) {
+			if first < 0 {
+				first = i
+			}
+			count++
+			i += len(needle)
+		} else {
+			i++
+		}
+	}
+	return first, count
+}
+
+func foldEqualAt(hay, needle []rune, at int) bool {
+	for j := range needle {
+		if unicode.ToLower(hay[at+j]) != unicode.ToLower(needle[j]) {
+			return false
+		}
+	}
+	return true
+}
+
+// snippetAround returns matchLen runes at start plus up to ctx runes of
+// context on each side, with ellipses marking truncation and newlines
+// collapsed to spaces so the result stays a single compact line.
+func snippetAround(text []rune, start, matchLen, ctx int) string {
+	if ctx < 0 {
+		ctx = 0
+	}
+	lo := start - ctx
+	if lo < 0 {
+		lo = 0
+	}
+	hi := start + matchLen + ctx
+	if hi > len(text) {
+		hi = len(text)
+	}
+	snip := strings.ReplaceAll(string(text[lo:hi]), "\n", " ")
+	if lo > 0 {
+		snip = "…" + snip
+	}
+	if hi < len(text) {
+		snip = snip + "…"
+	}
+	return snip
 }
 
 // SendToSessionAndWait spawns the same fire-and-forget send as

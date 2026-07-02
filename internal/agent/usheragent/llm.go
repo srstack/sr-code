@@ -67,12 +67,18 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 }
 
 const (
-	defaultWaitTimeout   = 300 * time.Second  // 5 min — covers most non-coding turns
-	maxWaitTimeout       = 1800 * time.Second // 30 min — hard ceiling
-	defaultReadTurns     = 20
-	maxReadTurns         = 200
-	defaultCreateTimeout = 300 * time.Second // 5 min — initial-message turn
-	maxCreateTimeout     = 900 * time.Second // 15 min — hard ceiling
+	defaultWaitTimeout    = 300 * time.Second  // 5 min — covers most non-coding turns
+	maxWaitTimeout        = 1800 * time.Second // 30 min — hard ceiling
+	defaultReadTurns      = 20
+	maxReadTurns          = 200
+	defaultSearchHits     = 20
+	maxSearchHits         = 100
+	defaultSearchContext  = 120
+	maxSearchContext      = 500
+	defaultSearchSessions = 20
+	maxSearchSessions     = 50
+	defaultCreateTimeout  = 300 * time.Second // 5 min — initial-message turn
+	maxCreateTimeout      = 900 * time.Second // 15 min — hard ceiling
 )
 
 // Handle drives the tool-call loop until the model returns finish_reason="stop"
@@ -204,6 +210,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		var args struct {
 			SessionID string `json:"session_id"`
 			Limit     int    `json:"limit"`
+			Offset    *int   `json:"offset"`
 		}
 		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
 			return errResult("invalid arguments: " + err.Error()), ""
@@ -218,12 +225,91 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		if limit > maxReadTurns {
 			limit = maxReadTurns
 		}
-		turns, err := a.api.ReadSessionTranscript(args.SessionID, limit)
+		// Negative offset (or omitted) = most recent page; a caller pages older
+		// turns with offset = returned offset - limit, using total to stop.
+		offset := -1
+		if args.Offset != nil {
+			offset = *args.Offset
+		}
+		turns, start, total, err := a.api.ReadSessionTranscriptPage(args.SessionID, offset, limit)
 		if err != nil {
 			return errResult(err.Error()), ""
 		}
-		b, _ := json.Marshal(turns)
-		return string(b), args.SessionID
+		payload, _ := json.Marshal(map[string]any{
+			"turns":    turns,
+			"offset":   start,
+			"total":    total,
+			"has_more": start+len(turns) < total,
+		})
+		return string(payload), args.SessionID
+
+	case "search_session_transcript":
+		var args struct {
+			SessionID    string `json:"session_id"`
+			Query        string `json:"query"`
+			MaxHits      int    `json:"max_hits"`
+			ContextChars int    `json:"context_chars"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" || strings.TrimSpace(args.Query) == "" {
+			return errResult("session_id and query are required"), ""
+		}
+		maxHits := args.MaxHits
+		if maxHits <= 0 {
+			maxHits = defaultSearchHits
+		}
+		if maxHits > maxSearchHits {
+			maxHits = maxSearchHits
+		}
+		ctxChars := args.ContextChars
+		if ctxChars <= 0 {
+			ctxChars = defaultSearchContext
+		}
+		if ctxChars > maxSearchContext {
+			ctxChars = maxSearchContext
+		}
+		hits, truncated, err := a.api.SearchSessionTranscript(args.SessionID, args.Query, maxHits, ctxChars)
+		if err != nil {
+			return errResult(err.Error()), ""
+		}
+		payload, _ := json.Marshal(map[string]any{"hits": hits, "truncated": truncated})
+		return string(payload), args.SessionID
+
+	case "search_all_sessions":
+		var args struct {
+			Query        string `json:"query"`
+			MaxSessions  int    `json:"max_sessions"`
+			ContextChars int    `json:"context_chars"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if strings.TrimSpace(args.Query) == "" {
+			return errResult("query is required"), ""
+		}
+		maxSessions := args.MaxSessions
+		if maxSessions <= 0 {
+			maxSessions = defaultSearchSessions
+		}
+		if maxSessions > maxSearchSessions {
+			maxSessions = maxSearchSessions
+		}
+		ctxChars := args.ContextChars
+		if ctxChars <= 0 {
+			ctxChars = defaultSearchContext
+		}
+		if ctxChars > maxSearchContext {
+			ctxChars = maxSearchContext
+		}
+		results, truncated, err := a.api.SearchAllSessions(args.Query, maxSessions, ctxChars)
+		if err != nil {
+			return errResult(err.Error()), ""
+		}
+		payload, _ := json.Marshal(map[string]any{"results": results, "truncated": truncated})
+		// Cross-session search doesn't target one session, so it sets no focus.
+		return string(payload), ""
 
 	case "create_session":
 		var args struct {
@@ -467,18 +553,66 @@ DO NOT USE FOR: tasks obviously > 30 min (deploys, full builds). Use send_to_ses
 			Type: "function",
 			Function: ChatFunction{
 				Name: "read_session_transcript",
-				Description: `Read recent user/assistant turns from a session's transcript. Tool uses inside the session are inlined as ` + "`tool: Name`" + ` annotations. Returns [{role, content, ts}, ...].
+				Description: `Read one page of user/assistant turns from a session's transcript. Tool uses inside the session are inlined as ` + "`tool: Name`" + ` annotations. Returns {turns: [{role, content, ts}, ...], offset, total, has_more} — offset is the absolute index of the first turn returned, total the whole transcript's turn count.
 
 USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives.
+
+PAGING: with no offset you get the most recent ` + "`limit`" + ` turns. total tells you how many exist; if has_more is true there are older turns you haven't seen. To reach a specific spot — e.g. a turn_index from search_session_transcript, or the page before this one — pass offset (absolute, 0-based from the start). There is no depth limit; limit only bounds one page.
 
 DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For "switch to session X" prefer send_and_wait_for_response so a visible action confirms the switch.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"session_id": map[string]any{"type": "string"},
-						"limit":      map[string]any{"type": "integer", "description": "Optional. Default 20, max 200."},
+						"limit":      map[string]any{"type": "integer", "description": "Optional. Page size (turns per call). Default 20, max 200."},
+						"offset":     map[string]any{"type": "integer", "description": "Optional. Absolute 0-based index of the first turn to return. Omit for the most recent page. Use a turn_index from search_session_transcript to jump to a hit."},
 					},
 					"required":             []string{"session_id"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name: "search_session_transcript",
+				Description: `Find where a string appears in a session's transcript WITHOUT reading the whole thing. Scans every user/assistant turn (not just the recent window) and returns only the matching turns as [{role, ts, turn_index, occurrences, snippet}, ...] plus a "truncated" flag. Case-insensitive literal substring — not regex.
+
+USE FOR: locating something specific in a long session — "did session X mention the migration?", "where did we discuss the timeout bug?", "find the commit hash Y talked about". Use this INSTEAD of read_session_transcript when the answer could be buried past the last 20 turns.
+
+THEN: to see the full context around a hit, call read_session_transcript with offset=<turn_index> (jumps to that turn at any depth), or send_and_wait_for_response to ask the session directly.
+
+DO NOT USE FOR: reading the latest activity (use read_session_transcript) or matching tool/command/file names — search covers prose only, not tool annotations.`,
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"session_id":    map[string]any{"type": "string"},
+						"query":         map[string]any{"type": "string", "description": "Literal substring to find (case-insensitive)."},
+						"max_hits":      map[string]any{"type": "integer", "description": "Optional. Max matching turns to return. Default 20, max 100."},
+						"context_chars": map[string]any{"type": "integer", "description": "Optional. Characters of context on each side of the match. Default 120, max 500."},
+					},
+					"required":             []string{"session_id", "query"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name: "search_all_sessions",
+				Description: `Search EVERY session at once for a string — the way to answer "which session mentioned X?" without knowing the id. Returns one row per matching session: {results: [{session_id, title, cwd, hit_count, turn_index, snippet}, ...], truncated}, ranked by hit_count (most matches first). Case-insensitive literal substring over user/assistant prose.
+
+USE FOR: locating the right session when you don't have its id — "which session was about the auth migration?", "who touched the deploy script?", "find the session discussing timeouts". Then route to the winner with send_and_wait_for_response, or drill in with read_session_transcript (offset=turn_index) / search_session_transcript on that one id.
+
+DO NOT USE FOR: searching inside a session you already identified (use search_session_transcript with its id) or matching tool/command/file names — search covers prose only.`,
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query":         map[string]any{"type": "string", "description": "Literal substring to find (case-insensitive)."},
+						"max_sessions":  map[string]any{"type": "integer", "description": "Optional. Max matching sessions to return. Default 20, max 50."},
+						"context_chars": map[string]any{"type": "integer", "description": "Optional. Characters of context on each side of the match snippet. Default 120, max 500."},
+					},
+					"required":             []string{"query"},
 					"additionalProperties": false,
 				},
 			},

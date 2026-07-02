@@ -49,3 +49,29 @@ type TranscriptTurn struct {
 	Content string    `json:"content"`
 	Time    time.Time `json:"ts"`
 }
+
+// TranscriptSearchHit is one matching turn from a transcript substring search.
+// TurnIndex is the 0-based position of the turn within the full transcript
+// (newest last), letting a caller locate the surrounding context with a
+// follow-up read. Snippet is the matched text with limited context on either
+// side of the first occurrence; Occurrences counts all matches in that turn.
+type TranscriptSearchHit struct {
+	Role        string    `json:"role"`
+	Time        time.Time `json:"ts"`
+	TurnIndex   int       `json:"turn_index"`
+	Occurrences int       `json:"occurrences"`
+	Snippet     string    `json:"snippet"`
+}
+
+// SessionSearchResult is one session's summary from a cross-session search:
+// how many turns matched and a snippet at the first hit, enough to decide
+// which session to open or route to. TurnIndex locates the first hit for a
+// follow-up read_session_transcript.
+type SessionSearchResult struct {
+	SessionID string `json:"session_id"`
+	Title     string `json:"title"`
+	Cwd       string `json:"cwd"`
+	HitCount  int    `json:"hit_count"`
+	TurnIndex int    `json:"turn_index"`
+	Snippet   string `json:"snippet"`
+}
