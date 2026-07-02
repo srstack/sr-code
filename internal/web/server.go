@@ -1178,8 +1178,11 @@ func (s *Server) renderStateBlock(focusID string) string {
 	sessions := s.router.ListSessions()
 	pending := s.router.ListPendingInteractions()
 
+	now := time.Now().UTC()
+
 	var b strings.Builder
 	b.WriteString("<current_state>\n")
+	fmt.Fprintf(&b, "now: %s\n", now.Format(time.RFC3339))
 	fmt.Fprintf(&b, "session_count: %d\n", len(sessions))
 	fmt.Fprintf(&b, "pending_permission_requests: %d\n", len(pending))
 	if focusID != "" {
@@ -1202,10 +1205,11 @@ func (s *Server) renderStateBlock(focusID string) string {
 		if sess.ID == focusID {
 			mark = "  [FOCUS]"
 		}
-		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %s%s\n",
+		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %-9s  %s%s\n",
 			sess.ID,
 			truncateRunes(sess.Cwd, 30),
 			string(sess.Status),
+			humanizeAge(now, sess.LastInputAt),
 			truncateRunes(sess.Title, 50),
 			mark)
 	}
@@ -1214,6 +1218,28 @@ func (s *Server) renderStateBlock(focusID string) string {
 	}
 	b.WriteString("</current_state>")
 	return b.String()
+}
+
+// humanizeAge renders how long ago last happened relative to now as a compact
+// phrase ("just now", "5m ago", "3h ago", "2d ago") for the state block, so
+// the router can reason about recency (e.g. picking the most recently active
+// session) without doing timestamp math on a small model. A zero or future
+// last reads as "just now".
+func humanizeAge(now, last time.Time) string {
+	if last.IsZero() {
+		return "unknown"
+	}
+	d := now.Sub(last)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours())/24)
+	}
 }
 
 func truncateRunes(s string, n int) string {

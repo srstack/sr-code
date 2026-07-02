@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFocusSwitchBanner(t *testing.T) {
@@ -169,5 +170,25 @@ func TestCodexModels(t *testing.T) {
 	got = (&Server{codexModelsPath: p}).codexModels()
 	if len(got) != 2 || got[0].Value != "gpt-5.4-mini" || got[1].Value != "gpt-5.5" {
 		t.Fatalf("catalog parse/sort = %v (want mini then 5.5, hide excluded)", got)
+	}
+}
+
+func TestHumanizeAge(t *testing.T) {
+	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		last time.Time
+		want string
+	}{
+		{time.Time{}, "unknown"},                 // zero → unknown
+		{now.Add(-10 * time.Second), "just now"}, // <1m
+		{now.Add(-5 * time.Minute), "5m ago"},    // minutes
+		{now.Add(-3 * time.Hour), "3h ago"},      // hours
+		{now.Add(-50 * time.Hour), "2d ago"},     // days (floored)
+		{now.Add(10 * time.Second), "just now"},  // future/skew
+	}
+	for _, c := range cases {
+		if got := humanizeAge(now, c.last); got != c.want {
+			t.Errorf("humanizeAge(now, %v) = %q, want %q", c.last, got, c.want)
+		}
 	}
 }
