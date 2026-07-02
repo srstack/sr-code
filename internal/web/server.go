@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
@@ -74,6 +75,34 @@ type Server struct {
 	// (cache refetch) shows up without restarting usher.
 	codexModelsPath string
 	uiDir           string
+
+	// Main-chat delivery. The user message is persisted in the POST handler
+	// (202 means durable); the agent turn then runs on the chat's single
+	// worker goroutine, fed by a bounded FIFO queue. Everything the chat
+	// displays reaches clients through the per-chat SSE stream; chatSubs
+	// maps each subscriber channel to its cancel so a slow subscriber is
+	// force-closed rather than silently dropped (reconnect + refetch is the
+	// only gap-healing path).
+	chatMu      sync.Mutex
+	chatSubs    map[string]map[chan chatFrame]func()
+	chatQueues  map[string]chan mainchat.Message
+	chatPending map[string]int // reserved turn-queue slots (see tryReserveTurn)
+}
+
+// chatFrame is one SSE frame on /api/mainchats/{id}/events. Event is the SSE
+// event name: "message" (Data carries a persisted message + optional focus)
+// or "turn.done" (an agent turn finished — even one that displayed nothing —
+// so the client can clear its thinking placeholder; Data is zero).
+type chatFrame struct {
+	Event string
+	Data  chatEvent
+}
+
+// chatEvent is the "message" frame payload: a persisted message, plus the
+// resolved focus when this message moved it.
+type chatEvent struct {
+	Message mainchat.Message `json:"message"`
+	Focus   *focusDetail     `json:"focus,omitempty"`
 }
 
 func NewServer(
@@ -102,6 +131,9 @@ func NewServer(
 		logger:          logger,
 		codexModelsPath: codexModelsPath,
 		uiDir:           uiDir,
+		chatSubs:        map[string]map[chan chatFrame]func(){},
+		chatQueues:      map[string]chan mainchat.Message{},
+		chatPending:     map[string]int{},
 	}
 }
 
@@ -232,6 +264,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/mainchats", s.handleListMainChats)
 	webMux.HandleFunc("GET /api/mainchats/{id}", s.handleGetMainChat)
 	webMux.HandleFunc("GET /api/mainchats/{id}/messages", s.handleListMainChatMessages)
+	webMux.HandleFunc("GET /api/mainchats/{id}/events", s.handleMainChatEvents)
 	webMux.HandleFunc("POST /api/mainchats/{id}/send", s.handleMainChatSend)
 
 	webMux.HandleFunc("GET /api/interactions", s.handleListInteractions)
@@ -1146,11 +1179,6 @@ func (s *Server) handleListMainChatMessages(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, msgs)
 }
 
-type mainChatSendResponse struct {
-	Messages []mainchat.Message `json:"messages"`
-	Focus    *focusDetail       `json:"focus,omitempty"`
-}
-
 type focusDetail struct {
 	SessionID string `json:"session_id"`
 	Cwd       string `json:"cwd,omitempty"`
@@ -1294,16 +1322,25 @@ func (s *Server) lastFocus(msgs []mainchat.Message) *focusDetail {
 		if msgs[i].FocusSession == "" {
 			continue
 		}
-		fd := &focusDetail{SessionID: msgs[i].FocusSession}
-		if sess, ok := s.router.GetSession(msgs[i].FocusSession); ok {
-			fd.Cwd = sess.Cwd
-			fd.Title = sess.Title
-		}
-		return fd
+		return s.focusDetailFor(msgs[i].FocusSession)
 	}
 	return nil
 }
 
+// agentTurnTimeout bounds one detached agent turn (the LLM tool-call loop).
+// Session sends inside the turn no longer block (replies arrive via relay),
+// so this only guards against a hung LLM backend.
+const agentTurnTimeout = 10 * time.Minute
+
+// maxQueuedChatTurns bounds one chat's turn queue. A full queue means the
+// agent is far behind (or a client is retry-looping) — reject with 429 rather
+// than stack unbounded turns that fire long after the user gave up.
+const maxQueuedChatTurns = 8
+
+// handleMainChatSend persists the user message (a failed persist is the
+// client's 500, not a log line), queues the agent turn, and returns 202. The
+// turn runs detached from the request — a locked phone or dropped tunnel
+// can't kill it — and all resulting messages arrive over the SSE stream.
 func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req sendRequest
@@ -1315,71 +1352,317 @@ func (s *Server) handleMainChatSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "text is required")
 		return
 	}
-
-	// Read history (and prior focus) BEFORE persisting the new user message.
-	prior, err := s.main.Read(id, mainChatHistoryCap)
-	if err != nil {
+	if err := mainchat.ValidateID(id); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	history := make([]usheragent.HistoryMessage, 0, len(prior))
-	for _, m := range prior {
-		history = append(history, usheragent.HistoryMessage{Role: m.Role, Content: m.Content})
+
+	// Reserve the queue slot BEFORE persisting: a message rejected with 429
+	// must leave no trace, or it would sit in the history as a ghost no
+	// worker will ever process.
+	if !s.tryReserveTurn(id) {
+		writeErr(w, http.StatusTooManyRequests, "chat is busy (turn queue full); try again shortly")
+		return
+	}
+	userMsg := mainchat.Message{Role: "user", Content: req.Text, Time: time.Now().UTC()}
+	if err := s.appendChat(id, userMsg, nil); err != nil {
+		s.releaseTurn(id)
+		writeErr(w, http.StatusInternalServerError, "persist message: "+err.Error())
+		return
+	}
+	s.chatQueue(id) <- userMsg // can't block: reservations gate the buffer
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// tryReserveTurn claims one of the chat's maxQueuedChatTurns queue slots;
+// the claim guarantees the subsequent channel send cannot block or overflow.
+// Released by the worker on dequeue.
+func (s *Server) tryReserveTurn(chatID string) bool {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if s.chatPending[chatID] >= maxQueuedChatTurns {
+		return false
+	}
+	s.chatPending[chatID]++
+	return true
+}
+
+func (s *Server) releaseTurn(chatID string) {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if s.chatPending[chatID] <= 1 {
+		delete(s.chatPending, chatID)
+	} else {
+		s.chatPending[chatID]--
+	}
+}
+
+// chatQueue returns the chat's turn queue, lazily starting its single worker
+// goroutine. One worker per chat = strict arrival-order turns; workers are
+// tiny and live for the process (the set of chats is small).
+func (s *Server) chatQueue(chatID string) chan mainchat.Message {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	q := s.chatQueues[chatID]
+	if q == nil {
+		q = make(chan mainchat.Message, maxQueuedChatTurns)
+		s.chatQueues[chatID] = q
+		go func() {
+			for msg := range q {
+				s.releaseTurn(chatID) // slot freed on dequeue, not turn end
+				s.runMainChatTurn(chatID, msg)
+			}
+		}()
+	}
+	return q
+}
+
+// runMainChatTurn executes one agent turn for an already-persisted user
+// message. Turns for a chat run one at a time in arrival order, so each
+// turn's history contains the previous turn's messages. Relayed session
+// replies are the exception: they append whenever their session finishes.
+func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
+	// Always signal turn end — even a turn that displayed nothing — so the
+	// client can clear its thinking placeholder.
+	defer s.broadcastChat(chatID, chatFrame{Event: "turn.done"})
+
+	prior, err := s.main.Read(chatID, mainChatHistoryCap+2)
+	if err != nil {
+		s.logger.Warn("main chat read", "chat", chatID, "err", err)
+		return
+	}
+	// The store already holds userMsg (persisted at POST time). History is
+	// everything EXCEPT this turn's own user message, which is passed
+	// separately as the current message.
+	for i := len(prior) - 1; i >= 0; i-- {
+		m := prior[i]
+		if m.Role == "user" && m.Content == userMsg.Content && m.Time.Equal(userMsg.Time) {
+			prior = append(prior[:i:i], prior[i+1:]...)
+			break
+		}
+	}
+	if len(prior) > mainChatHistoryCap {
+		prior = prior[len(prior)-mainChatHistoryCap:]
 	}
 	prevFocus := ""
 	if fd := s.lastFocus(prior); fd != nil {
 		prevFocus = fd.SessionID
 	}
 
-	userMsg := mainchat.Message{Role: "user", Content: req.Text, Time: time.Now().UTC()}
-	if err := s.main.Append(id, userMsg); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	// Append a compact ground-truth block to the user message. The agent
 	// (especially small models like Haiku / Flash / mini) uses it to answer
 	// metadata trivia without hallucinating, and to verify focus before
 	// claiming a switch.
-	enrichedUserMsg := req.Text + "\n\n" + s.renderStateBlock(prevFocus)
+	enrichedUserMsg := userMsg.Content + "\n\n" + s.renderStateBlock(prevFocus)
 
-	res, err := s.agent.Handle(r.Context(), history, prevFocus, enrichedUserMsg)
+	relay := func(sessionID, reply string, err error) {
+		s.relaySessionReply(chatID, sessionID, reply, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), agentTurnTimeout)
+	defer cancel()
+	res, err := s.agent.Handle(ctx, historyFromMessages(prior), prevFocus, enrichedUserMsg, relay)
 	if err != nil {
 		s.logger.Warn("agent handle", "err", err)
-		res = usheragent.AgentResult{Reply: "agent error: " + err.Error()}
+		// Keep res.FocusSession: Handle returns the focus accumulated before
+		// the failure, so routing that already happened isn't forgotten.
+		res.Reply = "agent error: " + err.Error()
 	}
 	// Carry forward focus when this turn didn't touch any session.
 	newFocus := res.FocusSession
 	if newFocus == "" {
 		newFocus = prevFocus
 	}
-	// Announce a focus change server-side (the model relays verbatim and can't
-	// reliably detect a switch itself): prepend a linked banner when this turn
-	// routed to a session different from the prior focus.
+	// Announce a focus change server-side (the model can't reliably detect a
+	// switch itself): prepend a linked banner when this turn routed to a
+	// session different from the prior focus.
 	title := ""
 	if sess, ok := s.router.GetSession(res.FocusSession); ok {
 		title = sess.Title
 	}
-	agentMsg := mainchat.Message{
-		Role:         "agent",
-		Content:      focusSwitchBanner(prevFocus, res.FocusSession, title) + res.Reply,
-		Time:         time.Now().UTC(),
-		FocusSession: newFocus,
+	content := focusSwitchBanner(prevFocus, res.FocusSession, title) + res.Reply
+	if strings.TrimSpace(content) == "" {
+		// Pure-passthrough turn: the agent said nothing and focus didn't
+		// switch (a switch always yields a banner) — nothing to display.
+		// The deferred turn.done still tells the client the turn is over.
+		return
 	}
-	if err := s.main.Append(id, agentMsg); err != nil {
-		s.logger.Warn("main chat append agent", "err", err)
+	if err := s.appendChat(chatID, mainchat.Message{
+		Role:         "agent",
+		Content:      content,
+		FocusSession: newFocus,
+	}, s.focusDetailFor(newFocus)); err != nil {
+		s.logger.Warn("main chat append agent", "chat", chatID, "err", err)
+	}
+}
+
+// historyFromMessages maps persisted chat messages to the agent's history
+// shape. Relayed session replies become user-role observations tagged with
+// their source — they're information shown to the user, not the agent's own
+// words, and the tag lets the prompt tell the model exactly that.
+func historyFromMessages(msgs []mainchat.Message) []usheragent.HistoryMessage {
+	out := make([]usheragent.HistoryMessage, 0, len(msgs))
+	for _, m := range msgs {
+		h := usheragent.HistoryMessage{Role: m.Role, Content: m.Content}
+		if m.Role == "relay" {
+			h.Role = "user"
+			h.Content = usheragent.RelayTag(shortID(m.SourceSession)) + m.Content
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// relaySessionReply appends a session's completed reply to the chat verbatim.
+// This is the display path for session output — the agent never restates it.
+func (s *Server) relaySessionReply(chatID, sessionID, reply string, err error) {
+	// The reply is stored verbatim — surrounding whitespace can be meaning
+	// (code fences, terminal output); trimming is only for the empty check.
+	content := reply
+	if strings.TrimSpace(content) == "" {
+		content = "(no text response)"
+	}
+	if err != nil {
+		content += "\n\n(relay: " + err.Error() + ")"
+	}
+	if aerr := s.appendChat(chatID, mainchat.Message{
+		Role:          "relay",
+		Content:       content,
+		SourceSession: sessionID,
+	}, nil); aerr != nil {
+		s.logger.Warn("main chat append relay", "chat", chatID, "session", sessionID, "err", aerr)
+	}
+}
+
+func (s *Server) focusDetailFor(sessionID string) *focusDetail {
+	if sessionID == "" {
+		return nil
+	}
+	fd := &focusDetail{SessionID: sessionID}
+	if sess, ok := s.router.GetSession(sessionID); ok {
+		fd.Cwd = sess.Cwd
+		fd.Title = sess.Title
+	}
+	return fd
+}
+
+// appendChat persists msg (the returned error is the caller's to surface),
+// then broadcasts it (with the focus it moved, if any) to the chat's SSE
+// subscribers. A failed persist is NOT broadcast — showing a message that
+// isn't stored would desync the UI from the next turn's history.
+func (s *Server) appendChat(chatID string, msg mainchat.Message, focus *focusDetail) error {
+	if msg.Time.IsZero() {
+		msg.Time = time.Now().UTC()
+	}
+	if err := s.main.Append(chatID, msg); err != nil {
+		return err
+	}
+	s.broadcastChat(chatID, chatFrame{Event: "message", Data: chatEvent{Message: msg, Focus: focus}})
+	return nil
+}
+
+// broadcastChat fans one frame out to the chat's SSE subscribers. A full
+// subscriber is force-closed instead of skipped: a silent drop would leave
+// the stream healthy-looking but missing messages, with nothing ever
+// triggering the client's reconnect-refetch recovery.
+func (s *Server) broadcastChat(chatID string, frame chatFrame) {
+	var evict []func()
+	s.chatMu.Lock()
+	for ch, cancel := range s.chatSubs[chatID] {
+		select {
+		case ch <- frame:
+		default:
+			evict = append(evict, cancel)
+		}
+	}
+	s.chatMu.Unlock()
+	// cancel takes chatMu; run evictions after unlocking.
+	for _, cancel := range evict {
+		cancel()
+	}
+}
+
+func (s *Server) subscribeChat(chatID string) (<-chan chatFrame, func()) {
+	ch := make(chan chatFrame, 16)
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			s.chatMu.Lock()
+			delete(s.chatSubs[chatID], ch)
+			if len(s.chatSubs[chatID]) == 0 {
+				delete(s.chatSubs, chatID)
+			}
+			s.chatMu.Unlock()
+			close(ch)
+		})
+	}
+	s.chatMu.Lock()
+	if s.chatSubs[chatID] == nil {
+		s.chatSubs[chatID] = map[chan chatFrame]func(){}
+	}
+	s.chatSubs[chatID][ch] = cancel
+	s.chatMu.Unlock()
+	return ch, cancel
+}
+
+// handleMainChatEvents streams a chat's frames as SSE: "message" events and
+// "turn.done" markers. No replay; instead the subscription registers BEFORE
+// the response headers flush and the client refetches history on every open —
+// so anything after that fetch arrives either in it or on this stream.
+func (s *Server) handleMainChatEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := mainchat.ValidateID(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
 	}
 
-	resp := mainChatSendResponse{Messages: []mainchat.Message{userMsg, agentMsg}}
-	if newFocus != "" {
-		fd := &focusDetail{SessionID: newFocus}
-		if sess, ok := s.router.GetSession(newFocus); ok {
-			fd.Cwd = sess.Cwd
-			fd.Title = sess.Title
+	ch, cancel := s.subscribeChat(id)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case frame, ok := <-ch:
+			if !ok {
+				// Force-closed as a slow subscriber: end the response so the
+				// EventSource reconnects and refetches.
+				return
+			}
+			payload := []byte("{}")
+			if frame.Event == "message" {
+				b, err := json.Marshal(frame.Data)
+				if err != nil {
+					continue
+				}
+				payload = b
+			}
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", frame.Event, payload); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
-		resp.Focus = fd
 	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // --- hooks ---------------------------------------------------------------

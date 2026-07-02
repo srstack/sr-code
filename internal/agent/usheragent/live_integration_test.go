@@ -59,7 +59,7 @@ func TestLive_ToolLoopRoundTrip(t *testing.T) {
 			// (reasoning + tool_call) assistant turn we must replay, turn 2 =
 			// the answer that 400s if the replay dropped the thinking state.
 			res, err := a.Handle(ctx, nil, "",
-				"Call the list_sessions tool, then tell me exactly how many sessions there are.")
+				"Call the list_sessions tool, then tell me exactly how many sessions there are.", nil)
 			if err != nil {
 				t.Fatalf("%s tool loop failed (round-trip regression?): %v", p.name, err)
 			}

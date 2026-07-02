@@ -31,6 +31,7 @@ func newMockChatServer(t *testing.T, responses []ChatResponse) (*httptest.Server
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		m.lastReq = ChatRequest{} // Decode merges into the old value; reset so omitted fields (e.g. tools) don't linger
 		_ = json.NewDecoder(r.Body).Decode(&m.lastReq)
 		if m.calls >= len(m.responses) {
 			t.Errorf("unexpected call %d (only %d responses queued)", m.calls+1, len(m.responses))
@@ -56,6 +57,7 @@ type fakeAgentAPI struct {
 	waitReplies map[string]string
 	waitErrs    map[string]error
 	waitedFor   []sendCall
+	relayed     []sendCall // sends made through SendToSessionRelayed
 
 	created     []createCall
 	createReply string
@@ -184,6 +186,28 @@ func (f *fakeAgentAPI) CreateSession(_ context.Context, cwd, msg string, _ time.
 	}
 	return f.createNewID, f.createReply, nil
 }
+
+// SendToSessionRelayed resolves the relay synchronously from waitReplies /
+// waitErrs so tests can assert the relayed text without goroutine plumbing.
+func (f *fakeAgentAPI) SendToSessionRelayed(id, text string, onDone func(sessionID, reply string, err error)) error {
+	f.sent = append(f.sent, sendCall{id, text})
+	f.relayed = append(f.relayed, sendCall{id, text})
+	if onDone != nil {
+		onDone(id, f.waitReplies[id], f.waitErrs[id])
+	}
+	return nil
+}
+
+func (f *fakeAgentAPI) CreateSessionRelayed(cwd, msg string, onDone func(sessionID, reply string, err error)) (string, error) {
+	f.created = append(f.created, createCall{cwd, msg})
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	if onDone != nil {
+		onDone(f.createNewID, f.createReply, nil)
+	}
+	return f.createNewID, nil
+}
 func (f *fakeAgentAPI) Archive(id string)                { f.archived[id] = true }
 func (f *fakeAgentAPI) Unarchive(id string)              { f.archived[id] = false }
 func (f *fakeAgentAPI) IsArchived(id string) bool        { return f.archived[id] }
@@ -229,7 +253,7 @@ func newTestLLM(t *testing.T, api AgentAPI, baseURL string) *LLMAgent {
 
 func runHandle(t *testing.T, a *LLMAgent, userMsg string) AgentResult {
 	t.Helper()
-	res, err := a.Handle(context.Background(), nil, "", userMsg)
+	res, err := a.Handle(context.Background(), nil, "", userMsg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +346,7 @@ func TestLLMAgent_ToolErrorPropagatesAsContent(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
 		t.Fatal(err)
 	}
 	var toolMsg *ChatMessage
@@ -423,7 +447,7 @@ func TestLLMAgent_SendAndWaitTimeoutClamped(t *testing.T) {
 	})
 	defer srv.Close()
 	a := newTestLLM(t, api, srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -437,7 +461,7 @@ func TestLLMAgent_HistoryAndFocusInjected(t *testing.T) {
 		{Role: "user", Content: "first thing"},
 		{Role: "agent", Content: "first reply"},
 	}
-	if _, err := a.Handle(context.Background(), history, "focused-session-id", "next thing"); err != nil {
+	if _, err := a.Handle(context.Background(), history, "focused-session-id", "next thing", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -467,7 +491,7 @@ func TestLLMAgent_NoFocusInjectionWhenEmpty(t *testing.T) {
 	srv, m := newMockChatServer(t, []ChatResponse{chatTextResp("ok")})
 	defer srv.Close()
 	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "hi"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "hi", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Only one system message (the static prompt), then the user message.
@@ -490,7 +514,7 @@ func TestLLMAgent_MaxItersGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Handle(context.Background(), nil, "", "loop"); err == nil || !strings.Contains(err.Error(), "max iterations") {
+	if _, err := a.Handle(context.Background(), nil, "", "loop", nil); err == nil || !strings.Contains(err.Error(), "max iterations") {
 		t.Errorf("expected max-iter error, got %v", err)
 	}
 }
@@ -532,7 +556,7 @@ func TestLLMAgent_CreateSessionMissingArgs(t *testing.T) {
 	})
 	defer srv.Close()
 	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "scratch"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "scratch", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -629,7 +653,7 @@ func TestLLMAgent_ReplaysProviderReasoningAcrossToolLoop(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestLLM(t, api, srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "how many sessions?"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "how many sessions?", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -659,7 +683,7 @@ func TestExecuteTool_BadJSONArgs(t *testing.T) {
 	})
 	// "not json" is unparseable; repair pipeline collapses to "{}" which
 	// then fails the per-tool required-arg check with a clear message.
-	got, focus := a.executeTool(context.Background(), "send_to_session", "not json")
+	got, focus := a.executeTool(context.Background(), "send_to_session", "not json", nil)
 	if !strings.Contains(got, "required") {
 		t.Errorf("got %q (want 'required' from arg validation)", got)
 	}
@@ -710,7 +734,7 @@ func TestLLMStrictModeAddsEnforcementToSystemPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(m.lastReq.Messages) == 0 || m.lastReq.Messages[0].Role != "system" {
@@ -729,10 +753,295 @@ func TestLLMNonStrictHasNoEnforcement(t *testing.T) {
 		Model:  "m",
 		// Strict not set
 	})
-	if _, err := a.Handle(context.Background(), nil, "", "x"); err != nil {
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(m.lastReq.Messages[0].Content, "Strict mode") {
 		t.Error("non-strict run leaked strict block into system prompt")
+	}
+}
+
+// --- relayed sends (main-chat relay channel) -------------------------------
+
+func TestLLMAgent_SendToSessionRelayed(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "deadbeef", Title: "X"}}
+	api.waitReplies["deadbeef"] = "the session's own words"
+	srv, m := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("call_send", "send_to_session", `{"session_id":"deadbeef","text":"deploy now"}`),
+		chatTextResp("routed"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	var relayed []string
+	relay := func(sessionID, reply string, err error) {
+		relayed = append(relayed, sessionID+"|"+reply)
+	}
+	res, err := a.Handle(context.Background(), nil, "", "tell deadbeef to deploy now", relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With a relay sink present the send must go through the relayed
+	// primitive, not the plain fire-and-forget.
+	if len(api.relayed) != 1 || api.relayed[0].ID != "deadbeef" || api.relayed[0].Text != "deploy now" {
+		t.Errorf("relayed = %+v", api.relayed)
+	}
+	if len(relayed) != 1 || relayed[0] != "deadbeef|the session's own words" {
+		t.Errorf("relay sink got %v", relayed)
+	}
+	if res.FocusSession != "deadbeef" {
+		t.Errorf("FocusSession = %q", res.FocusSession)
+	}
+	// The tool result must tell the model the reply is handled elsewhere.
+	var toolMsg *ChatMessage
+	for i := range m.lastReq.Messages {
+		if m.lastReq.Messages[i].Role == "tool" {
+			toolMsg = &m.lastReq.Messages[i]
+		}
+	}
+	if toolMsg == nil || !strings.Contains(toolMsg.Content, "verbatim") {
+		t.Errorf("tool result should mention the automatic relay, got %+v", toolMsg)
+	}
+}
+
+func TestLLMAgent_SendToSessionWithoutRelayFallsBack(t *testing.T) {
+	api := newFakeAgentAPI()
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("call_send", "send_to_session", `{"session_id":"deadbeef","text":"go"}`),
+		chatTextResp("sent"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.relayed) != 0 {
+		t.Errorf("nil sink must use plain SendToSession, relayed = %+v", api.relayed)
+	}
+	if len(api.sent) != 1 {
+		t.Errorf("sent = %+v", api.sent)
+	}
+}
+
+func TestLLMAgent_CreateSessionRelayed(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.createNewID = "newid123"
+	api.createReply = "first reply"
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("call_c", "create_session", `{"cwd":"/tmp","initial_message":"hi"}`),
+		chatTextResp("created"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	var relayed []string
+	relay := func(sessionID, reply string, err error) {
+		relayed = append(relayed, sessionID+"|"+reply)
+	}
+	res, err := a.Handle(context.Background(), nil, "", "new scratch session", relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.created) != 1 || api.created[0].Cwd != "/tmp" {
+		t.Errorf("created = %+v", api.created)
+	}
+	if len(relayed) != 1 || relayed[0] != "newid123|first reply" {
+		t.Errorf("relay sink got %v", relayed)
+	}
+	if res.FocusSession != "newid123" {
+		t.Errorf("FocusSession = %q", res.FocusSession)
+	}
+}
+
+// TestLLMAgent_MaxItersWrapUp: when the tool budget runs out, the agent makes
+// one final tools-free completion and returns its text (with the accumulated
+// focus) instead of a bare error.
+func TestLLMAgent_MaxItersWrapUp(t *testing.T) {
+	api := newFakeAgentAPI()
+	srv, m := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c1", "send_to_session", `{"session_id":"deadbeef","text":"go"}`),
+		chatToolCallResp("c2", "read_session_transcript", `{"session_id":"deadbeef"}`),
+		chatTextResp("routed to deadbeef; details will follow"),
+	})
+	defer srv.Close()
+
+	a, err := NewLLM(api, LLMConfig{Client: NewChatClient(srv.URL+"/v1", "k"), Model: "m", MaxIters: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Handle(context.Background(), nil, "", "do the thing", nil)
+	if err != nil {
+		t.Fatalf("wrap-up should recover, got %v", err)
+	}
+	if res.Reply != "routed to deadbeef; details will follow" {
+		t.Errorf("Reply = %q", res.Reply)
+	}
+	if res.FocusSession != "deadbeef" {
+		t.Errorf("FocusSession = %q, want deadbeef (accumulated before exhaustion)", res.FocusSession)
+	}
+	// The wrap-up request must offer no tools and carry the budget notice.
+	if len(m.lastReq.Tools) != 0 {
+		t.Errorf("wrap-up request still offered %d tools", len(m.lastReq.Tools))
+	}
+	last := m.lastReq.Messages[len(m.lastReq.Messages)-1]
+	if last.Role != "user" || !strings.Contains(last.Content, "Tool budget") {
+		t.Errorf("wrap-up notice missing, last message = %+v", last)
+	}
+}
+
+// TestLLMAgent_RepeatedIdenticalCallBlocked: an immediate identical repeat of
+// a tool call is not dispatched — the model gets an error result instead
+// (anti-polling / anti-duplicate-send guard).
+func TestLLMAgent_RepeatedIdenticalCallBlocked(t *testing.T) {
+	api := newFakeAgentAPI()
+	srv, m := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c1", "send_to_session", `{"session_id":"deadbeef","text":"go"}`),
+		chatToolCallResp("c2", "send_to_session", `{"session_id":"deadbeef","text":"go"}`),
+		chatTextResp("ok"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.sent) != 1 {
+		t.Errorf("duplicate send dispatched: sent = %+v", api.sent)
+	}
+	var blocked bool
+	for _, msg := range m.lastReq.Messages {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "repeated identical tool call blocked") {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Error("second call's tool result should carry the blocked notice")
+	}
+}
+
+// TestLLMAgent_ToolCallsWithoutFinishReason: providers that return tool calls
+// with a missing finish_reason must still get their tools dispatched instead
+// of the turn being misread as an empty final answer.
+func TestLLMAgent_ToolCallsWithoutFinishReason(t *testing.T) {
+	api := newFakeAgentAPI()
+	quirky := ChatResponse{
+		Choices: []ChatChoice{{
+			Message: ChatMessage{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:       "c1",
+					Type:     "function",
+					Function: ToolCallFunc{Name: "send_to_session", Arguments: `{"session_id":"deadbeef","text":"go"}`},
+				}},
+			},
+			FinishReason: "", // provider quirk: tool calls, no finish_reason
+		}},
+	}
+	srv, _ := newMockChatServer(t, []ChatResponse{quirky, chatTextResp("done")})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res, err := a.Handle(context.Background(), nil, "", "x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.sent) != 1 {
+		t.Errorf("tool call not dispatched: sent = %+v", api.sent)
+	}
+	if res.Reply != "done" || res.FocusSession != "deadbeef" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+// TestLLMAgent_LengthWithToolCallsNotDispatched: a max_tokens-truncated
+// response carrying (possibly partial) tool calls must NOT be executed.
+func TestLLMAgent_LengthWithToolCallsNotDispatched(t *testing.T) {
+	api := newFakeAgentAPI()
+	truncated := ChatResponse{
+		Choices: []ChatChoice{{
+			Message: ChatMessage{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:       "c1",
+					Type:     "function",
+					Function: ToolCallFunc{Name: "send_to_session", Arguments: `{"session_id":"deadbeef","text":"half a mess`},
+				}},
+			},
+			FinishReason: "length",
+		}},
+	}
+	srv, _ := newMockChatServer(t, []ChatResponse{truncated})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	_, err := a.Handle(context.Background(), nil, "", "x", nil)
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Errorf("err = %v, want truncated-by-max_tokens", err)
+	}
+	if len(api.sent) != 0 {
+		t.Errorf("truncated tool call was dispatched: %+v", api.sent)
+	}
+}
+
+// TestLLMAgent_RetryAfterErrorNotBlocked: the anti-repeat guard must let an
+// identical call through when the first attempt returned an error result.
+func TestLLMAgent_RetryAfterErrorNotBlocked(t *testing.T) {
+	api := newFakeAgentAPI()
+	// respond_to_interaction with an unknown id errors; the model retries
+	// the identical call — the retry must reach the API again.
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("c1", "read_session_transcript", `{"session_id":"missing"}`),
+		chatToolCallResp("c2", "read_session_transcript", `{"session_id":"missing"}`),
+		chatTextResp("gave up"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res, err := a.Handle(context.Background(), nil, "", "x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reply != "gave up" {
+		t.Errorf("Reply = %q", res.Reply)
+	}
+	// Both identical calls errored ("session not found") and neither was
+	// blocked — observable via the mock's final request containing two tool
+	// results with the not-found error and zero "blocked" notices.
+}
+
+// TestLLMAgent_EmptyToolCallsGlitchErrors: finish_reason=tool_calls with no
+// calls and no content must error (an invisible empty answer helps nobody).
+func TestLLMAgent_EmptyToolCallsGlitchErrors(t *testing.T) {
+	glitch := ChatResponse{
+		Choices: []ChatChoice{{
+			Message:      ChatMessage{Role: "assistant"},
+			FinishReason: "tool_calls",
+		}},
+	}
+	srv, _ := newMockChatServer(t, []ChatResponse{glitch})
+	defer srv.Close()
+
+	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
+	_, err := a.Handle(context.Background(), nil, "", "x", nil)
+	if err == nil || !strings.Contains(err.Error(), "no tool_calls") {
+		t.Errorf("err = %v, want explicit glitch error", err)
+	}
+}
+
+// TestSystemPromptDocumentsRelayTag pins the relay history marker (produced
+// by the web layer via RelayTag) to the shape the system prompt teaches the
+// model. If either side changes without the other, the model silently stops
+// recognizing relayed replies as session output.
+func TestSystemPromptDocumentsRelayTag(t *testing.T) {
+	const documented = "[session <id> replied]"
+	if !strings.Contains(defaultLLMSystemPrompt, documented) {
+		t.Fatalf("system prompt no longer documents the relay marker %q", documented)
+	}
+	got := RelayTag("abc12345")
+	want := strings.Replace(documented, "<id>", "abc12345", 1) + "\n"
+	if got != want {
+		t.Errorf("RelayTag = %q, want %q (matching the prompt's documented shape)", got, want)
 	}
 }

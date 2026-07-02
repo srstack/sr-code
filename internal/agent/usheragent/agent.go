@@ -12,6 +12,7 @@ package usheragent
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/nexustar/usher/internal/core"
@@ -21,6 +22,16 @@ import (
 type AgentAPI interface {
 	ListSessions() []core.Session
 	SendToSession(id, text string) error
+
+	// SendToSessionRelayed is SendToSession plus a background collector:
+	// when the turn completes, onDone (shape-compatible with RelaySink)
+	// receives the session id and the assistant text. It runs at most once
+	// on its own goroutine; a collector that expires with nothing at all is
+	// dropped without calling it. This is the delivery primitive behind the
+	// main chat's relay channel — the session's reply reaches the user
+	// verbatim without the agent holding its turn open.
+	SendToSessionRelayed(id, text string, onDone func(sessionID, reply string, err error)) error
+
 	ListPendingInteractions() []hook.Pending
 	RespondInteraction(id string, resp hook.Response) error
 
@@ -70,7 +81,30 @@ type AgentAPI interface {
 	// message and waits for the first assistant response. Returns the new
 	// session id and the assistant text.
 	CreateSession(ctx context.Context, cwd, initialMsg string, timeout time.Duration) (string, string, error)
+
+	// CreateSessionRelayed is CreateSession without the in-turn wait: it
+	// returns once the new session id is known and hands the first assistant
+	// reply to onDone in the background (same contract as
+	// SendToSessionRelayed; onDone also receives the new session id).
+	CreateSessionRelayed(cwd, initialMsg string, onDone func(sessionID, reply string, err error)) (string, error)
 }
+
+// RelayTag is the marker prepended to a relayed session reply when it is fed
+// back to the model as a user-role history observation. The system prompt
+// teaches the model this exact shape ("[session <id> replied]") — a test
+// pins the two together, so change both or neither.
+func RelayTag(sessionID string) string {
+	return fmt.Sprintf("[session %s replied]\n", sessionID)
+}
+
+// RelaySink delivers a session's completed reply back to the main chat for
+// verbatim display. The server (which knows the chat id) supplies it per
+// Handle call; agents forward it into the relayed-send primitives. sessionID
+// is the session that produced reply; err is non-nil when the turn errored or
+// the collector gave up (reply may still carry partial text). A nil sink
+// means the caller has no relay channel — agents fall back to plain
+// fire-and-forget sends.
+type RelaySink func(sessionID, reply string, err error)
 
 // HistoryMessage is one prior turn handed to Agent.Handle. The Agent is
 // responsible for converting these into its own backend's message shape
@@ -92,9 +126,11 @@ type AgentResult struct {
 // Agent processes a user message in the main chat and returns a reply.
 // history is the recent persisted user/agent turns (newest last; the current
 // user message is NOT included). currentFocus is the most recent
-// FocusSession from prior agent messages, or "" if none.
+// FocusSession from prior agent messages, or "" if none. relay (may be nil)
+// is where session replies triggered this turn land once complete — the
+// agent's own Reply is only routing talk, never a restatement of them.
 type Agent interface {
-	Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string) (AgentResult, error)
+	Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string, relay RelaySink) (AgentResult, error)
 }
 
 // strictModeAddendum is appended to the system prompt when LLMConfig.Strict
@@ -124,13 +160,14 @@ yourself.
 
 For ANY question that is substantive on a session's domain — evaluation,
 code review, design critique, analysis, "is this good?", "what should
-we do?", "explain how X works", "summarize the design" — call
-send_and_wait_for_response on the relevant session and return its reply.
-Do NOT answer from your own reasoning, even when you have just read the
-transcript and feel you "know enough". Your reasoning is small-model
-reasoning; the session's is not. Reading a transcript is for figuring
-out *which session to route to and how to phrase the forwarded message*,
-not for answering the user yourself.
+we do?", "explain how X works", "summarize the design" — route it to the
+relevant session with send_to_session. The session's reply is delivered
+to the user verbatim by the server when it completes; you never see or
+restate it. Do NOT answer from your own reasoning, even when you have
+just read the transcript and feel you "know enough". Your reasoning is
+small-model reasoning; the session's is not. Reading a transcript is for
+figuring out *which session to route to and how to phrase the forwarded
+message*, not for answering the user yourself.
 
 You only answer locally when ALL of the following hold:
 - The question is trivia readable from <current_state> (count / cwd /
@@ -149,8 +186,8 @@ You only answer locally when ALL of the following hold:
 - Never narrate a tool outcome you did not invoke this turn. If you
   say "I created session X", "I sent your message to Y", "I switched
   to Z", "I read the transcript of W", the corresponding tool
-  (create_session, send_to_session, send_and_wait_for_response,
-  read_session_transcript) MUST have actually been called this turn.
+  (create_session, send_to_session, read_session_transcript) MUST
+  have actually been called this turn.
   Do NOT manufacture session ids, fabricate tool results, or describe
   outputs that "would have" happened. When the user confirms a
   previously-offered action ("yes", "go ahead", "要", "do it"),

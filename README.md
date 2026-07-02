@@ -102,13 +102,16 @@ most common:
 
 ## Main chat
 
-The **main chat** link opens a conversation with usher's routing agent. The
-default **rule agent** is a few slash commands:
+The **main chat** link opens a conversation with usher's routing agent.
+Sending never blocks the chat: a routed message returns immediately, and when
+the target session finishes its turn the reply is posted back into the chat
+verbatim — whether that takes seconds or hours. The default **rule agent** is
+a few slash commands:
 
 ```
 /list                          list sessions (shows auto-approve / archived flags)
 /send <prefix> <text>          send to the matching session (by id prefix or title)
-/ask <prefix> <text>           send and wait for the session's reply
+/ask <prefix> <text>           send and wait inline for the session's reply
 /read <prefix> [n]             show the last n turns of a session (default 20)
 /new <cwd> <text>              start a new session in <cwd> with an initial message
 /pending                       list pending permission requests

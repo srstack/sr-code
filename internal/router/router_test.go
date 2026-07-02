@@ -1,13 +1,18 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/sender"
 )
 
@@ -144,5 +149,213 @@ func TestSenderForBackendFallsBackToDefault(t *testing.T) {
 	}
 	if got := r.senderForBackend("claude"); got != r.senders["claude"] {
 		t.Errorf("registered backend not returned")
+	}
+}
+
+// --- collectTurnText (the relayed/waited send's accumulate loop) ----------
+
+func partEvent(sid, role, typ, content string) broker.Event {
+	raw, _ := json.Marshal(map[string]any{
+		"role": role,
+		"part": map[string]string{"type": typ, "content": content},
+	})
+	return broker.Event{SessionID: sid, Type: "part", Raw: raw}
+}
+
+func TestCollectTurnTextAccumulatesUntilExit(t *testing.T) {
+	b := broker.New()
+	ch, unsub := b.Subscribe("s1")
+	defer unsub()
+
+	go func() {
+		b.Publish(partEvent("s1", "assistant", "text", "hello"))
+		b.Publish(partEvent("s1", "assistant", "tool", "ignored tool part"))
+		b.Publish(partEvent("s1", "user", "text", "ignored user echo"))
+		b.Publish(partEvent("s1", "assistant", "text", "world"))
+		b.Publish(broker.Event{SessionID: "s1", Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+	}()
+
+	got, err := collectTurnText(context.Background(), ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello\nworld" {
+		t.Errorf("collected %q, want %q", got, "hello\nworld")
+	}
+}
+
+func TestCollectTurnTextErrorEvent(t *testing.T) {
+	b := broker.New()
+	ch, unsub := b.Subscribe("s1")
+	defer unsub()
+
+	go func() {
+		b.Publish(partEvent("s1", "assistant", "text", "partial"))
+		b.Publish(broker.Event{SessionID: "s1", Type: "error", Raw: json.RawMessage(`{"message":"boom"}`)})
+	}()
+
+	got, err := collectTurnText(context.Background(), ch)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("err = %v, want boom", err)
+	}
+	if got != "partial" {
+		t.Errorf("partial text lost: %q", got)
+	}
+}
+
+func TestCollectTurnTextTimeout(t *testing.T) {
+	b := broker.New()
+	ch, unsub := b.Subscribe("s1")
+	defer unsub()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already expired: no events will ever arrive
+
+	if _, err := collectTurnText(ctx, ch); err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("err = %v, want timeout", err)
+	}
+}
+
+func TestSendToSessionRelayedUnknownSession(t *testing.T) {
+	d, err := discovery.NewMulti(nil, discovery.NewClaudeSource(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Router{discovery: d, broker: broker.New()}
+	if err := r.SendToSessionRelayed("nope", "hi", func(string, string, error) {}); err == nil {
+		t.Error("expected error for unknown session")
+	}
+}
+
+// --- send queue (per-session turn serialization) ---------------------------
+
+// newQueueTestRouter builds a Router over a real discovery holding one session
+// (id "abc12345"), with runTurn overridden to simulate each turn: publish one
+// assistant part echoing the prompt, publish exit, release the send. That is
+// exactly the event pattern a real turn produces, so the relay collectors'
+// attribution can be asserted end to end without tmux.
+func newQueueTestRouter(t *testing.T) *Router {
+	t.Helper()
+	tmp := t.TempDir()
+	line := `{"type":"user","sessionId":"abc12345","cwd":"/tmp/x","timestamp":"2026-07-01T10:00:00.000Z","message":{"role":"user","content":"seed"},"uuid":"u1"}` + "\n"
+	p := filepath.Join(tmp, "-tmp-x", "abc12345.jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := discovery.NewMulti(nil, discovery.NewClaudeSource(tmp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := &Router{
+		discovery:  d,
+		broker:     broker.New(),
+		activeSend: map[string]*sendToken{},
+		sendQueue:  map[string][]pendingSend{},
+		creating:   map[string]core.Session{},
+	}
+	r.runTurn = func(_ context.Context, sessionID, prompt, _ string, tok *sendToken) {
+		r.broker.Publish(partEvent(sessionID, "assistant", "text", "re: "+prompt))
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+		r.releaseSend(sessionID, tok)
+	}
+	return r
+}
+
+// TestSendQueueSerializesAndAttributesReplies: three rapid relayed sends into
+// one session must run as three ordered turns, each collector receiving ITS
+// OWN turn's reply — not the previous turn's tail (the busy-session
+// misattribution bug).
+func TestSendQueueSerializesAndAttributesReplies(t *testing.T) {
+	r := newQueueTestRouter(t)
+
+	type got struct{ prompt, reply string }
+	results := make(chan got, 3)
+	for _, prompt := range []string{"one", "two", "three"} {
+		p := prompt
+		err := r.SendToSessionRelayed("abc12345", p, func(_, reply string, err error) {
+			if err != nil {
+				t.Errorf("send %q relay err: %v", p, err)
+			}
+			results <- got{p, reply}
+		})
+		if err != nil {
+			t.Fatalf("send %q: %v", p, err)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		select {
+		case g := <-results:
+			if g.reply != "re: "+g.prompt {
+				t.Errorf("prompt %q got reply %q — misattributed turn", g.prompt, g.reply)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for relayed replies")
+		}
+	}
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	if len(r.sendQueue["abc12345"]) != 0 || len(r.activeSend) != 0 {
+		t.Errorf("queue not drained: %+v %+v", r.sendQueue, r.activeSend)
+	}
+}
+
+// TestSendQueueWaitCorrelatesAcrossQueue: SendToSessionAndWait issued while a
+// turn is in flight must return the QUEUED send's reply, not the in-flight
+// turn's.
+func TestSendQueueWaitCorrelatesAcrossQueue(t *testing.T) {
+	r := newQueueTestRouter(t)
+
+	// Occupy the session: a manual active token makes send #2 queue. Finish
+	// the fake turn after a short delay, publishing its own exit.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = ctx
+	tok := &sendToken{cancel: func() {}}
+	r.sendMu.Lock()
+	r.activeSend["abc12345"] = tok
+	r.sendMu.Unlock()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		r.broker.Publish(partEvent("abc12345", "assistant", "text", "stale turn tail"))
+		r.broker.Publish(broker.Event{SessionID: "abc12345", Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+		r.releaseSend("abc12345", tok)
+	}()
+
+	reply, err := r.SendToSessionAndWait(context.Background(), "abc12345", "fresh question", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "re: fresh question" {
+		t.Errorf("reply = %q, want the queued turn's own reply", reply)
+	}
+}
+
+func TestFlushSendQueueAborts(t *testing.T) {
+	r := newQueueTestRouter(t)
+	r.sendMu.Lock()
+	r.activeSend["abc12345"] = &sendToken{cancel: func() {}}
+	r.sendMu.Unlock()
+
+	aborted := make(chan error, 1)
+	if err := r.enqueueSend("abc12345", "queued", nil, func(err error) { aborted <- err }); err != nil {
+		t.Fatal(err)
+	}
+	r.flushSendQueue("abc12345", errors.New("cancelled"))
+	select {
+	case err := <-aborted:
+		if err == nil || !strings.Contains(err.Error(), "cancelled") {
+			t.Errorf("abort err = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("abort callback never ran")
 	}
 }

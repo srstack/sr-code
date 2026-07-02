@@ -148,6 +148,14 @@ export function appendChatMessage(m) {
   div.className = 'chat-message ' + role + (m._placeholder ? ' placeholder' : '');
   const ts = m.ts ? `<span class="ts">${esc(new Date(m.ts).toLocaleString())}</span>` : '';
   const modelAttr = m.model ? ` title="${esc(m.model)}"` : '';
+  // A relay message is a session's own reply forwarded verbatim into the main
+  // chat — label it as the session speaking, linked to its detail view.
+  let roleLabel = esc(role);
+  if (role === 'relay') {
+    roleLabel = m.source_session
+      ? `<a class="relay-source" href="#/s/${esc(m.source_session)}">session ${esc(m.source_session.slice(0, 8))}</a>`
+      : 'session';
+  }
 
   if (role === 'assistant' && m.parts) {
     // Grouped assistant turn: role header + structured parts. An EMPTY parts
@@ -155,13 +163,13 @@ export function appendChatMessage(m) {
     // it (a flat .content div here would misrender the first tool part).
     // Completed turns close with the fork control at the card's bottom edge.
     div.innerHTML =
-      `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
+      `<div class="role"${modelAttr}>${roleLabel}${ts}</div>` +
       renderAssistantParts(m.parts) +
       (m.uuid ? forkBtnHTML(m.uuid) : '');
   } else {
-    // User, error, agent, or streaming placeholder (flat content).
+    // User, error, agent, relay, or streaming placeholder (flat content).
     div.innerHTML =
-      `<div class="role"${modelAttr}>${esc(role)}${ts}</div>` +
+      `<div class="role"${modelAttr}>${roleLabel}${ts}</div>` +
       `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>`;
   }
   // send-anchor lives inside chat-scroll (sticky at bottom). Insert

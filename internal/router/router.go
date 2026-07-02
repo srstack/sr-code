@@ -47,8 +47,24 @@ type Router struct {
 	meta           *sessionmeta.Store
 
 	sendMu     sync.Mutex
-	activeSend map[string]*sendToken   // sessionID -> latest send's cancel handle
-	creating   map[string]core.Session // sessions usher is spawning, not yet on disk
+	activeSend map[string]*sendToken    // sessionID -> in-flight turn's cancel handle
+	sendQueue  map[string][]pendingSend // sessionID -> sends waiting for the turn to end
+	creating   map[string]core.Session  // sessions usher is spawning, not yet on disk
+
+	// runTurn overrides the turn executor ((*Router).runSend) in tests, so
+	// queue mechanics are testable without a live tmux sender. nil in
+	// production.
+	runTurn func(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken)
+}
+
+// startTurn launches one turn's executor goroutine (the seam runTurn tests
+// override).
+func (r *Router) startTurn(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
+	run := r.runTurn
+	if run == nil {
+		run = r.runSend
+	}
+	go run(ctx, sessionID, prompt, cwd, tok)
 }
 
 // sendToken pairs a cancel function with a unique pointer identity so that a
@@ -57,6 +73,21 @@ type Router struct {
 type sendToken struct {
 	cancel context.CancelFunc
 }
+
+// pendingSend is one send waiting in a session's FIFO queue behind an
+// in-flight turn. pre (optional) runs just before the turn starts — after
+// every event of the previous turn has been published — so a relay collector
+// can subscribe with correct turn attribution. abort (optional) runs instead
+// if the queued send is dropped (session deleted, turn cancelled).
+type pendingSend struct {
+	text  string
+	pre   func()
+	abort func(err error)
+}
+
+// maxQueuedSends bounds one session's send queue — a backstop against a
+// looping agent, far above anything a human produces.
+const maxQueuedSends = 32
 
 // New builds a Router over the given backends (at least one). senders maps a
 // backend name ("claude"/"codex") to its Sender; defaultBackend names the one to
@@ -71,6 +102,7 @@ func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBacke
 		hooks:          h,
 		meta:           meta,
 		activeSend:     map[string]*sendToken{},
+		sendQueue:      map[string][]pendingSend{},
 		creating:       map[string]core.Session{},
 	}
 }
@@ -340,9 +372,11 @@ func (r *Router) PauseSession(id string) error {
 	return nil
 }
 
-// stopLive drops a session to idle: cancels any in-flight turn and kills its
-// live window. Best-effort; idempotent. Shared by PauseSession/DeleteSession.
+// stopLive drops a session to idle: cancels any in-flight turn, drops queued
+// sends, and kills its live window. Best-effort; idempotent. Shared by
+// PauseSession/DeleteSession.
 func (r *Router) stopLive(id string) {
+	r.flushSendQueue(id, errors.New("session stopped"))
 	r.sendMu.Lock()
 	tok := r.activeSend[id]
 	r.sendMu.Unlock()
@@ -356,34 +390,60 @@ func (r *Router) stopLive(id string) {
 
 // --- session writes ------------------------------------------------------
 
-// SendToSession spawns a fire-and-forget subprocess for the session. Stream
-// events go to broker subscribers. Returns immediately once the subprocess
-// is started, or with an error if the session is unknown.
+// SendToSession delivers text to the session as the next turn. If the session
+// is idle the turn starts immediately (fire-and-forget; stream events go to
+// broker subscribers); if a turn is in flight the send waits in the session's
+// FIFO queue and is injected when that turn ends. Returns an error only if
+// the session is unknown or the queue is full.
 func (r *Router) SendToSession(id, text string) error {
+	return r.enqueueSend(id, text, nil, nil)
+}
+
+// enqueueSend is the single entry point for turn-tracked sends: run now if
+// the session is idle, queue otherwise. Serializing usher-injected turns per
+// session is what makes "subscribe, then collect until subprocess.exit" a
+// sound way to capture one turn's reply — a send injected mid-turn would
+// tail the PREVIOUS turn's remainder instead. Typing directly into an
+// attached tmux pane still bypasses this (the manual-attach corner).
+func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) error {
 	sess, ok := r.discovery.Get(id)
 	if !ok {
 		return errors.New("session not found")
 	}
 	// A '!'-prefixed message is not a model turn: Claude Code runs it as a TUI
-	// bash command. That is a feature claude already has — usher is not adding
-	// command execution, only keeping such a message (which bracketed paste
-	// can't neutralize, unlike a leading '/' or '@') from wedging the turn
-	// tailer, since bash mode logs no turn_duration for it to wait on.
+	// bash command, which logs no turn_duration for the tailer to wait on
+	// (and bracketed paste can't neutralize a leading '!', unlike '/' or
+	// '@'). Bash lines skip the queue: claude runs them even mid-turn.
 	if strings.HasPrefix(text, "!") {
+		if pre != nil {
+			pre()
+		}
 		go r.injectDirect(sess.ID, text, sess.Cwd)
 		return nil
 	}
 	// Reorder the sidebar the instant the user sends, without waiting for the
 	// prompt to land in the jsonl (see discovery.MarkInput).
 	r.discovery.MarkInput(id, time.Now().UTC())
-	ctx, cancel := context.WithCancel(context.Background())
-	tok := &sendToken{cancel: cancel}
 
 	r.sendMu.Lock()
+	if _, busy := r.activeSend[id]; busy || len(r.sendQueue[id]) > 0 {
+		if len(r.sendQueue[id]) >= maxQueuedSends {
+			r.sendMu.Unlock()
+			return errors.New("send queue full for session")
+		}
+		r.sendQueue[id] = append(r.sendQueue[id], pendingSend{text: text, pre: pre, abort: abort})
+		r.sendMu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	tok := &sendToken{cancel: cancel}
 	r.activeSend[id] = tok
 	r.sendMu.Unlock()
 
-	go r.runSend(ctx, sess.ID, text, sess.Cwd, tok)
+	if pre != nil {
+		pre()
+	}
+	r.startTurn(ctx, sess.ID, text, sess.Cwd, tok)
 	return nil
 }
 
@@ -418,10 +478,13 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 	}
 	asm := newStreamAssembler(r.backendOf(sessionID))
 	for ev := range ch {
+		// Publish BEFORE clearing the running bit: once activeSend is empty a
+		// new send's collector may subscribe, and it must not see this
+		// turn's exit.
+		r.publishStream(sessionID, asm, ev)
 		if ev.Type == "subprocess.exit" {
 			r.markSendIdle(sessionID, tok)
 		}
-		r.publishStream(sessionID, asm, ev)
 	}
 }
 
@@ -555,8 +618,62 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 		delete(r.activeSend, sessionID)
 	}
 	delete(r.creating, sessionID) // discovery owns it once the turn hit disk
+
+	// Promote the next queued send. runSend's event loop has ended, so the
+	// finished turn is fully published — the promoted send's pre() (relay
+	// subscription) can't see stale events.
+	var next *pendingSend
+	var nextTok *sendToken
+	var nextCtx context.Context
+	if _, busy := r.activeSend[sessionID]; !busy {
+		if q := r.sendQueue[sessionID]; len(q) > 0 {
+			n := q[0]
+			next = &n
+			if len(q) == 1 {
+				delete(r.sendQueue, sessionID)
+			} else {
+				r.sendQueue[sessionID] = q[1:]
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			nextTok = &sendToken{cancel: cancel}
+			nextCtx = ctx
+			r.activeSend[sessionID] = nextTok
+		}
+	}
 	r.sendMu.Unlock()
 	tok.cancel()
+
+	if next == nil {
+		return
+	}
+	sess, ok := r.discovery.Get(sessionID)
+	if !ok {
+		// Session vanished while this send was queued.
+		if next.abort != nil {
+			next.abort(errors.New("session no longer exists"))
+		}
+		r.releaseSend(sessionID, nextTok) // drain the rest of the queue
+		return
+	}
+	if next.pre != nil {
+		next.pre()
+	}
+	r.startTurn(nextCtx, sess.ID, next.text, sess.Cwd, nextTok)
+}
+
+// flushSendQueue drops every queued send for sessionID, calling each abort.
+// Used when the user cancels the in-flight turn or the session goes away —
+// continuing to inject queued messages after an explicit stop would surprise.
+func (r *Router) flushSendQueue(sessionID string, reason error) {
+	r.sendMu.Lock()
+	q := r.sendQueue[sessionID]
+	delete(r.sendQueue, sessionID)
+	r.sendMu.Unlock()
+	for _, p := range q {
+		if p.abort != nil {
+			p.abort(reason)
+		}
+	}
 }
 
 // markSendIdle clears the running-state bit before publishing a terminal
@@ -590,6 +707,9 @@ func (r *Router) CancelSend(sessionID string) error {
 	if !ok {
 		return errors.New("no active send")
 	}
+	// Cancel means stop: drop queued follow-ups too, before cancelling the
+	// turn, so releaseSend finds nothing to promote.
+	r.flushSendQueue(sessionID, errors.New("cancelled"))
 	if err := r.senderFor(sessionID).Interrupt(sessionID); err != nil {
 		slog.Warn("interrupt session turn", "session", sessionID, "err", err)
 	}
@@ -983,19 +1103,94 @@ func snippetAround(text []rune, start, matchLen, ctx int) string {
 // missed in the window between SendToSession returning and the subscriber
 // being attached.
 func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, timeout time.Duration) (string, error) {
-	if _, ok := r.discovery.Get(id); !ok {
-		return "", errors.New("session not found")
-	}
-	ch, cancel := r.broker.Subscribe(id)
-	defer cancel()
-
-	if err := r.SendToSession(id, text); err != nil {
-		return "", err
-	}
-
 	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
 	defer waitCancel()
 
+	// The subscription is created by the queue's pre hook — at actual turn
+	// start, after any earlier turn's events have all been published — so the
+	// collected text is this turn's, even when the send had to queue.
+	started := make(chan turnSub, 1)
+	aborted := make(chan error, 1)
+	err := r.enqueueSend(id, text,
+		func() {
+			ch, cancel := r.broker.Subscribe(id)
+			started <- turnSub{ch: ch, cancel: cancel}
+		},
+		func(err error) { aborted <- err },
+	)
+	if err != nil {
+		return "", err
+	}
+
+	select {
+	case sub := <-started:
+		defer sub.cancel()
+		return collectTurnText(waitCtx, sub.ch)
+	case err := <-aborted:
+		return "", err
+	case <-waitCtx.Done():
+		// Wait expired while still queued. The send stays queued (delivered
+		// in order); only the wait gives up. Drain the eventual subscription
+		// so it can't leak.
+		go func() {
+			select {
+			case sub := <-started:
+				sub.cancel()
+			case <-aborted:
+			case <-time.After(relayWaitCeiling):
+			}
+		}()
+		return "", errors.New("timeout (send still queued behind an earlier turn)")
+	}
+}
+
+// turnSub hands a pre-subscribed broker stream from enqueueSend's pre hook to
+// the caller that collects it.
+type turnSub struct {
+	ch     <-chan broker.Event
+	cancel func()
+}
+
+// relayWaitCeiling bounds how long a relayed send's collector goroutine may
+// outlive its turn. It is not a UX timeout — relays are event-driven and fire
+// whenever subprocess.exit lands — only a leak backstop for a session whose
+// turn never terminates.
+const relayWaitCeiling = 24 * time.Hour
+
+// errNoResponse marks a collect that ended with no assistant text at all
+// (ceiling/timeout expiry before any part arrived).
+var errNoResponse = errors.New("timeout (no response received)")
+
+// SendToSessionRelayed delivers text like SendToSession and collects the
+// turn's assistant text in the background, handing it to onDone (at most
+// once, own goroutine; reply may be partial alongside a non-nil error). If
+// the ceiling passes with no response at all — killed window, exit never
+// observed — onDone is NOT called: a day-late "(relay: timeout)" message is
+// noise, and the reply, if any, is in the transcript.
+func (r *Router) SendToSessionRelayed(id, text string, onDone func(sessionID, reply string, err error)) error {
+	return r.enqueueSend(id, text,
+		func() {
+			ch, cancel := r.broker.Subscribe(id)
+			go func() {
+				defer cancel()
+				waitCtx, waitCancel := context.WithTimeout(context.Background(), relayWaitCeiling)
+				defer waitCancel()
+				reply, err := collectTurnText(waitCtx, ch)
+				if errors.Is(err, errNoResponse) {
+					slog.Warn("relay collector expired with no response; dropping", "session", id)
+					return
+				}
+				onDone(id, reply, err)
+			}()
+		},
+		func(err error) { onDone(id, "", err) },
+	)
+}
+
+// collectTurnText accumulates one turn's assistant text from a broker
+// subscription until subprocess.exit, an error event, channel close, or ctx
+// expiry (partial text is returned alongside the timeout error).
+func collectTurnText(ctx context.Context, ch <-chan broker.Event) (string, error) {
 	var buf strings.Builder
 	for {
 		select {
@@ -1019,9 +1214,9 @@ func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, time
 			case "error":
 				return buf.String(), errors.New(extractErrorMessage(ev.Raw))
 			}
-		case <-waitCtx.Done():
+		case <-ctx.Done():
 			if buf.Len() == 0 {
-				return "", errors.New("timeout (no response received)")
+				return "", errNoResponse
 			}
 			return buf.String(), fmt.Errorf("timeout after %d chars (partial response retained)", buf.Len())
 		}
@@ -1161,10 +1356,11 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model, ba
 	}
 	asm := newStreamAssembler(backend)
 	for ev := range ch {
+		// Publish before clearing the running bit — same reasoning as runSend.
+		r.publishStream(sessionID, asm, ev)
 		if ev.Type == "subprocess.exit" {
 			r.markSendIdle(sessionID, tok)
 		}
-		r.publishStream(sessionID, asm, ev)
 	}
 }
 
@@ -1217,28 +1413,104 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Create in the default backend with its default model (empty model → the
-	// CLI's own default). Claude lets usher pick the id up front; Codex assigns
-	// its own, so discover it first (mirrors StartSession's preAssignsID split).
-	snd := r.senderForBackend(r.defaultBackend)
-	var sessionID string
-	var ch <-chan sender.StreamEvent
-	if snd.PreAssignsID() {
-		sessionID = newUUIDv4()
-		ch, err = snd.SendNew(waitCtx, sessionID, initialMsg, cwd, "")
-	} else {
-		sessionID, ch, err = snd.StartCodexSession(waitCtx, newUUIDv4(), initialMsg, cwd, "", codexDiscoverTimeout)
-	}
+	sessionID, ch, tok, err := r.startNewSession(waitCtx, cancel, cwd, initialMsg)
 	if err != nil {
 		return "", "", err
 	}
 
+	reply := r.collectNewSessionText(sessionID, ch)
+	expired := waitCtx.Err() != nil // before releaseSend, which cancels waitCtx
+	r.releaseSend(sessionID, tok)
+
+	if expired && reply == "" {
+		return sessionID, "", fmt.Errorf("create_session timeout (no response received within %s)", timeout)
+	}
+	return sessionID, reply, nil
+}
+
+// CreateSessionRelayed starts a new session like CreateSession but returns as
+// soon as the session id is known; the first assistant reply is collected in
+// the background and handed to onDone (same contract as SendToSessionRelayed;
+// onDone also receives the new session id so callers don't have to close over
+// the not-yet-assigned return value). For Claude the id is pre-assigned so
+// this returns almost immediately; for Codex it returns once the rollout file
+// is discovered.
+func (r *Router) CreateSessionRelayed(cwd, initialMsg string, onDone func(sessionID, reply string, err error)) (string, error) {
+	cwd, err := validateCreateInputs(cwd, initialMsg)
+	if err != nil {
+		return "", err
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), relayWaitCeiling)
+
+	sessionID, ch, tok, err := r.startNewSession(waitCtx, cancel, cwd, initialMsg)
+	if err != nil {
+		cancel()
+		return "", err
+	}
+
+	go func() {
+		reply := r.collectNewSessionText(sessionID, ch)
+		expired := waitCtx.Err() != nil // before releaseSend, which cancels waitCtx
+		r.releaseSend(sessionID, tok)
+		if expired && reply == "" {
+			onDone(sessionID, "", errors.New("no response received (send expired)"))
+			return
+		}
+		onDone(sessionID, reply, nil)
+	}()
+	return sessionID, nil
+}
+
+// startNewSession spawns a brand-new session in the default backend with its
+// default model (empty model → the CLI's own default). Claude lets usher pick
+// the id up front; Codex assigns its own, so discover it first (mirrors
+// StartSession's preAssignsID split). The new id is registered in
+// creating/activeSend — without the overlay the focus link / detail view 404s
+// until discovery sees the first jsonl line, and without the token CancelSend
+// is a no-op and a follow-up send would interleave with the first turn
+// instead of queueing. Callers must end the turn with releaseSend(id, tok).
+func (r *Router) startNewSession(ctx context.Context, cancel context.CancelFunc, cwd, initialMsg string) (string, <-chan sender.StreamEvent, *sendToken, error) {
+	snd := r.senderForBackend(r.defaultBackend)
+	var sessionID string
+	var ch <-chan sender.StreamEvent
+	var err error
+	if snd.PreAssignsID() {
+		sessionID = newUUIDv4()
+		ch, err = snd.SendNew(ctx, sessionID, initialMsg, cwd, "")
+	} else {
+		sessionID, ch, err = snd.StartCodexSession(ctx, newUUIDv4(), initialMsg, cwd, "", codexDiscoverTimeout)
+	}
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	tok := &sendToken{cancel: cancel}
+	now := time.Now()
+	r.sendMu.Lock()
+	r.activeSend[sessionID] = tok
+	r.creating[sessionID] = core.Session{
+		ID:          sessionID,
+		Title:       truncateRunes(initialMsg, 60),
+		Cwd:         cwd,
+		Status:      core.StatusRunning,
+		StartedAt:   now,
+		LastEventAt: now,
+		LastInputAt: now,
+		Backend:     r.defaultBackend,
+	}
+	r.sendMu.Unlock()
+	return sessionID, ch, tok, nil
+}
+
+// collectNewSessionText drains a new session's first-turn stream, forwarding
+// every event to broker subscribers (raw + derived part/turn.user events, so a
+// session-detail tab opened on the new id sees the live stream too) while
+// accumulating the assistant text parts.
+func (r *Router) collectNewSessionText(sessionID string, ch <-chan sender.StreamEvent) string {
 	var buf strings.Builder
 	asm := newStreamAssembler(r.defaultBackend)
 	for ev := range ch {
-		// Forward to broker (raw + derived part/turn.user events) so any
-		// session-detail subscriber that opens the new tab sees the live
-		// stream too.
 		if p := r.publishStream(sessionID, asm, ev); p != nil && p.Type == "text" {
 			if buf.Len() > 0 {
 				buf.WriteString("\n")
@@ -1246,11 +1518,7 @@ func (r *Router) CreateSession(ctx context.Context, cwd, initialMsg string, time
 			buf.WriteString(p.Content)
 		}
 	}
-
-	if waitCtx.Err() != nil && buf.Len() == 0 {
-		return sessionID, "", fmt.Errorf("create_session timeout (no response received within %s)", timeout)
-	}
-	return sessionID, buf.String(), nil
+	return buf.String()
 }
 
 // newUUIDv4 produces a randomly-generated UUIDv4 string. We avoid the

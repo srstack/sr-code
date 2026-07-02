@@ -848,6 +848,12 @@ pre.raw-markdown {
 .chat-message.user .role { color: var(--accent); }
 .chat-message.agent .role { color: var(--purple); }
 .chat-message.error .role { color: var(--danger); }
+/* Relay: a session's reply forwarded verbatim into the main chat. The role
+   header links to the source session; the accent bar marks it as the
+   session's voice rather than the router agent's. */
+.chat-message.relay { border-left: 2px solid var(--claude); padding-left: 0.5rem; }
+.chat-message.relay .role a.relay-source { color: var(--claude); text-decoration: none; }
+.chat-message.relay .role a.relay-source:hover { text-decoration: underline; }
 /* Grouped assistant turn: tool parts render as collapsible <details> within the
    single assistant card. Edit/Write expand by default; others collapse. */
 .chat-message.assistant .tool-details {

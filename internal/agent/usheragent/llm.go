@@ -86,7 +86,7 @@ const (
 // OpenAI roles. currentFocus is injected as a separate system message —
 // kept distinct from the static prompt so prompt-cache hit rate isn't
 // disturbed if/when caching is added later.
-func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string) (AgentResult, error) {
+func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string, relay RelaySink) (AgentResult, error) {
 	msgs := []ChatMessage{{Role: "system", Content: a.sysPrompt}}
 	if currentFocus != "" {
 		msgs = append(msgs, ChatMessage{
@@ -108,6 +108,15 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 
 	focus := "" // session id touched this turn; carries across the loop's tool calls
 
+	// Anti-poll guard: an immediately-repeated identical (name, args) tool
+	// call is blocked — but only when the first attempt SUCCEEDED, so a
+	// retry after an error result passes through. Weaker models "wait" for
+	// async replies by re-reading the same transcript page or re-sending.
+	// (Every error return below carries FocusSession so the server keeps
+	// the turn's routing even when the loop fails.)
+	lastCallSig := ""
+	lastCallOK := false
+
 	for i := 0; i < a.maxIter; i++ {
 		resp, err := a.client.ChatCompletion(ctx, ChatRequest{
 			Model:    a.model,
@@ -115,23 +124,38 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 			Tools:    a.tools,
 		})
 		if err != nil {
-			return AgentResult{}, err
+			return AgentResult{FocusSession: focus}, err
 		}
 		if len(resp.Choices) == 0 {
-			return AgentResult{}, errors.New("empty choices in chat response")
+			return AgentResult{FocusSession: focus}, errors.New("empty choices in chat response")
 		}
 		choice := resp.Choices[0]
 		msgs = append(msgs, choice.Message)
 
-		switch choice.FinishReason {
-		case "stop", "end_turn", "":
-			return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
-		case "tool_calls":
-			if len(choice.Message.ToolCalls) == 0 {
-				return AgentResult{}, errors.New("finish_reason=tool_calls but no tool_calls returned")
-			}
+		// Checked before the tool_calls dispatch: a max_tokens-truncated
+		// response may carry PARTIAL tool calls — dispatching a cut-off
+		// send_to_session would deliver a garbled half-message.
+		if choice.FinishReason == "length" {
+			return AgentResult{FocusSession: focus}, errors.New("response truncated by max_tokens")
+		}
+
+		// Some providers return tool calls with a missing/nonstandard
+		// finish_reason — dispatch on the presence of tool_calls, so such a
+		// turn isn't misread as an (empty) final answer.
+		if len(choice.Message.ToolCalls) > 0 {
 			for _, call := range choice.Message.ToolCalls {
-				out, focusUpdate := a.executeTool(ctx, call.Function.Name, call.Function.Arguments)
+				sig := call.Function.Name + "\x00" + call.Function.Arguments
+				if sig == lastCallSig && lastCallOK {
+					msgs = append(msgs, ChatMessage{
+						Role:       "tool",
+						ToolCallID: call.ID,
+						Content:    errResult("repeated identical tool call blocked — do not poll for a session's reply (it is relayed automatically) or resend the same message; answer the user now with what you have"),
+					})
+					continue
+				}
+				out, focusUpdate := a.executeTool(ctx, call.Function.Name, call.Function.Arguments, relay)
+				lastCallSig = sig
+				lastCallOK = !strings.HasPrefix(out, `{"error":`)
 				if focusUpdate != "" {
 					focus = focusUpdate
 				}
@@ -142,21 +166,50 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 				})
 			}
 			continue
-		case "length":
-			return AgentResult{}, errors.New("response truncated by max_tokens")
+		}
+
+		switch choice.FinishReason {
+		case "stop", "end_turn", "":
+			return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
+		case "tool_calls":
+			// Glitch: finish_reason says tool_calls but none were present
+			// (that case was dispatched above). Use the content if there is
+			// any; otherwise surface the malformed turn instead of silently
+			// returning an empty answer.
+			if strings.TrimSpace(choice.Message.Content) != "" {
+				return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
+			}
+			return AgentResult{FocusSession: focus}, errors.New("finish_reason=tool_calls but no tool_calls returned")
 		default:
-			return AgentResult{}, fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
+			return AgentResult{FocusSession: focus}, fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
 		}
 	}
-	return AgentResult{}, fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
+
+	// Tool budget exhausted with the model still calling tools. The user saw
+	// none of that traffic, so a bare error wastes the whole turn — instead
+	// force a text-only wrap-up: no tools offered, plus an explicit
+	// instruction to answer from what it already learned.
+	msgs = append(msgs, ChatMessage{
+		Role:    "user",
+		Content: "[system] Tool budget for this turn is exhausted. Stop calling tools and answer the user now, in plain text, from what you already learned. If you routed work to a session, just say so — its reply arrives automatically.",
+	})
+	resp, err := a.client.ChatCompletion(ctx, ChatRequest{Model: a.model, Messages: msgs})
+	if err != nil {
+		return AgentResult{FocusSession: focus}, fmt.Errorf("max iterations (%d) reached and wrap-up failed: %w", a.maxIter, err)
+	}
+	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
+		return AgentResult{FocusSession: focus}, fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
+	}
+	return AgentResult{Reply: resp.Choices[0].Message.Content, FocusSession: focus}, nil
 }
 
 // executeTool dispatches a tool call to AgentAPI. Output is always a JSON
 // string (or `{"error":"..."}`) — that's what OpenAI-protocol `role:"tool"`
 // messages expect for `content`. The second return value is the session id
 // this tool touched (empty for read-only / non-targeted tools); used by
-// Handle to compute the turn's FocusSession.
-func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (string, string) {
+// Handle to compute the turn's FocusSession. relay (may be nil) is where
+// send/create replies land once the target session completes its turn.
+func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay RelaySink) (string, string) {
 	switch name {
 	case "list_sessions":
 		b, _ := json.Marshal(a.enrichedSessions())
@@ -173,10 +226,18 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		if args.SessionID == "" || args.Text == "" {
 			return errResult("session_id and text are required"), ""
 		}
-		if err := a.api.SendToSession(args.SessionID, args.Text); err != nil {
+		if relay == nil {
+			// No relay channel (caller can't display async replies) —
+			// plain fire-and-forget.
+			if err := a.api.SendToSession(args.SessionID, args.Text); err != nil {
+				return errResult(err.Error()), ""
+			}
+			return `{"status":"sent"}`, args.SessionID
+		}
+		if err := a.api.SendToSessionRelayed(args.SessionID, args.Text, relay); err != nil {
 			return errResult(err.Error()), ""
 		}
-		return `{"status":"sent"}`, args.SessionID
+		return `{"status":"sent","note":"the session's reply will be shown to the user verbatim when it completes — do not wait for it or restate it"}`, args.SessionID
 
 	case "send_and_wait_for_response":
 		var args struct {
@@ -323,20 +384,32 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string) (stri
 		if args.Cwd == "" || args.InitialMessage == "" {
 			return errResult("cwd and initial_message are required"), ""
 		}
-		timeout := defaultCreateTimeout
-		if args.TimeoutSeconds > 0 {
-			t := time.Duration(args.TimeoutSeconds) * time.Second
-			if t > maxCreateTimeout {
-				t = maxCreateTimeout
+		if relay == nil {
+			timeout := defaultCreateTimeout
+			if args.TimeoutSeconds > 0 {
+				t := time.Duration(args.TimeoutSeconds) * time.Second
+				if t > maxCreateTimeout {
+					t = maxCreateTimeout
+				}
+				timeout = t
 			}
-			timeout = t
-		}
-		newID, text, err := a.api.CreateSession(ctx, args.Cwd, args.InitialMessage, timeout)
-		if err != nil {
-			payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text, "error": err.Error()})
+			newID, text, err := a.api.CreateSession(ctx, args.Cwd, args.InitialMessage, timeout)
+			if err != nil {
+				payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text, "error": err.Error()})
+				return string(payload), newID
+			}
+			payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text})
 			return string(payload), newID
 		}
-		payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text})
+		newID, err := a.api.CreateSessionRelayed(args.Cwd, args.InitialMessage, relay)
+		if err != nil {
+			return errResult(err.Error()), ""
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"session_id": newID,
+			"status":     "created",
+			"note":       "the session's first reply will be shown to the user verbatim when it completes — do not wait for it or restate it",
+		})
 		return string(payload), newID
 
 	case "list_pending_interactions":
@@ -506,11 +579,11 @@ DO NOT USE FOR: simple metadata trivia like "how many sessions", "which session 
 			Type: "function",
 			Function: ChatFunction{
 				Name: "send_to_session",
-				Description: `Deliver a message to a session and return immediately. The session keeps working in the background; you do NOT see its response here. Updates focus to the target session.
+				Description: `Deliver a message to a session. Returns immediately; when the session finishes its turn, its reply is automatically shown to the user IN THIS CHAT, verbatim — you never see it and must not wait for it or restate it. Updates focus to the target session.
 
-USE FOR: explicit "kick off X", "let it run", "I'll check the tab myself", or known long-running work (full test suites, deploys) that exceeds the 30-min wait ceiling.
+USE FOR: the default way to route ANY instruction or question to a session — quick questions, long tasks, "ask X to ...", "run Z", follow-ups. Task duration doesn't matter; the reply arrives whenever it's ready.
 
-DO NOT USE WHEN: the user wants to see the answer in this chat. Default to send_and_wait_for_response in that case.`,
+AFTER CALLING: reply with at most one short routing sentence (or nothing beyond what the dashboard already shows). Never say you will "report back" — the relay is automatic.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -528,27 +601,11 @@ DO NOT USE WHEN: the user wants to see the answer in this chat. Default to send_
 				},
 			},
 		},
-		{
-			Type: "function",
-			Function: ChatFunction{
-				Name: "send_and_wait_for_response",
-				Description: `Send a message to a session AND block until the assistant's reply (default 300s, max 1800s). Returns {response, error?}. Updates focus to the target session.
-
-USE FOR: the default way to relay an instruction that has a visible answer — "ask X to ...", "have X explain Y", "run Z and tell me what it says", any "and tell me" follow-up.
-
-DO NOT USE FOR: tasks obviously > 30 min (deploys, full builds). Use send_to_session for those instead.`,
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"session_id":      map[string]any{"type": "string"},
-						"text":            map[string]any{"type": "string"},
-						"timeout_seconds": map[string]any{"type": "integer", "description": "Optional. Default 300, max 1800."},
-					},
-					"required":             []string{"session_id", "text"},
-					"additionalProperties": false,
-				},
-			},
-		},
+		// send_and_wait_for_response is disabled for now: session replies reach
+		// the user through the relay channel, so the agent has no display
+		// reason to block its turn. The executeTool case + AgentAPI method are
+		// kept — re-add a tool definition here to give the model an explicit
+		// "wait because MY next step needs the reply content" chaining tool.
 		{
 			Type: "function",
 			Function: ChatFunction{
@@ -559,7 +616,7 @@ USE FOR: any question about what was DONE or SAID inside a session — "what did
 
 PAGING: with no offset you get the most recent ` + "`limit`" + ` turns. total tells you how many exist; if has_more is true there are older turns you haven't seen. To reach a specific spot — e.g. a turn_index from search_session_transcript, or the page before this one — pass offset (absolute, 0-based from the start). There is no depth limit; limit only bounds one page.
 
-DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For "switch to session X" prefer send_and_wait_for_response so a visible action confirms the switch.`,
+DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For "switch to session X" prefer send_to_session so a visible action confirms the switch.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -580,7 +637,7 @@ DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <cur
 
 USE FOR: locating something specific in a long session — "did session X mention the migration?", "where did we discuss the timeout bug?", "find the commit hash Y talked about". Use this INSTEAD of read_session_transcript when the answer could be buried past the last 20 turns.
 
-THEN: to see the full context around a hit, call read_session_transcript with offset=<turn_index> (jumps to that turn at any depth), or send_and_wait_for_response to ask the session directly.
+THEN: to see the full context around a hit, call read_session_transcript with offset=<turn_index> (jumps to that turn at any depth), or send_to_session to ask the session directly.
 
 DO NOT USE FOR: reading the latest activity (use read_session_transcript) or matching tool/command/file names — search covers prose only, not tool annotations.`,
 				Parameters: map[string]any{
@@ -602,7 +659,7 @@ DO NOT USE FOR: reading the latest activity (use read_session_transcript) or mat
 				Name: "search_all_sessions",
 				Description: `Search EVERY session at once for a string — the way to answer "which session mentioned X?" without knowing the id. Returns one row per matching session: {results: [{session_id, title, cwd, hit_count, turn_index, snippet}, ...], truncated}, ranked by hit_count (most matches first). Case-insensitive literal substring over user/assistant prose.
 
-USE FOR: locating the right session when you don't have its id — "which session was about the auth migration?", "who touched the deploy script?", "find the session discussing timeouts". Then route to the winner with send_and_wait_for_response, or drill in with read_session_transcript (offset=turn_index) / search_session_transcript on that one id.
+USE FOR: locating the right session when you don't have its id — "which session was about the auth migration?", "who touched the deploy script?", "find the session discussing timeouts". Then route to the winner with send_to_session, or drill in with read_session_transcript (offset=turn_index) / search_session_transcript on that one id.
 
 DO NOT USE FOR: searching inside a session you already identified (use search_session_transcript with its id) or matching tool/command/file names — search covers prose only.`,
 				Parameters: map[string]any{
@@ -621,17 +678,16 @@ DO NOT USE FOR: searching inside a session you already identified (use search_se
 			Type: "function",
 			Function: ChatFunction{
 				Name: "create_session",
-				Description: `Start a brand-new Claude Code session in cwd, send it an initial message, wait for first reply (default 300s, max 900s). Returns {session_id, response, error?}. New id becomes focus.
+				Description: `Start a brand-new Claude Code session in cwd and send it an initial message. Returns {session_id, status} immediately; the session's first reply is automatically shown to the user in this chat, verbatim — do not wait for it or restate it. New id becomes focus.
 
 USE FOR: the user wants fresh context that doesn't fit any session in <current_state> — scratch experiments, a new project, isolated debugging.
 
-DO NOT USE FOR: routing into an existing session that matches the work — use send_and_wait_for_response on that one. cwd must already exist; do not invent paths. /tmp is a safe default for ephemeral / scratch work when the user gives no hint.`,
+DO NOT USE FOR: routing into an existing session that matches the work — use send_to_session on that one. cwd must already exist; do not invent paths. /tmp is a safe default for ephemeral / scratch work when the user gives no hint.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"cwd":             map[string]any{"type": "string", "description": "Working directory for the new session. Must exist."},
 						"initial_message": map[string]any{"type": "string", "description": "First message sent to the new session."},
-						"timeout_seconds": map[string]any{"type": "integer", "description": "Optional. Default 300, max 900."},
 					},
 					"required":             []string{"cwd", "initial_message"},
 					"additionalProperties": false,

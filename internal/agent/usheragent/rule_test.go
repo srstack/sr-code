@@ -154,6 +154,31 @@ func (f *fakeAPI) CreateSession(_ context.Context, cwd, msg string, _ time.Durat
 	}
 	return f.createNewID, f.createReply, nil
 }
+
+// SendToSessionRelayed resolves the relay synchronously from waitReplies /
+// waitErrs so tests can assert the relayed text without goroutine plumbing.
+func (f *fakeAPI) SendToSessionRelayed(id, text string, onDone func(sessionID, reply string, err error)) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
+	f.sentTo = append(f.sentTo, id)
+	f.sentText = append(f.sentText, text)
+	if onDone != nil {
+		onDone(id, f.waitReplies[id], f.waitErrs[id])
+	}
+	return nil
+}
+
+func (f *fakeAPI) CreateSessionRelayed(cwd, msg string, onDone func(sessionID, reply string, err error)) (string, error) {
+	f.created = append(f.created, createCall{cwd, msg})
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	if onDone != nil {
+		onDone(f.createNewID, f.createReply, nil)
+	}
+	return f.createNewID, nil
+}
 func (f *fakeAPI) Archive(id string)                { f.archived[id] = true }
 func (f *fakeAPI) Unarchive(id string)              { f.archived[id] = false }
 func (f *fakeAPI) IsArchived(id string) bool        { return f.archived[id] }
@@ -162,7 +187,7 @@ func (f *fakeAPI) IsAutoApprove(id string) bool     { return f.autoApprove[id] }
 
 func handle(t *testing.T, a *RuleAgent, msg string) string {
 	t.Helper()
-	res, err := a.Handle(context.Background(), nil, "", msg)
+	res, err := a.Handle(context.Background(), nil, "", msg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +196,7 @@ func handle(t *testing.T, a *RuleAgent, msg string) string {
 
 func handleFull(t *testing.T, a *RuleAgent, msg string) AgentResult {
 	t.Helper()
-	res, err := a.Handle(context.Background(), nil, "", msg)
+	res, err := a.Handle(context.Background(), nil, "", msg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,5 +486,33 @@ func TestRule_New(t *testing.T) {
 	}
 	if got := handle(t, a, "/new /tmp"); !strings.Contains(got, "usage") {
 		t.Errorf("missing message should show usage, got %q", got)
+	}
+}
+
+func TestRuleSendRelaysReply(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345-0000", Title: "deploy"}}
+	api.waitReplies["abc12345-0000"] = "session reply text"
+	a := NewRule(api)
+
+	var relayed []string
+	relay := func(sessionID, reply string, err error) {
+		relayed = append(relayed, sessionID+"|"+reply)
+	}
+	res, err := a.Handle(context.Background(), nil, "", "/send abc build it", relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.sentTo) != 1 || api.sentTo[0] != "abc12345-0000" {
+		t.Errorf("sentTo = %v", api.sentTo)
+	}
+	if len(relayed) != 1 || relayed[0] != "abc12345-0000|session reply text" {
+		t.Errorf("relay sink got %v", relayed)
+	}
+	if !strings.Contains(res.Reply, "sent to") {
+		t.Errorf("Reply = %q", res.Reply)
+	}
+	if res.FocusSession != "abc12345-0000" {
+		t.Errorf("FocusSession = %q", res.FocusSession)
 	}
 }

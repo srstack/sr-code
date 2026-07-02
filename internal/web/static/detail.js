@@ -759,8 +759,69 @@ export async function showMainChat(id) {
   const sendBtn = document.getElementById('send');
   restoreDraft(promptEl);
 
-  await loadMainChatInfo(id);
-  await loadChatMessages(id);
+  // The "thinking…" placeholder lives until this turn's `turn.done` (or an
+  // error); one placeholder even across queued sends.
+  let placeholder = null;
+  const clearPlaceholder = () => { if (placeholder) { placeholder.remove(); placeholder = null; } };
+
+  // Delivery contract: no replay, but the server registers the subscription
+  // before the SSE headers flush. So: open the stream FIRST, refetch history
+  // on EVERY open — anything after the fetch snapshot is guaranteed to
+  // arrive on the stream. Messages streaming in mid-refetch are queued and
+  // re-applied after it renders; chatMsgKeys dedups the overlap.
+  let chatLoading = false;
+  const pendingWhileLoading = [];
+
+  const applyChatMessage = (data) => {
+    const m = data.message || {};
+    if (chatSeenKey(m)) return; // already rendered (refetch overlap)
+    if (m.role === 'user') {
+      // Adopt our optimistic echo (canonical ts, drop the optimistic mark);
+      // no matching echo means another client sent it — render it.
+      const list = document.getElementById('chat-scroll');
+      const echo = list && [...list.querySelectorAll(':scope > .chat-message.user.optimistic')]
+        .find(n => { const c = n.querySelector('.content'); return c && c.dataset.raw === m.content; });
+      if (echo) {
+        updateMessageTs(echo, m.ts);
+        echo.classList.remove('optimistic');
+        markChatSeen(m);
+      } else {
+        appendChatMessage(m);
+        markChatSeen(m);
+      }
+    } else {
+      clearPlaceholder();
+      appendChatMessage(m);
+      markChatSeen(m);
+    }
+    if (data.focus) renderFocus(data.focus);
+  };
+
+  const refetchChat = async () => {
+    chatLoading = true;
+    try {
+      await loadMainChatInfo(id);
+      await loadChatMessages(id);
+    } finally {
+      chatLoading = false;
+      // Re-apply anything that streamed in mid-fetch; chatSeenKey skips what
+      // the fetched snapshot already contained.
+      while (pendingWhileLoading.length) applyChatMessage(pendingWhileLoading.shift());
+    }
+  };
+
+  const es = new EventSource('/api/mainchats/' + encodeURIComponent(id) + '/events');
+  setCurrentES(es);
+  es.onopen = () => { refetchChat(); };
+  es.onerror = () => {/* auto-reconnect; onopen refetches */};
+  es.addEventListener('message', (ev) => {
+    if (ev.data == null) return;
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    if (chatLoading) { pendingWhileLoading.push(data); return; }
+    applyChatMessage(data);
+  });
+  es.addEventListener('turn.done', () => { clearPlaceholder(); });
 
   const submit = async () => {
     const text = promptEl.value;
@@ -769,33 +830,31 @@ export async function showMainChat(id) {
     promptEl.value = '';
     clearDraft();
     growPrompt(promptEl); // shrink back; programmatic clear fires no input event
-    // Optimistic: show the user's message immediately and a "thinking" placeholder
-    // since LLM agents may take 5–30s before any response comes back.
     const userNode = appendChatMessage({ role: 'user', content: text });
-    const placeholder = appendChatMessage({ role: 'agent', content: 'thinking…', _placeholder: true });
+    if (userNode) userNode.classList.add('optimistic');
+    if (!placeholder) placeholder = appendChatMessage({ role: 'agent', content: 'thinking…', _placeholder: true });
     try {
       const res = await fetch('/api/mainchats/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       });
-      const data = await res.json();
-      if (placeholder) placeholder.remove();
       if (!res.ok) {
-        appendChatMessage({ role: 'error', content: data.error || 'send failed', ts: new Date().toISOString() });
-      } else {
-        // Server returns the persisted user+agent pair. Canonicalize the
-        // optimistic user node's ts from the server, then render the agent
-        // reply (which already carries its server ts via appendChatMessage).
-        const msgs = data.messages || [];
-        const serverUser = msgs.find(m => m.role === 'user');
-        if (serverUser && serverUser.ts) updateMessageTs(userNode, serverUser.ts);
-        for (const m of msgs.filter(m => m.role !== 'user')) appendChatMessage(m);
-        // Focus may have shifted this turn — update the header.
-        renderFocus(data.focus);
+        const err = await res.json().catch(() => ({}));
+        clearPlaceholder();
+        // Rejected (429 queue full / 500 persist failure): the message was
+        // NOT accepted — drop the echo and restore the draft for a retry.
+        if (userNode) userNode.remove();
+        promptEl.value = text;
+        growPrompt(promptEl);
+        appendChatMessage({ role: 'error', content: err.error || 'send failed', ts: new Date().toISOString() });
       }
+      // 202 accepted: everything else arrives over SSE.
     } catch (e) {
-      if (placeholder) placeholder.remove();
+      clearPlaceholder();
+      if (userNode) userNode.remove();
+      promptEl.value = text;
+      growPrompt(promptEl);
       appendChatMessage({ role: 'error', content: String(e), ts: new Date().toISOString() });
     } finally {
       sendBtn.disabled = false;
@@ -1055,6 +1114,14 @@ function turnKey(t) {
   return (t.role || '') + '\x00' + (t.ts || '') + '\x00' + c.length + '\x00' + c.slice(0, 48);
 }
 
+// chatMsgKeys tracks which persisted messages are rendered, across the two
+// arrival paths (history refetch + SSE stream), so their overlap renders once.
+// Reset by loadChatMessages, whose snapshot becomes the new ground truth.
+let chatMsgKeys = new Set();
+function chatKey(m) { return (m.role || '') + '\x00' + (m.ts || '') + '\x00' + (m.content || ''); }
+function chatSeenKey(m) { return chatMsgKeys.has(chatKey(m)); }
+function markChatSeen(m) { chatMsgKeys.add(chatKey(m)); }
+
 async function loadChatMessages(id) {
   try {
     const res = await fetch('/api/mainchats/' + encodeURIComponent(id) + '/messages');
@@ -1063,9 +1130,10 @@ async function loadChatMessages(id) {
     const list = document.getElementById('chat-scroll');
     if (!list) return;
     list.querySelectorAll(':scope > .chat-loading, :scope > .chat-message').forEach(n => n.remove());
+    chatMsgKeys = new Set();
     setSuppressAppendScroll(true);
     try {
-      for (const m of data) appendChatMessage(m);
+      for (const m of data) { appendChatMessage(m); markChatSeen(m); }
     } finally {
       setSuppressAppendScroll(false);
     }

@@ -18,7 +18,10 @@ import (
 )
 
 type Message struct {
-	Role    string    `json:"role"`    // "user" | "agent"
+	// Role is "user" | "agent" | "relay". A relay message is a session's
+	// completed reply delivered verbatim into the chat by the server (the
+	// agent routes; it does not restate session output).
+	Role    string    `json:"role"`
 	Content string    `json:"content"`
 	Time    time.Time `json:"ts"`
 	// FocusSession records which Claude Code session the agent operated on
@@ -26,6 +29,8 @@ type Message struct {
 	// touch any session). Server uses the most recent non-empty value as
 	// the implicit focus when the next user message is ambiguous.
 	FocusSession string `json:"focus_session,omitempty"`
+	// SourceSession is the session whose reply this is (relay messages only).
+	SourceSession string `json:"source_session,omitempty"`
 }
 
 type Chat struct {
@@ -40,6 +45,16 @@ type Store struct {
 
 var idRE = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// ValidateID reports whether id is a legal chat id (path-safe). Unknown ids
+// are fine — chats are created lazily on first Append — so this is the whole
+// request-time check, without parsing any file.
+func ValidateID(id string) error {
+	if !idRE.MatchString(id) {
+		return errors.New("invalid mainchat id")
+	}
+	return nil
+}
+
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -48,8 +63,8 @@ func NewStore(dir string) (*Store, error) {
 }
 
 func (s *Store) path(id string) (string, error) {
-	if !idRE.MatchString(id) {
-		return "", errors.New("invalid mainchat id")
+	if err := ValidateID(id); err != nil {
+		return "", err
 	}
 	return filepath.Join(s.dir, id+".jsonl"), nil
 }

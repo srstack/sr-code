@@ -21,7 +21,7 @@ func NewRule(api AgentAPI) *RuleAgent { return &RuleAgent{api: api} }
 
 const helpText = `commands:
   /list                          list all Claude Code sessions
-  /send <prefix> <text>          send <text> to the matching session (fire-and-forget)
+  /send <prefix> <text>          send <text>; the session's reply is relayed here when done
   /ask <prefix> <text>           send <text> and wait for the session's reply
   /read <prefix> [n]             show the last n turns of a session (default 20)
   /new <cwd> <text>              start a new session in <cwd> with an initial message
@@ -34,7 +34,7 @@ const helpText = `commands:
 // every command is parsed in isolation. /send sets FocusSession in the
 // returned result so the server can carry it forward, matching the contract
 // LLMAgent uses.
-func (a *RuleAgent) Handle(ctx context.Context, _ []HistoryMessage, _ string, userMsg string) (AgentResult, error) {
+func (a *RuleAgent) Handle(ctx context.Context, _ []HistoryMessage, _ string, userMsg string, relay RelaySink) (AgentResult, error) {
 	msg := strings.TrimSpace(userMsg)
 	if msg == "" {
 		return AgentResult{}, nil
@@ -49,7 +49,7 @@ func (a *RuleAgent) Handle(ctx context.Context, _ []HistoryMessage, _ string, us
 	case "/list":
 		reply = a.list()
 	case "/send":
-		reply, focus = a.send(rest)
+		reply, focus = a.send(rest, relay)
 	case "/ask":
 		reply, focus = a.ask(ctx, rest)
 	case "/read":
@@ -122,7 +122,7 @@ func (a *RuleAgent) resolveSession(prefix string) (core.Session, string) {
 	return matches[0], ""
 }
 
-func (a *RuleAgent) send(args string) (string, string) {
+func (a *RuleAgent) send(args string, relay RelaySink) (string, string) {
 	prefix, text := splitOnce(args)
 	text = strings.TrimSpace(text)
 	if prefix == "" || text == "" {
@@ -132,7 +132,13 @@ func (a *RuleAgent) send(args string) (string, string) {
 	if errMsg != "" {
 		return errMsg, ""
 	}
-	if err := a.api.SendToSession(sess.ID, text); err != nil {
+	if relay == nil {
+		if err := a.api.SendToSession(sess.ID, text); err != nil {
+			return "send failed: " + err.Error(), ""
+		}
+		return fmt.Sprintf("sent to %s (%s)", shortID(sess.ID), titleOr(sess)), sess.ID
+	}
+	if err := a.api.SendToSessionRelayed(sess.ID, text, relay); err != nil {
 		return "send failed: " + err.Error(), ""
 	}
 	return fmt.Sprintf("sent to %s (%s)", shortID(sess.ID), titleOr(sess)), sess.ID
