@@ -82,21 +82,17 @@ const (
 )
 
 // Handle drives the tool-call loop until the model returns finish_reason="stop"
-// or maxIter is exhausted. history (≤ 40 messages = 20 turns) is mapped to
-// OpenAI roles. currentFocus is injected as a separate system message —
-// kept distinct from the static prompt so prompt-cache hit rate isn't
-// disturbed if/when caching is added later.
+// or maxIter is exhausted. history is mapped to OpenAI roles verbatim — the
+// server owns its shape (summary anchoring, relay excerpts), Handle owns only
+// the transport.
 func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, currentFocus, userMsg string, relay RelaySink) (AgentResult, error) {
+	// currentFocus is deliberately NOT injected as a message: a system
+	// message after the static prompt would invalidate the provider's prefix
+	// cache for the whole history every time focus changes. The focus id
+	// lives in the <current_state> block at the message tail; the behavioral
+	// rule ("default to the focus") lives in the static system prompt.
+	_ = currentFocus
 	msgs := []ChatMessage{{Role: "system", Content: a.sysPrompt}}
-	if currentFocus != "" {
-		msgs = append(msgs, ChatMessage{
-			Role: "system",
-			Content: fmt.Sprintf(
-				"Current focus: session %s. When the user gives an instruction without naming a session, default to this one. Don't announce switches or add focus links yourself — the dashboard does that automatically.",
-				currentFocus,
-			),
-		})
-	}
 	for _, h := range history {
 		role := "user"
 		if h.Role == "agent" {
@@ -201,6 +197,40 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 		return AgentResult{FocusSession: focus}, fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
 	}
 	return AgentResult{Reply: resp.Choices[0].Message.Content, FocusSession: focus}, nil
+}
+
+// summarizePrompt drives history compaction. The main chat is a router, not
+// a knowledge store — session transcripts remain fully recoverable via tools
+// — so the summary keeps only what future ROUTING needs and compresses hard.
+const summarizePrompt = `You compress the older part of a session-routing chat into a standing summary. Keep ONLY, as terse bullet points:
+
+- standing user instructions and preferences that remain in force ("always send X-type work to session Y", tone/format asks);
+- which sessions were used for what (short id + one-line purpose) and roughly when last touched;
+- unresolved threads: work still running, questions the user never answered, promised follow-ups.
+
+DROP: completed exchanges, pleasantries, session reply bodies (a pointer like "session ab12cd34 answered the migration question" is enough — full text stays recoverable from the session transcript). Do not invent anything not in the input. Answer with the summary only, no preamble.`
+
+// SummarizeHistory implements HistorySummarizer: one tools-free completion
+// over the flattened history.
+func (a *LLMAgent) SummarizeHistory(ctx context.Context, history []HistoryMessage) (string, error) {
+	var b strings.Builder
+	for _, h := range history {
+		fmt.Fprintf(&b, "%s: %s\n\n", h.Role, h.Content)
+	}
+	resp, err := a.client.ChatCompletion(ctx, ChatRequest{
+		Model: a.model,
+		Messages: []ChatMessage{
+			{Role: "system", Content: summarizePrompt},
+			{Role: "user", Content: b.String()},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
+		return "", errors.New("empty summary")
+	}
+	return resp.Choices[0].Message.Content, nil
 }
 
 // executeTool dispatches a tool call to AgentAPI. Output is always a JSON
@@ -612,7 +642,7 @@ AFTER CALLING: reply with at most one short routing sentence (or nothing beyond 
 				Name: "read_session_transcript",
 				Description: `Read one page of user/assistant turns from a session's transcript. Tool uses inside the session are inlined as ` + "`tool: Name`" + ` annotations. Returns {turns: [{role, content, ts}, ...], offset, total, has_more} — offset is the absolute index of the first turn returned, total the whole transcript's turn count.
 
-USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives.
+USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives. ALSO the recovery path for excerpted replies: a chat message showing "[… N chars omitted …]" has its full text here — recent replies are in the default page; older ones, locate via search_session_transcript and jump with offset.
 
 PAGING: with no offset you get the most recent ` + "`limit`" + ` turns. total tells you how many exist; if has_more is true there are older turns you haven't seen. To reach a specific spot — e.g. a turn_index from search_session_transcript, or the page before this one — pass offset (absolute, 0-based from the start). There is no depth limit; limit only bounds one page.
 

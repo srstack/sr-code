@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
 	"github.com/nexustar/usher/internal/auth"
@@ -1191,8 +1192,7 @@ type mainChatInfo struct {
 }
 
 const (
-	mainChatHistoryCap = 40 // 20 turns of user+agent
-	stateBlockMaxRows  = 30 // session rows in the rendered <current_state> preamble
+	stateBlockMaxRows = 30 // session rows in the rendered <current_state> preamble
 )
 
 // renderStateBlock produces a compact ground-truth dump of the router's
@@ -1411,6 +1411,10 @@ func (s *Server) chatQueue(chatID string) chan mainchat.Message {
 			for msg := range q {
 				s.releaseTurn(chatID) // slot freed on dequeue, not turn end
 				s.runMainChatTurn(chatID, msg)
+				// Compaction runs between turns on this same worker: no
+				// races with turns, and no user-visible latency unless the
+				// user sends again within the summarization window.
+				s.maybeCompactChat(chatID)
 			}
 		}()
 	}
@@ -1426,7 +1430,7 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 	// client can clear its thinking placeholder.
 	defer s.broadcastChat(chatID, chatFrame{Event: "turn.done"})
 
-	prior, err := s.main.Read(chatID, mainChatHistoryCap+2)
+	prior, err := s.main.Read(chatID, 0)
 	if err != nil {
 		s.logger.Warn("main chat read", "chat", chatID, "err", err)
 		return
@@ -1440,9 +1444,6 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 			prior = append(prior[:i:i], prior[i+1:]...)
 			break
 		}
-	}
-	if len(prior) > mainChatHistoryCap {
-		prior = prior[len(prior)-mainChatHistoryCap:]
 	}
 	prevFocus := ""
 	if fd := s.lastFocus(prior); fd != nil {
@@ -1461,7 +1462,7 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), agentTurnTimeout)
 	defer cancel()
-	res, err := s.agent.Handle(ctx, historyFromMessages(prior), prevFocus, enrichedUserMsg, relay)
+	res, err := s.agent.Handle(ctx, deriveChatHistory(prior), prevFocus, enrichedUserMsg, relay)
 	if err != nil {
 		s.logger.Warn("agent handle", "err", err)
 		// Keep res.FocusSession: Handle returns the focus accumulated before
@@ -1496,21 +1497,166 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 	}
 }
 
-// historyFromMessages maps persisted chat messages to the agent's history
-// shape. Relayed session replies become user-role observations tagged with
-// their source — they're information shown to the user, not the agent's own
-// words, and the tag lets the prompt tell the model exactly that.
-func historyFromMessages(msgs []mainchat.Message) []usheragent.HistoryMessage {
+// History derivation. The model's view of a chat is computed from the store
+// on every turn, and its shape is designed around provider prefix caches:
+// content, once derived at a position, never changes — relays get their form
+// at birth, and the only rewrite point is a compaction (which pays one
+// deliberate cache miss and then stays stable until the next one).
+const (
+	// Relay birth-form slider: a session reply ≤ relayVerbatimMax runes
+	// enters the history verbatim; a larger one enters as a head+tail
+	// excerpt with a transcript pointer. 0 = excerpt everything; the
+	// display/store always keeps the full text either way.
+	relayVerbatimMax = 2048
+	relayExcerptHead = 800
+	relayExcerptTail = 400
+
+	// historyBudgetRunes triggers compaction after a turn; the hard cap
+	// bounds the derivation by front-trimming when compaction is
+	// unavailable or failing (cache-hostile, correctness backstop only).
+	historyBudgetRunes  = 16 * 1024
+	historyHardCapRunes = 24 * 1024
+
+	// compactKeepRunes of recent history stay verbatim through a
+	// compaction; everything older folds into the summary.
+	compactKeepRunes = 6 * 1024
+
+	summarizeTimeout = 2 * time.Minute
+)
+
+// deriveChatHistory maps persisted messages to the model's history: anchored
+// at the last summary (which stands in for everything it covered), each
+// message in its immutable derived form, front-trimmed only at the hard cap.
+func deriveChatHistory(msgs []mainchat.Message) []usheragent.HistoryMessage {
+	msgs = sinceLastSummary(msgs)
 	out := make([]usheragent.HistoryMessage, 0, len(msgs))
+	total := 0
 	for _, m := range msgs {
-		h := usheragent.HistoryMessage{Role: m.Role, Content: m.Content}
-		if m.Role == "relay" {
-			h.Role = "user"
-			h.Content = usheragent.RelayTag(shortID(m.SourceSession)) + m.Content
-		}
+		h := deriveHistoryMessage(m)
 		out = append(out, h)
+		total += utf8.RuneCountInString(h.Content)
+	}
+	for len(out) > 1 && total > historyHardCapRunes {
+		total -= utf8.RuneCountInString(out[0].Content)
+		out = out[1:]
 	}
 	return out
+}
+
+// sinceLastSummary returns the summary (first) plus every message it does
+// not cover. The kept-verbatim tail of a compaction predates the summary in
+// the append-only store, so coverage is by CoveredThrough timestamp, not
+// position.
+func sinceLastSummary(msgs []mainchat.Message) []mainchat.Message {
+	si := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "summary" {
+			si = i
+			break
+		}
+	}
+	if si < 0 {
+		return msgs
+	}
+	covered := msgs[si].CoveredThrough
+	out := []mainchat.Message{msgs[si]}
+	for i, m := range msgs {
+		if i == si || m.Role == "summary" {
+			continue // older summaries are themselves folded into the newest
+		}
+		if !m.Time.After(covered) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// deriveHistoryMessage is the immutable model-view form of one message.
+// Relays and summaries become user-role observations tagged with their
+// nature — information shown to the user, not the agent's own words.
+func deriveHistoryMessage(m mainchat.Message) usheragent.HistoryMessage {
+	switch m.Role {
+	case "relay":
+		sid := shortID(m.SourceSession)
+		return usheragent.HistoryMessage{Role: "user", Content: usheragent.RelayTag(sid) + relayBirthForm(m.Content, sid)}
+	case "summary":
+		return usheragent.HistoryMessage{Role: "user", Content: usheragent.SummaryTag + m.Content}
+	default:
+		return usheragent.HistoryMessage{Role: m.Role, Content: m.Content}
+	}
+}
+
+// relayBirthForm renders a session reply for the model: verbatim when small,
+// head+tail excerpt with a recovery pointer when large. Long replies usually
+// carry their TLDR up front and their conclusion at the end; the middle is
+// one read_session_transcript call away, at full fidelity.
+func relayBirthForm(reply, sid string) string {
+	r := []rune(reply)
+	if len(r) <= relayVerbatimMax {
+		return reply
+	}
+	omitted := len(r) - relayExcerptHead - relayExcerptTail
+	return string(r[:relayExcerptHead]) +
+		fmt.Sprintf("\n[… %d chars omitted — read_session_transcript(%s) for the full reply]\n", omitted, sid) +
+		string(r[len(r)-relayExcerptTail:])
+}
+
+// maybeCompactChat folds the chat's older history into a summary message
+// once the derived view exceeds its budget. Only agents implementing
+// HistorySummarizer compact (the rule agent ignores history anyway); failure
+// is silent — the derivation's hard cap keeps prompts bounded until the next
+// attempt. The summary is appended (the store stays append-only) with
+// CoveredThrough marking the fold point, and is itself a broadcast message,
+// so clients render the compaction marker live.
+func (s *Server) maybeCompactChat(chatID string) {
+	summarizer, ok := s.agent.(usheragent.HistorySummarizer)
+	if !ok {
+		return
+	}
+	msgs, err := s.main.Read(chatID, 0)
+	if err != nil {
+		return
+	}
+	msgs = sinceLastSummary(msgs)
+
+	derived := make([]usheragent.HistoryMessage, len(msgs))
+	sizes := make([]int, len(msgs))
+	total := 0
+	for i, m := range msgs {
+		derived[i] = deriveHistoryMessage(m)
+		sizes[i] = utf8.RuneCountInString(derived[i].Content)
+		total += sizes[i]
+	}
+	if total <= historyBudgetRunes {
+		return
+	}
+
+	// Fold everything except a recent tail of ~compactKeepRunes.
+	cut := len(msgs)
+	kept := 0
+	for cut > 0 && kept < compactKeepRunes {
+		cut--
+		kept += sizes[cut]
+	}
+	if cut < 2 {
+		return // one giant message; folding it buys nothing
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), summarizeTimeout)
+	defer cancel()
+	text, err := summarizer.SummarizeHistory(ctx, derived[:cut])
+	if err != nil {
+		s.logger.Warn("chat compaction", "chat", chatID, "err", err)
+		return
+	}
+	if err := s.appendChat(chatID, mainchat.Message{
+		Role:           "summary",
+		Content:        text,
+		CoveredThrough: msgs[cut-1].Time,
+	}, nil); err != nil {
+		s.logger.Warn("chat compaction append", "chat", chatID, "err", err)
+	}
 }
 
 // relaySessionReply appends a session's completed reply to the chat verbatim.

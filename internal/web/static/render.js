@@ -166,6 +166,15 @@ export function appendChatMessage(m) {
       `<div class="role"${modelAttr}>${roleLabel}${ts}</div>` +
       renderAssistantParts(m.parts) +
       (m.uuid ? forkBtnHTML(m.uuid) : '');
+  } else if (role === 'summary') {
+    // Compaction marker: earlier turns were folded into this standing
+    // summary (model-side only — the full history stays above). Collapsed
+    // by default to keep the chat readable.
+    div.innerHTML =
+      `<details class="summary-body">` +
+      `<summary>earlier conversation compressed${ts}</summary>` +
+      `<div class="content" data-raw="${esc(m.content || '')}">${renderMarkdown(m.content || '')}</div>` +
+      `</details>`;
   } else {
     // User, error, agent, relay, or streaming placeholder (flat content).
     div.innerHTML =

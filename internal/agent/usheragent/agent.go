@@ -97,6 +97,10 @@ func RelayTag(sessionID string) string {
 	return fmt.Sprintf("[session %s replied]\n", sessionID)
 }
 
+// SummaryTag likewise marks a compaction summary in the history; the system
+// prompt documents it and a test pins the pair.
+const SummaryTag = "[summary of earlier conversation]\n"
+
 // RelaySink delivers a session's completed reply back to the main chat for
 // verbatim display. The server (which knows the chat id) supplies it per
 // Handle call; agents forward it into the relayed-send primitives. sessionID
@@ -121,6 +125,15 @@ type HistoryMessage struct {
 type AgentResult struct {
 	Reply        string
 	FocusSession string
+}
+
+// HistorySummarizer is the optional compaction hook: an Agent that also
+// implements it can compress the older portion of a chat's history into a
+// standing summary. The server type-asserts for it after each turn; agents
+// without it (RuleAgent, which ignores history anyway) simply never compact
+// and the derivation falls back to trimming.
+type HistorySummarizer interface {
+	SummarizeHistory(ctx context.Context, history []HistoryMessage) (string, error)
 }
 
 // Agent processes a user message in the main chat and returns a reply.

@@ -31,6 +31,12 @@ type Message struct {
 	FocusSession string `json:"focus_session,omitempty"`
 	// SourceSession is the session whose reply this is (relay messages only).
 	SourceSession string `json:"source_session,omitempty"`
+	// CoveredThrough (summary messages only) is the timestamp of the last
+	// message this summary folded in. The store is append-only, so a
+	// compaction's summary lands AFTER the recent tail it deliberately kept —
+	// this field is how the derivation knows to keep messages newer than the
+	// fold while dropping the folded ones.
+	CoveredThrough time.Time `json:"covered_through,omitzero"`
 }
 
 type Chat struct {

@@ -452,7 +452,11 @@ func TestLLMAgent_SendAndWaitTimeoutClamped(t *testing.T) {
 	}
 }
 
-func TestLLMAgent_HistoryAndFocusInjected(t *testing.T) {
+// TestLLMAgent_HistoryMappedNoFocusMessage: focus must NOT appear as a
+// message (it would break the provider's prefix cache on every switch — the
+// id lives in the tail <current_state> block instead); history maps straight
+// after the single static system prompt.
+func TestLLMAgent_HistoryMappedNoFocusMessage(t *testing.T) {
 	srv, m := newMockChatServer(t, []ChatResponse{chatTextResp("ok")})
 	defer srv.Close()
 	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
@@ -465,25 +469,23 @@ func TestLLMAgent_HistoryAndFocusInjected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Check the request the mock saw: should have system, system(focus), user, assistant, user
 	roles := []string{}
 	for _, m := range m.lastReq.Messages {
 		roles = append(roles, m.Role)
 	}
-	if len(roles) != 5 || roles[0] != "system" || roles[1] != "system" {
-		t.Errorf("expected [system, system(focus), user, assistant, user]; got %v", roles)
+	if len(roles) != 4 || roles[0] != "system" || roles[1] != "user" || roles[2] != "assistant" || roles[3] != "user" {
+		t.Fatalf("expected [system, user, assistant, user]; got %v", roles)
 	}
-	if !strings.Contains(m.lastReq.Messages[1].Content, "focused-session-id") {
-		t.Errorf("focus system message missing id: %q", m.lastReq.Messages[1].Content)
+	for _, msg := range m.lastReq.Messages {
+		if msg.Role == "system" && strings.Contains(msg.Content, "focused-session-id") {
+			t.Errorf("focus injected as a system message (cache-hostile): %q", msg.Content)
+		}
 	}
-	if m.lastReq.Messages[2].Content != "first thing" {
-		t.Errorf("history[0] = %q", m.lastReq.Messages[2].Content)
+	if m.lastReq.Messages[1].Content != "first thing" || m.lastReq.Messages[2].Content != "first reply" {
+		t.Errorf("history mapping wrong: %+v", m.lastReq.Messages[1:3])
 	}
-	if m.lastReq.Messages[3].Role != "assistant" || m.lastReq.Messages[3].Content != "first reply" {
-		t.Errorf("history[1] = %+v", m.lastReq.Messages[3])
-	}
-	if m.lastReq.Messages[4].Content != "next thing" {
-		t.Errorf("current user = %q", m.lastReq.Messages[4].Content)
+	if m.lastReq.Messages[3].Content != "next thing" {
+		t.Errorf("current user = %q", m.lastReq.Messages[3].Content)
 	}
 }
 
@@ -1043,5 +1045,35 @@ func TestSystemPromptDocumentsRelayTag(t *testing.T) {
 	want := strings.Replace(documented, "<id>", "abc12345", 1) + "\n"
 	if got != want {
 		t.Errorf("RelayTag = %q, want %q (matching the prompt's documented shape)", got, want)
+	}
+}
+
+func TestSystemPromptDocumentsSummaryTag(t *testing.T) {
+	if !strings.Contains(defaultLLMSystemPrompt, strings.TrimSuffix(SummaryTag, "\n")) {
+		t.Fatalf("system prompt no longer documents the summary marker %q", SummaryTag)
+	}
+}
+
+func TestSummarizeHistory(t *testing.T) {
+	srv, m := newMockChatServer(t, []ChatResponse{chatTextResp("- standing: send infra work to ab12cd34")})
+	defer srv.Close()
+	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
+
+	got, err := a.SummarizeHistory(context.Background(), []HistoryMessage{
+		{Role: "user", Content: "always send infra work to ab12cd34"},
+		{Role: "agent", Content: "noted"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "ab12cd34") {
+		t.Errorf("summary = %q", got)
+	}
+	// Tools-free call with the flattened history in the user message.
+	if len(m.lastReq.Tools) != 0 {
+		t.Errorf("summarize offered %d tools", len(m.lastReq.Tools))
+	}
+	if len(m.lastReq.Messages) != 2 || !strings.Contains(m.lastReq.Messages[1].Content, "always send infra work") {
+		t.Errorf("summarize request messages = %+v", m.lastReq.Messages)
 	}
 }

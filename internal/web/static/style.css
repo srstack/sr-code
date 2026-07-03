@@ -854,6 +854,16 @@ pre.raw-markdown {
 .chat-message.relay { border-left: 2px solid var(--claude); padding-left: 0.5rem; }
 .chat-message.relay .role a.relay-source { color: var(--claude); text-decoration: none; }
 .chat-message.relay .role a.relay-source:hover { text-decoration: underline; }
+/* Compaction marker: older turns folded into a standing summary (model-side
+   view only — the full messages remain above). Collapsed and muted. */
+.chat-message.summary .summary-body > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.chat-message.summary .content { color: var(--text-muted); font-size: 0.85rem; }
 /* Grouped assistant turn: tool parts render as collapsible <details> within the
    single assistant card. Edit/Write expand by default; others collapse. */
 .chat-message.assistant .tool-details {

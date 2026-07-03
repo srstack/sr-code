@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
 	"github.com/nexustar/usher/internal/broker"
@@ -351,24 +352,83 @@ func TestBroadcastEvictsSlowSubscriber(t *testing.T) {
 	}
 }
 
-func TestHistoryFromMessages(t *testing.T) {
+func TestDeriveChatHistoryRelayForms(t *testing.T) {
+	// Small relay: verbatim. Large relay (CJK to prove rune-safe cuts):
+	// head+tail excerpt with a recovery pointer, decided at derivation and
+	// stable forever.
+	big := strings.Repeat("中", relayVerbatimMax+500)
 	in := []mainchat.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "agent", Content: "routed"},
 		{Role: "relay", Content: "full reply", SourceSession: "0af0c1d2-3e4f-5678-9abc-def012345678"},
+		{Role: "relay", Content: big, SourceSession: "0af0c1d2-3e4f-5678-9abc-def012345678"},
 	}
-	out := historyFromMessages(in)
-	if len(out) != 3 {
+	out := deriveChatHistory(in)
+	if len(out) != 4 {
 		t.Fatalf("len = %d", len(out))
 	}
 	if out[0].Role != "user" || out[1].Role != "agent" {
 		t.Errorf("passthrough roles wrong: %+v", out[:2])
 	}
-	if out[2].Role != "user" {
-		t.Errorf("relay must map to user role, got %q", out[2].Role)
+	if out[2].Role != "user" ||
+		!strings.HasPrefix(out[2].Content, "[session 0af0c1d2 replied]\n") ||
+		!strings.HasSuffix(out[2].Content, "full reply") {
+		t.Errorf("small relay must be verbatim: %q", out[2].Content)
 	}
-	if !strings.HasPrefix(out[2].Content, "[session 0af0c1d2 replied]\n") || !strings.Contains(out[2].Content, "full reply") {
-		t.Errorf("relay content = %q", out[2].Content)
+	ex := out[3].Content
+	if !strings.Contains(ex, "chars omitted — read_session_transcript(0af0c1d2)") {
+		t.Errorf("large relay missing pointer: %q", ex)
+	}
+	if !utf8.ValidString(ex) {
+		t.Error("excerpt cut through a rune")
+	}
+	if got := utf8.RuneCountInString(ex); got > relayExcerptHead+relayExcerptTail+200 {
+		t.Errorf("excerpt too large: %d runes", got)
+	}
+}
+
+func TestDeriveChatHistorySummaryAnchoring(t *testing.T) {
+	t0 := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	in := []mainchat.Message{
+		{Role: "user", Content: "old question", Time: t0},
+		{Role: "agent", Content: "old answer", Time: t0.Add(1 * time.Minute)},
+		{Role: "user", Content: "recent tail msg", Time: t0.Add(2 * time.Minute)},
+		// Compaction folded everything through t0+1m; the tail above was
+		// kept verbatim and predates the summary in the append-only store.
+		{Role: "summary", Content: "standing stuff", Time: t0.Add(3 * time.Minute), CoveredThrough: t0.Add(1 * time.Minute)},
+		{Role: "user", Content: "new msg", Time: t0.Add(4 * time.Minute)},
+	}
+	out := deriveChatHistory(in)
+	want := []string{"[summary of earlier conversation]\nstanding stuff", "recent tail msg", "new msg"}
+	if len(out) != len(want) {
+		t.Fatalf("derived %d messages: %+v", len(out), out)
+	}
+	for i, w := range want {
+		if out[i].Content != w {
+			t.Errorf("out[%d] = %q, want %q", i, out[i].Content, w)
+		}
+	}
+	if out[0].Role != "user" {
+		t.Errorf("summary must map to user role, got %q", out[0].Role)
+	}
+}
+
+func TestDeriveChatHistoryHardCap(t *testing.T) {
+	// No summary available (e.g. rule agent): the hard cap front-trims.
+	var in []mainchat.Message
+	for i := 0; i < 40; i++ {
+		in = append(in, mainchat.Message{Role: "user", Content: strings.Repeat("x", 1024)})
+	}
+	out := deriveChatHistory(in)
+	total := 0
+	for _, h := range out {
+		total += utf8.RuneCountInString(h.Content)
+	}
+	if total > historyHardCapRunes {
+		t.Errorf("derived history %d runes exceeds hard cap %d", total, historyHardCapRunes)
+	}
+	if len(out) == 0 || out[len(out)-1].Content != in[len(in)-1].Content {
+		t.Error("trim must drop from the FRONT, keeping the newest tail")
 	}
 }
 
@@ -439,5 +499,92 @@ func TestRelayPreservesWhitespace(t *testing.T) {
 	}
 	if msgs[0].Content != raw {
 		t.Errorf("relay content altered: %q", msgs[0].Content)
+	}
+}
+
+// summarizingAgent adds the compaction hook to scriptedAgent.
+type summarizingAgent struct {
+	scriptedAgent
+	summarized [][]usheragent.HistoryMessage
+}
+
+func (f *summarizingAgent) SummarizeHistory(_ context.Context, history []usheragent.HistoryMessage) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.summarized = append(f.summarized, history)
+	return "standing summary (" + strconv.Itoa(len(history)) + " messages folded)", nil
+}
+
+// TestChatCompaction: once the derived history exceeds its budget, the turn
+// worker folds the older portion into an appended summary message, and the
+// next derivation anchors on it — under budget, summary first, recent tail
+// kept.
+func TestChatCompaction(t *testing.T) {
+	agent := &summarizingAgent{scriptedAgent: scriptedAgent{reply: "ok"}}
+	s := newChatTestServer(t, agent)
+
+	// Seed past the budget: 20 relays × 1000 runes ≈ 20k derived > 16k.
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < 20; i++ {
+		if err := s.main.Append("chat1", mainchat.Message{
+			Role: "relay", SourceSession: "sess-1",
+			Content: strings.Repeat("x", 1000),
+			Time:    base.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := httptest.NewServer(chatMux(s))
+	defer srv.Close()
+	postChat(t, srv.URL, "chat1", "hi")
+
+	var summary *mainchat.Message
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && summary == nil {
+		msgs, err := s.main.Read("chat1", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range msgs {
+			if msgs[i].Role == "summary" {
+				summary = &msgs[i]
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if summary == nil {
+		t.Fatal("no summary message appended")
+	}
+	if summary.CoveredThrough.IsZero() {
+		t.Error("summary missing CoveredThrough")
+	}
+	agent.mu.Lock()
+	if len(agent.summarized) == 0 || len(agent.summarized[0]) < 2 {
+		t.Errorf("summarizer input = %+v", agent.summarized)
+	}
+	agent.mu.Unlock()
+
+	// The next derivation must anchor on the summary and fit the budget.
+	msgs, _ := s.main.Read("chat1", 0)
+	hist := deriveChatHistory(msgs)
+	if !strings.HasPrefix(hist[0].Content, usheragent.SummaryTag) {
+		t.Errorf("derived history must start with the summary, got %q", hist[0].Content[:60])
+	}
+	total := 0
+	for _, h := range hist {
+		total += utf8.RuneCountInString(h.Content)
+	}
+	if total > historyBudgetRunes {
+		t.Errorf("post-compaction derived history still %d runes (> %d)", total, historyBudgetRunes)
+	}
+	// The kept tail must still be present after the summary.
+	var tailKept bool
+	for _, h := range hist[1:] {
+		if strings.Contains(h.Content, "xxxx") {
+			tailKept = true
+		}
+	}
+	if !tailKept {
+		t.Error("recent tail vanished after compaction")
 	}
 }
