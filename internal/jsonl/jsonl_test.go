@@ -459,3 +459,36 @@ func TestAssembler_MatchesReadTurns(t *testing.T) {
 		}
 	}
 }
+
+// Claude Code injects <task-notification> prompts when background work
+// (workflows, subagents) finishes — a one-line summary plus a machine
+// payload. Transcripts show the TUI-style summary, not the blob.
+func TestCompactTaskNotification(t *testing.T) {
+	blob := "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n" +
+		"<summary>Dynamic workflow \"Deep research\" completed</summary>\n<result>{\"huge\":\"json\"}</result>\n</task-notification>"
+	if got := compactTaskNotification(blob); got != `[task notification] Dynamic workflow "Deep research" completed` {
+		t.Errorf("got %q", got)
+	}
+	noSummary := "<task-notification>\n<status>completed</status>\n</task-notification>"
+	if got := compactTaskNotification(noSummary); got != "[task notification] background task completed" {
+		t.Errorf("no-summary got %q", got)
+	}
+	plain := "just a normal prompt with <summary>weird text</summary>"
+	if got := compactTaskNotification(plain); got != plain {
+		t.Errorf("plain text altered: %q", got)
+	}
+}
+
+// End to end through the Assembler: the notification turn's Content is the
+// compact form, so transcript reads and live turn.user events agree.
+func TestAssemblerCompactsTaskNotification(t *testing.T) {
+	a := NewAssembler()
+	line := `{"type":"user","timestamp":"2026-07-04T10:13:27Z","message":{"role":"user","content":"<task-notification>\n<summary>workflow done</summary>\n<result>{}</result>\n</task-notification>"}}`
+	completed, _ := a.FeedLine([]byte(line))
+	if len(completed) != 1 || completed[0].Role != "user" {
+		t.Fatalf("completed = %+v", completed)
+	}
+	if completed[0].Content != "[task notification] workflow done" {
+		t.Errorf("content = %q", completed[0].Content)
+	}
+}

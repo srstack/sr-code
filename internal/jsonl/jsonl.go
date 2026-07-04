@@ -237,7 +237,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		if text := extractUserText(ev.Message); text != "" {
 			completed = append(completed, Turn{
 				Role:    "user",
-				Content: text,
+				Content: compactTaskNotification(text),
 				Time:    ev.Timestamp,
 			})
 		}
@@ -440,6 +440,40 @@ func matchToolInfo(msg json.RawMessage, names map[string]toolInfo) (toolInfo, st
 		}
 	}
 	return toolInfo{}, ""
+}
+
+// compactTaskNotification rewrites Claude Code's self-injected
+// <task-notification> prompt (background task completion — one summary line
+// plus a machine payload that dwarfs it) to the short form the TUI itself
+// displays. Any other text passes through unchanged. This is a
+// display/transcript transform only; the raw line stays on disk untouched.
+func compactTaskNotification(text string) string {
+	if !strings.HasPrefix(strings.TrimSpace(text), "<task-notification>") {
+		return text
+	}
+	if s := xmlTagContent(text, "summary"); s != "" {
+		return "[task notification] " + s
+	}
+	if s := xmlTagContent(text, "status"); s != "" {
+		return "[task notification] background task " + s
+	}
+	return "[task notification]"
+}
+
+// xmlTagContent returns the trimmed text between the first <tag>…</tag> pair,
+// or "" — a narrow scan for Claude Code's notification markup, not an XML
+// parser.
+func xmlTagContent(s, tag string) string {
+	open, end := "<"+tag+">", "</"+tag+">"
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(s[i:], end)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[i+len(open) : i+j])
 }
 
 // extractUserText gets the text content from a real user message (not tool_result).
