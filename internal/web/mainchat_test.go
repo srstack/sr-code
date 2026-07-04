@@ -588,3 +588,42 @@ func TestChatCompaction(t *testing.T) {
 		t.Error("recent tail vanished after compaction")
 	}
 }
+
+// TestRelayForeignTurnFollowsReferencingChats: a foreign turn is relayed
+// only to chats whose recent history references the session.
+func TestRelayForeignTurnFollowsReferencingChats(t *testing.T) {
+	s := newChatTestServer(t, &scriptedAgent{})
+	if err := s.main.Append("chat1", mainchat.Message{Role: "agent", Content: "routed", FocusSession: "sess-X"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.main.Append("chat2", mainchat.Message{Role: "user", Content: "unrelated"}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.RelayForeignTurn("sess-X", "late background report")
+
+	msgs1, _ := s.main.Read("chat1", 0)
+	last := msgs1[len(msgs1)-1]
+	if last.Role != "relay" || last.Content != "late background report" || last.SourceSession != "sess-X" {
+		t.Errorf("chat1 last = %+v", last)
+	}
+	msgs2, _ := s.main.Read("chat2", 0)
+	for _, m := range msgs2 {
+		if m.Role == "relay" {
+			t.Errorf("chat2 must not receive the relay: %+v", m)
+		}
+	}
+}
+
+// TestStateBlockLegendAndLastEvent: the ground-truth block carries the
+// status legend and the last_event column header the prompt relies on.
+func TestStateBlockLegendAndLastEvent(t *testing.T) {
+	s := newChatTestServer(t, &scriptedAgent{})
+	block := s.renderStateBlock("")
+	if !strings.Contains(block, "status legend:") || !strings.Contains(block, "background work") {
+		t.Errorf("missing status legend: %q", block)
+	}
+	if !strings.Contains(block, "last_event") {
+		t.Errorf("missing last_event column: %q", block)
+	}
+}

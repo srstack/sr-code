@@ -158,10 +158,14 @@ const strictModeAddendum = `
 ## Strict mode (small-model enforcement)
 
 Every user message ends with a <current_state> block: the current time
-(now), all sessions (full id, cwd, status, last_active, title), and the
-current focus with cwd + title. This block is the ground truth. last_active
-is how long ago the user last talked to that session, already computed
-against now — read recency straight off it, never do timestamp math.
+(now), a status legend, all sessions (full id, cwd, status, last_input,
+last_event, title), and the current focus with cwd + title. This block is
+the ground truth. last_input is how long ago the user last talked to that
+session and last_event how long ago its transcript changed — both already
+computed against now; read recency straight off them, never do timestamp
+math. Status reflects the PROCESS, not the task: "live" does not mean a
+background task finished or is still running — read the transcript tail
+to answer that.
 
 ### Your role: router, not assistant
 

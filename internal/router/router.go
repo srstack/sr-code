@@ -51,6 +51,11 @@ type Router struct {
 	sendQueue  map[string][]pendingSend // sessionID -> sends waiting for the turn to end
 	creating   map[string]core.Session  // sessions usher is spawning, not yet on disk
 
+	// Foreign-turn watcher state (see foreignwatch.go): per-session log-size
+	// baseline (guarded by sendMu) and the completion handler.
+	foreignBase   map[string]int64
+	onForeignTurn ForeignTurnHandler
+
 	// runTurn overrides the turn executor ((*Router).runSend) in tests, so
 	// queue mechanics are testable without a live tmux sender. nil in
 	// production.
@@ -512,6 +517,10 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 // log lines.
 type streamAssembler interface {
 	FeedLine(raw []byte) (completed []jsonl.Turn, part *jsonl.TurnPart)
+	// Flush completes the in-progress assistant turn, if any. Assemblers
+	// close a turn on the NEXT user prompt, so a region that ends at a
+	// turn boundary still holds its final turn open until flushed.
+	Flush() *jsonl.Turn
 	Model() string
 }
 
@@ -618,6 +627,9 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 		delete(r.activeSend, sessionID)
 	}
 	delete(r.creating, sessionID) // discovery owns it once the turn hit disk
+	// Belt over markSendIdle's bump — and the ONLY bump for create paths,
+	// which end their first turn here without ever calling markSendIdle.
+	r.bumpForeignBaseLocked(sessionID)
 
 	// Promote the next queued send. runSend's event loop has ended, so the
 	// finished turn is fully published — the promoted send's pre() (relay
@@ -689,6 +701,9 @@ func (r *Router) markSendIdle(sessionID string, tok *sendToken) {
 	if ok {
 		delete(r.activeSend, sessionID)
 	}
+	// This turn's log lines are usher's own (already relayed by its
+	// collector) — move the foreign watcher's baseline past them.
+	r.bumpForeignBaseLocked(sessionID)
 	if sess, ok := r.creating[sessionID]; ok {
 		sess.Status = core.StatusIdle
 		sess.LastEventAt = time.Now()

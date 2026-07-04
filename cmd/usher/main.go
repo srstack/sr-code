@@ -262,6 +262,13 @@ func serve(args []string) error {
 	}
 
 	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, *uiDir, logger)
+
+	// Foreign-turn watcher: turns usher didn't start (background workflow
+	// continuations, pane-typed prompts) get relayed to the chats that
+	// routed to their session.
+	r.SetForeignTurnHandler(srv.RelayForeignTurn)
+	go r.RunForeignWatch(ctx, 0)
+
 	return srv.Run(ctx)
 }
 

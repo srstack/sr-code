@@ -1211,6 +1211,11 @@ func (s *Server) renderStateBlock(focusID string) string {
 	var b strings.Builder
 	b.WriteString("<current_state>\n")
 	fmt.Fprintf(&b, "now: %s\n", now.Format(time.RFC3339))
+	// The status legend heads off a costly misreading: "live" looks like
+	// "still working" but only means the process is warm — background work
+	// (workflows, subagents) runs invisibly under it, so status can never
+	// answer "is the task done?". The transcript can.
+	b.WriteString("status legend: running = a turn is executing | live = idle, accepts input (background work may still be in flight) | idle = no process. Status cannot tell whether a task finished — read the transcript tail for that.\n")
 	fmt.Fprintf(&b, "session_count: %d\n", len(sessions))
 	fmt.Fprintf(&b, "pending_permission_requests: %d\n", len(pending))
 	if focusID != "" {
@@ -1223,7 +1228,7 @@ func (s *Server) renderStateBlock(focusID string) string {
 	} else {
 		b.WriteString("focus: (none yet)\n")
 	}
-	b.WriteString("sessions:\n")
+	b.WriteString("sessions (id  cwd  status  last_input  last_event  title):\n")
 	rows := sessions
 	if len(rows) > stateBlockMaxRows {
 		rows = rows[:stateBlockMaxRows]
@@ -1233,11 +1238,15 @@ func (s *Server) renderStateBlock(focusID string) string {
 		if sess.ID == focusID {
 			mark = "  [FOCUS]"
 		}
-		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %-9s  %s%s\n",
+		// last_input = the user last talked to it; last_event = the
+		// transcript last changed. Transcript movement after the last input
+		// is the tell that background work produced something.
+		fmt.Fprintf(&b, "  %s  %-30s  %-7s  %-9s  %-9s  %s%s\n",
 			sess.ID,
 			truncateRunes(sess.Cwd, 30),
 			string(sess.Status),
 			humanizeAge(now, sess.LastInputAt),
+			humanizeAge(now, sess.LastEventAt),
 			truncateRunes(sess.Title, 50),
 			mark)
 	}
@@ -1657,6 +1666,44 @@ func (s *Server) maybeCompactChat(chatID string) {
 	}, nil); err != nil {
 		s.logger.Warn("chat compaction append", "chat", chatID, "err", err)
 	}
+}
+
+// followScanWindow bounds how far back a chat's history is scanned when
+// deciding whether it follows a session: reference the session within the
+// last N messages and foreign turns keep flowing in; go quiet for long
+// enough and the mirror stops.
+const followScanWindow = 100
+
+// RelayForeignTurn delivers a turn usher did NOT initiate — a background
+// workflow continuation, a prompt typed straight into the tmux pane — to
+// every chat that recently routed to the session. Follows are derived from
+// the chat histories themselves (FocusSession/SourceSession references), so
+// there is no registry to persist and restarts lose nothing. Wired as the
+// router's ForeignTurnHandler.
+func (s *Server) RelayForeignTurn(sessionID, text string) {
+	chats, err := s.main.List()
+	if err != nil {
+		return
+	}
+	for _, c := range chats {
+		msgs, err := s.main.Read(c.ID, followScanWindow)
+		if err != nil {
+			continue
+		}
+		if !referencesSession(msgs, sessionID) {
+			continue
+		}
+		s.relaySessionReply(c.ID, sessionID, text, nil)
+	}
+}
+
+func referencesSession(msgs []mainchat.Message, sessionID string) bool {
+	for _, m := range msgs {
+		if m.FocusSession == sessionID || m.SourceSession == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 // relaySessionReply appends a session's completed reply to the chat verbatim.
