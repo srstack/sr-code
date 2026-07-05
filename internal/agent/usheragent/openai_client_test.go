@@ -229,7 +229,7 @@ func TestChatClient_NoRetryOn4xxOther(t *testing.T) {
 	}
 }
 
-func TestChatClient_GivesUpAfterOneRetry(t *testing.T) {
+func TestChatClient_GivesUpAfterMaxRetries(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomicAdd(&calls, 1)
@@ -240,8 +240,8 @@ func TestChatClient_GivesUpAfterOneRetry(t *testing.T) {
 	if _, err := c.ChatCompletion(context.Background(), ChatRequest{Model: "x", Messages: []ChatMessage{{Role: "user", Content: "x"}}}); err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
-	if calls != 2 {
-		t.Errorf("expected 2 calls (1 + 1 retry), got %d", calls)
+	if calls != 1+maxRetryAttempts {
+		t.Errorf("expected %d calls (1 + %d retries), got %d", 1+maxRetryAttempts, maxRetryAttempts, calls)
 	}
 }
 

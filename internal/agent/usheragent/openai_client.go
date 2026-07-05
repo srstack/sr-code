@@ -244,16 +244,17 @@ type APIError struct {
 
 func (e *APIError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message) }
 
-// retry config — single retry on 429 or 5xx with a bounded back-off.
+// retry config — up to two retries on 429 or 5xx with exponential back-off.
 const (
-	maxRetryAttempts = 1
+	maxRetryAttempts = 2
 	defaultBackoff   = 2 * time.Second
 	maxBackoff       = 60 * time.Second
 )
 
 // ChatCompletion sends a non-streaming request and returns the decoded
-// response. On a transient failure (HTTP 429 or 5xx), retries once,
-// honoring the `Retry-After` header (capped at 60s) when present.
+// response. On a transient failure (HTTP 429 or 5xx), retries up to
+// maxRetryAttempts times, doubling the back-off per attempt and honoring
+// the `Retry-After` header (capped at 60s) when present.
 func (c *ChatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	var resp ChatResponse
 	var err error
@@ -265,7 +266,10 @@ func (c *ChatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatR
 		if attempt >= maxRetryAttempts || !shouldRetry(err) {
 			return resp, err
 		}
-		delay := backoffFor(err)
+		delay := backoffFor(err) << attempt
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
