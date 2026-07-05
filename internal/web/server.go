@@ -918,25 +918,35 @@ var sseForward = map[string]bool{
 	"turn.user":          true,
 }
 
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := s.router.GetSession(id); !ok {
-		writeErr(w, http.StatusNotFound, "session not found")
-		return
-	}
-
+// sseStart asserts streaming support and writes the SSE preamble (headers +
+// 200 + first flush). Returns false after answering 500 itself. The single
+// home for proxy-facing details like X-Accel-Buffering — fix once, fix every
+// stream.
+func sseStart(w http.ResponseWriter) (http.Flusher, bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
-		return
+		return nil, false
 	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	return flusher, true
+}
+
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	flusher, ok := sseStart(w)
+	if !ok {
+		return
+	}
 
 	ch, cancel := s.router.SubscribeSession(id)
 	defer cancel()
@@ -1022,18 +1032,10 @@ func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := sseStart(w)
 	if !ok {
-		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
 
 	// Size the pane to the viewer (cols + rows measured/derived client-side) so
 	// the mirror fills the panel without scroll; this also repairs any
@@ -1808,21 +1810,16 @@ func (s *Server) handleMainChatEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
-		return
-	}
 
+	// Subscribe BEFORE the preamble flushes: once the client sees the stream
+	// open, everything after its history fetch is guaranteed to arrive.
 	ch, cancel := s.subscribeChat(id)
 	defer cancel()
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	flusher, ok := sseStart(w)
+	if !ok {
+		return
+	}
 
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
