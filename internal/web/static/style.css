@@ -896,6 +896,18 @@ pre.raw-markdown {
   letter-spacing: 0;
   color: var(--text-muted);
 }
+.chat-message.assistant .tool-details .tool-copy {
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: 0.9rem;
+  cursor: pointer;
+  padding: 0.1rem 0.45rem; /* padding doubles as the mobile touch target */
+}
+.chat-message.assistant .tool-details .tool-copy svg { vertical-align: -0.15em; }
+.chat-message.assistant .tool-details .tool-copy.copied { color: var(--accent); }
+/* The button ends the summary line, so the mark can't shift content after it. */
+.chat-message.assistant .tool-details .tool-copy.copied::after { content: ' ✓'; }
 .chat-message.assistant .tool-details .tool-body {
   padding: 0 0.5rem 0.4rem;
   color: var(--text-muted);

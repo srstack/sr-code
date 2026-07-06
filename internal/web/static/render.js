@@ -115,7 +115,16 @@ export function renderToolPart(p) {
   }
   const expandByDefault = /^(Edit|Write)$/i.test(name);
   const openAttr = expandByDefault ? ' open' : '';
-  const label = target ? esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' : esc(name);
+  // Inline SVG, not a text glyph (⧉ renders as tofu on fonts without coverage).
+  const copyIcon =
+    '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
+    '<rect x="6" y="6" width="8" height="8" rx="1.5"/>' +
+    '<path d="M4.5 10.5h-1a1.5 1.5 0 0 1-1.5-1.5V3.5A1.5 1.5 0 0 1 3.5 2h5.5A1.5 1.5 0 0 1 10.5 3.5v1"/>' +
+    '</svg>';
+  const label = target
+    ? esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' +
+      '<button class="tool-copy" type="button" title="Copy" aria-label="Copy target">' + copyIcon + '</button>'
+    : esc(name);
   return `<details class="tool-details"${openAttr}>` +
     `<summary>${label}</summary>` +
     `<div class="tool-body" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>` +
