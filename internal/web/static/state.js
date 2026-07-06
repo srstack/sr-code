@@ -48,6 +48,11 @@ export function setCurrentDetailId(v) { currentDetailId = v; }
 export let suppressAppendScroll = false;
 export function setSuppressAppendScroll(v) { suppressAppendScroll = v; }
 
+// --editor-url template from GET /api/config ("" = no editor configured).
+// Fetched once at boot by app.js; read by the kebab popover.
+export let editorUrl = '';
+export function setEditorUrl(v) { editorUrl = v; }
+
 // --- constants used by multiple modules ---
 
 // claude's bottom UI is a fixed 4-row block: input-box top border, input line,

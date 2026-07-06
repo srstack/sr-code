@@ -74,7 +74,10 @@ type Server struct {
 	// catalog). "" when codex isn't enabled. Read per request so a plan change
 	// (cache refetch) shows up without restarting usher.
 	codexModelsPath string
-	uiDir           string
+	// editorURL is the --editor-url template for the "Open in editor" entry
+	// in the session actions menu; "" hides the entry.
+	editorURL string
+	uiDir     string
 
 	// Main-chat delivery. The user message is persisted in the POST handler
 	// (202 means durable); the agent turn then runs on the chat's single
@@ -98,6 +101,7 @@ func NewServer(
 	agent usheragent.Agent,
 	pushMgr *push.Manager,
 	codexModelsPath string,
+	editorURL string,
 	uiDir string,
 	logger *slog.Logger,
 ) *Server {
@@ -114,6 +118,7 @@ func NewServer(
 		push:            pushMgr,
 		logger:          logger,
 		codexModelsPath: codexModelsPath,
+		editorURL:       editorURL,
 		uiDir:           uiDir,
 		chatSubs:        map[string]map[chan chatFrame]func(){},
 		chatQueues:      map[string]chan mainchat.Message{},
@@ -253,6 +258,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	webMux.HandleFunc("GET /api/interactions", s.handleListInteractions)
 	webMux.HandleFunc("POST /api/interactions/{id}/respond", s.handleRespondInteraction)
+
+	webMux.HandleFunc("GET /api/config", s.handleConfig)
 
 	webMux.HandleFunc("GET /api/push/vapid-key", s.handlePushVAPIDKey)
 	webMux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
@@ -576,6 +583,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": id})
+}
+
+// handleConfig exposes the few server-side settings the SPA needs to render
+// optional UI.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"editor_url": s.editorURL})
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {

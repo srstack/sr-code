@@ -7,6 +7,7 @@ import {
   updateTabBadge,
   registerRenderSidebarSessions,
   refreshSubtitle, currentDetailId,
+  editorUrl,
 } from './state.js';
 import { statusDot, backendMark } from './render.js';
 import { loadList } from './list.js';
@@ -240,19 +241,34 @@ function openKebabPopover(btn) {
   const pauseItem = (status === 'live' || status === 'running' || status === 'awaiting_permission')
     ? `<button type="button" class="kebab-item" data-action="pause" data-id="${esc(id)}">Pause</button>`
     : '';
+  // Editor deep link — only when --editor-url is configured AND the button
+  // carries a cwd (the title menu does; sidebar rows don't need it). A real
+  // <a> so target="usher-editor" reuses one named tab across clicks — which
+  // is also why there's no rel="noopener": it would sever the browsing
+  // context group and name lookup with it, opening a fresh tab every click.
+  // {cwd} is substituted verbatim: templates place it in a path
+  // (vscode://file{cwd}) or query — encoding is the template author's call.
+  const cwd = btn.dataset.cwd;
+  const editorItem = (editorUrl && cwd)
+    ? `<a class="kebab-item" data-action="editor" target="usher-editor"
+         href="${esc(editorUrl.split('{cwd}').join(cwd))}">Open in editor</a>`
+    : '';
   kebabPopover.innerHTML =
+    editorItem +
     `<button type="button" class="kebab-item" data-action="rename" data-id="${esc(id)}">Rename</button>` +
     `<button type="button" class="kebab-item" data-action="${pinAction}" data-id="${esc(id)}">${pinLabel}</button>` +
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
     pauseItem +
     `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`;
   kebabPopover.hidden = false;
-  // Position below-right of the button; clamp to viewport edges so the
-  // menu stays fully visible on narrow screens.
+  // Position below the button — right-aligned for the edge-hugging kebabs,
+  // left-aligned for the title menu (its anchor sits at the header's left).
+  // Clamp to viewport edges so the menu stays fully visible on narrow screens.
   const r = btn.getBoundingClientRect();
   const popW = kebabPopover.offsetWidth;
   const popH = kebabPopover.offsetHeight;
-  let left = r.right - popW;
+  let left = btn.classList.contains('subtitle-menu') ? r.left : r.right - popW;
+  if (left + popW > window.innerWidth - 4) left = window.innerWidth - popW - 4;
   let top = r.bottom + 4;
   if (left < 4) left = 4;
   if (top + popH > window.innerHeight - 4) {
@@ -279,7 +295,9 @@ document.addEventListener('click', (e) => {
     loadSidebar();
     return;
   }
-  const kebab = e.target.closest('.kebab-btn');
+  // .subtitle-menu (the detail header's title-as-menu button) shares the
+  // popover and every action handler with the sidebar/list kebabs.
+  const kebab = e.target.closest('.kebab-btn, .subtitle-menu');
   if (kebab) {
     e.preventDefault();
     e.stopPropagation();
@@ -292,6 +310,11 @@ document.addEventListener('click', (e) => {
   }
   const item = e.target.closest('.kebab-item');
   if (item) {
+    if (item.dataset.action === 'editor') {
+      // Let the <a> navigate natively (named-tab target); just tidy up.
+      closeKebabPopover();
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     handleKebabAction(item.dataset.action, item.dataset.id);
@@ -426,6 +449,7 @@ async function handleKebabAction(action, id) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       loadSidebar();
       loadList();
+      if (id === currentDetailId) refreshSubtitle(id); // re-sync the header kebab datasets
     } catch (e) {
       console.warn('pin/unpin failed', e);
     }
@@ -437,6 +461,7 @@ async function handleKebabAction(action, id) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     loadSidebar();
     loadList(); // no-op unless the list view is open
+    if (id === currentDetailId) refreshSubtitle(id); // re-sync the header kebab datasets
   } catch (e) {
     console.warn('archive/unarchive failed', e);
   }
@@ -472,6 +497,7 @@ async function pauseSession(id) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     loadSidebar();
     loadList(); // no-op unless the list view is open
+    if (id === currentDetailId) refreshSubtitle(id); // re-sync the header kebab datasets
   } catch (e) {
     console.warn('pause failed', e);
     alert('Failed to pause session.');

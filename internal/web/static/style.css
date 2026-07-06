@@ -294,6 +294,8 @@ body {
   cursor: pointer;
   border-radius: 4px;
   font-family: inherit;
+  text-decoration: none; /* the editor item is an <a> */
+  box-sizing: border-box;
 }
 #kebab-popover .kebab-item:hover { background: var(--bg-hover); }
 #kebab-popover .kebab-item.kebab-danger { color: var(--danger-text); }
@@ -542,6 +544,41 @@ body.sidebar-collapsed .mobile-toggle {
   color: var(--text-faint);
 }
 .list-scroll .kebab-btn:hover { color: var(--text); }
+/* Title-as-menu (session actions): the detail header's title is the trigger.
+ * Bare text + a faint chevron at rest; the pressed/open state paints the
+ * pill-family gray under the whole title group. */
+.subtitle-menu {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0; /* let the title inside truncate */
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0.15rem 0.4rem;
+  margin-left: -0.4rem; /* keep the title's optical left edge where it was */
+  border-radius: 6px;
+}
+.subtitle-menu .session-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subtitle-chevron {
+  flex: none;
+  color: var(--text-faint);
+  /* The button row aligns by baseline (title text), which would seat the
+   * svg's bottom edge on the baseline — visibly low. Center it on the row
+   * box instead so it sits on the title's optical midline. */
+  align-self: center;
+}
+.subtitle-menu:active, .subtitle-menu.open { background: var(--bg-mainchat); }
+@media (hover: hover) {
+  .subtitle-menu:hover .subtitle-chevron { color: var(--text); }
+}
 /* Phone: title + actions only. Collapse the cwd/last-activity tracks to 0 and
    zero their cells — NOT display:none, which under table-layout:fixed re-maps
    the remaining cells left and drops the action button onto a zeroed column. */

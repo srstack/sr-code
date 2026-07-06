@@ -118,6 +118,10 @@ func serve(args []string) error {
 		"sessions whose jsonl mtime is older than this fall out of the sidebar's default view; 0 disables auto-archive (manual archive still works)")
 	uiDir := fs.String("ui-dir", "",
 		"serve the web UI from this directory instead of the embedded copy")
+	editorURL := fs.String("editor-url", "",
+		"URL template for an \"Open in editor\" entry in the session actions menu; {cwd} is replaced "+
+			"verbatim with the session's working directory (e.g. \"https://code.example.com/?folder={cwd}\" "+
+			"for code-server, \"vscode://file{cwd}\" for local VS Code). Empty hides the entry.")
 	disablePush := fs.Bool("disable-push", false,
 		"turn off Web Push browser notifications (turn-done + permission prompts). On by default, but "+
 			"inert until a browser opts in (which needs the user's notification-permission grant) — nothing "+
@@ -261,7 +265,7 @@ func serve(args []string) error {
 		return err
 	}
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, *uiDir, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, *editorURL, *uiDir, logger)
 
 	// Foreign-turn watcher: turns usher didn't start (background workflow
 	// continuations, pane-typed prompts) get relayed to the chats that

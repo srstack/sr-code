@@ -1,7 +1,7 @@
 // usher SPA: entry point.
 // Hash-based routing between session list, detail view, new session, and main chat.
 
-import { closeES, clearListInterval } from './state.js';
+import { closeES, clearListInterval, setEditorUrl } from './state.js';
 import './render.js'; // side-effect: sets up marked, render-pill listeners
 import { loadSidebar, updateSidebarActive } from './sidebar.js';
 import { showList, loadList } from './list.js';
@@ -35,5 +35,10 @@ setInterval(loadSidebar, 5000);
 loadSidebar();
 
 route();
+
+fetch('/api/config')
+  .then(r => (r.ok ? r.json() : null))
+  .then(c => { if (c) setEditorUrl(c.editor_url || ''); })
+  .catch(() => {});
 
 initServiceWorker();

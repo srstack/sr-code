@@ -873,10 +873,22 @@ export async function showMainChat(id) {
 }
 
 function renderSessionSubtitle(sess) {
+  // The title is the session-actions menu trigger ("title as menu"): the
+  // popover + handlers are the sidebar kebab's, reading everything off the
+  // button's datasets. Both showDetail and refreshSubtitle come through
+  // here, so the datasets track every action applied to the on-screen
+  // session. The chevron sits OUTSIDE the truncating title span so a long
+  // title can't ellipsize it away.
   subtitle.innerHTML =
     backendMark(sess.backend) +
     `<span class="subtitle-left">` +
-      `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+      `<button type="button" class="subtitle-menu"` +
+        ` data-id="${esc(sess.id)}" data-archived="${sess.archived ? '1' : '0'}"` +
+        ` data-pinned="${sess.pinned ? '1' : '0'}" data-status="${esc(sess.status || '')}"` +
+        ` data-cwd="${esc(sess.cwd || '')}" aria-label="session actions" aria-haspopup="menu">` +
+        `<strong class="session-title">${esc(sess.title || '(untitled)')}</strong>` +
+        `<svg class="subtitle-chevron" viewBox="0 0 10 6" width="10" height="6" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg>` +
+      `</button>` +
       `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
       `<span class="session-cwd">${esc(sess.cwd || '')}</span>` +
     `</span>`;
