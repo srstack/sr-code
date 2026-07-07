@@ -9,61 +9,37 @@ import (
 	"time"
 )
 
-// ExtractUserText flattens a user message's prompt text. Content may be a plain
-// string or an array of blocks; only text blocks contribute, so a tool_result
-// user event (tool output fed back to claude) yields "" and is not echoed.
-func ExtractUserText(raw json.RawMessage) string {
-	var line struct {
-		Message struct {
-			Content json.RawMessage `json:"content"`
-		} `json:"message"`
+// TurnUserText extracts the display text from router's backend-neutral
+// "turn.user" event. This is the event IM frontends should render for prompt
+// echoes; it is derived from either Claude jsonl or Codex rollout logs.
+func TurnUserText(raw json.RawMessage) string {
+	var o struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &line); err != nil {
+	if err := json.Unmarshal(raw, &o); err != nil || o.Role != "user" {
 		return ""
 	}
-	var s string
-	if err := json.Unmarshal(line.Message.Content, &s); err == nil {
-		return s
+	return o.Content
+}
+
+// PartText extracts assistant text from router's backend-neutral "part" event.
+// Tool parts and malformed payloads yield "".
+func PartText(raw json.RawMessage) string {
+	var o struct {
+		Role string `json:"role"`
+		Part struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"part"`
 	}
-	var blocks []textBlock
-	if err := json.Unmarshal(line.Message.Content, &blocks); err != nil {
+	if err := json.Unmarshal(raw, &o); err != nil {
 		return ""
 	}
-	return joinTextBlocks(blocks)
-}
-
-type textBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// joinTextBlocks concatenates the text blocks with blank lines between them;
-// non-text blocks contribute nothing.
-func joinTextBlocks(blocks []textBlock) string {
-	var b strings.Builder
-	for _, blk := range blocks {
-		if blk.Type == "text" && blk.Text != "" {
-			if b.Len() > 0 {
-				b.WriteString("\n\n")
-			}
-			b.WriteString(blk.Text)
-		}
-	}
-	return b.String()
-}
-
-// AssistantText flattens the text blocks of an assistant jsonl line. tool_use
-// and thinking blocks contribute nothing, so a tool-only message yields "".
-func AssistantText(raw json.RawMessage) string {
-	var line struct {
-		Message struct {
-			Content []textBlock `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.Unmarshal(raw, &line); err != nil {
+	if o.Role != "assistant" || o.Part.Type != "text" {
 		return ""
 	}
-	return joinTextBlocks(line.Message.Content)
+	return o.Part.Content
 }
 
 // ImageExts mirrors the show_image allowlist (cmd/usher/mcpcmd.go mcpImageExts
@@ -72,32 +48,26 @@ var ImageExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 }
 
-// ImageRefs extracts the file paths of any show_image MCP tool calls in an
-// assistant jsonl line. The tool surfaces as a tool_use block whose name ends
-// in "show_image" (MCP namespaces it, e.g. mcp__usher__show_image) carrying a
-// file_path input — the same shape the web UI renders as an inline image.
-func ImageRefs(raw json.RawMessage) []string {
-	var line struct {
-		Message struct {
-			Content []struct {
-				Type  string `json:"type"`
-				Name  string `json:"name"`
-				Input struct {
-					FilePath string `json:"file_path"`
-				} `json:"input"`
-			} `json:"content"`
-		} `json:"message"`
+// PartImageRefs extracts show_image file paths from a backend-neutral tool
+// "part" event. The router puts a tool's path-like argument into toolTarget,
+// so this covers streamed show_image calls without tying IM frontends to one
+// backend's raw log shape.
+func PartImageRefs(raw json.RawMessage) []string {
+	var o struct {
+		Role string `json:"role"`
+		Part struct {
+			Type       string `json:"type"`
+			ToolName   string `json:"toolName"`
+			ToolTarget string `json:"toolTarget"`
+		} `json:"part"`
 	}
-	if err := json.Unmarshal(raw, &line); err != nil {
+	if err := json.Unmarshal(raw, &o); err != nil {
 		return nil
 	}
-	var out []string
-	for _, b := range line.Message.Content {
-		if b.Type == "tool_use" && isShowImage(b.Name) && b.Input.FilePath != "" {
-			out = append(out, b.Input.FilePath)
-		}
+	if o.Role != "assistant" || o.Part.Type != "tool" || o.Part.ToolTarget == "" || !isShowImage(o.Part.ToolName) {
+		return nil
 	}
-	return out
+	return []string{o.Part.ToolTarget}
 }
 
 func isShowImage(name string) bool {

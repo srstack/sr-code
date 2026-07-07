@@ -94,9 +94,9 @@ func run(args []string) error {
 	defer cancel()
 
 	router := pluginapi.NewClient(*socket, logger)
-	// Only the event types the hub renders; tool_result user events in
-	// particular carry whole tool outputs the mirror would just discard.
-	router.EventTypes = []string{"user", "assistant", "subprocess.exit"}
+	// Only the backend-neutral event types the hub renders — raw log lines
+	// (with their whole tool payloads) never cross the socket.
+	router.EventTypes = []string{"turn.user", "part", "subprocess.exit"}
 	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
 	err = router.Ping(pingCtx)
 	pingCancel()

@@ -421,9 +421,9 @@ func (h *Hub) notifyTopic(thread int64, text string) {
 // completion — and, elsewhere, permission prompts — notify audibly.
 func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 	switch ev.Type {
-	case "user":
+	case "turn.user":
 		h.mirrorPrompt(ctx, ev)
-	case "assistant":
+	case "part":
 		h.mirrorAssistant(ctx, ev)
 	case "subprocess.exit":
 		h.notifyTurnComplete(ctx, ev)
@@ -434,7 +434,7 @@ func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 // topic shows the question). Prompts typed in Telegram are recorded by
 // handleInbound and skipped; tool_result "user" events have no prompt text.
 func (h *Hub) mirrorPrompt(ctx context.Context, ev broker.Event) {
-	text := strings.TrimSpace(imutil.ExtractUserText(ev.Raw))
+	text := strings.TrimSpace(imutil.TurnUserText(ev.Raw))
 	if text == "" || h.consumeRecentSent(ev.SessionID, text) {
 		return
 	}
@@ -468,8 +468,8 @@ func (h *Hub) mirrorPrompt(ctx context.Context, ev broker.Event) {
 // mirrorAssistant posts the assistant text and any show_image attachments of an
 // event into its topic as silent messages.
 func (h *Hub) mirrorAssistant(ctx context.Context, ev broker.Event) {
-	text := imutil.AssistantText(ev.Raw)
-	images := imutil.ImageRefs(ev.Raw)
+	text := imutil.PartText(ev.Raw)
+	images := imutil.PartImageRefs(ev.Raw)
 	if text == "" && len(images) == 0 {
 		return
 	}

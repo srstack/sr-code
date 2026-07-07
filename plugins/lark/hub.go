@@ -293,9 +293,9 @@ func (h *Hub) takePosted(id string) (hook.Pending, bool) {
 // handleEvent mirrors a single session event into its thread.
 func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 	switch ev.Type {
-	case "user":
+	case "turn.user":
 		h.mirrorPrompt(ctx, ev)
-	case "assistant":
+	case "part":
 		h.mirrorAssistant(ctx, ev)
 	case "subprocess.exit":
 		h.notifyTurnComplete(ctx, ev)
@@ -306,7 +306,7 @@ func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 // mirrorPrompt echoes a web/main-chat-originated prompt into its thread.
 // Prompts typed in Lark are recorded by HandleMessage and skipped.
 func (h *Hub) mirrorPrompt(ctx context.Context, ev broker.Event) {
-	text := strings.TrimSpace(imutil.ExtractUserText(ev.Raw))
+	text := strings.TrimSpace(imutil.TurnUserText(ev.Raw))
 	if text == "" || h.consumeRecentSent(ev.SessionID, text) {
 		return
 	}
@@ -330,8 +330,8 @@ func (h *Hub) mirrorPrompt(ctx context.Context, ev broker.Event) {
 // mirrorAssistant posts the assistant text and any show_image attachments of
 // an event into its thread.
 func (h *Hub) mirrorAssistant(ctx context.Context, ev broker.Event) {
-	text := imutil.AssistantText(ev.Raw)
-	images := imutil.ImageRefs(ev.Raw)
+	text := imutil.PartText(ev.Raw)
+	images := imutil.PartImageRefs(ev.Raw)
 	if text == "" && len(images) == 0 {
 		return
 	}

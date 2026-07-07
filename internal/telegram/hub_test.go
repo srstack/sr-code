@@ -147,14 +147,15 @@ func TestHubMirrorsAndLazyCreatesTopic(t *testing.T) {
 	go func() { defer close(done); _ = hub.Run(ctx) }()
 
 	asst := func(text string) broker.Event {
-		raw, _ := json.Marshal(map[string]any{"message": map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-		}})
-		return broker.Event{SessionID: "sessXYZ", Type: "assistant", Raw: raw}
+		raw, _ := json.Marshal(map[string]any{
+			"role": "assistant",
+			"part": map[string]any{"type": "text", "content": text},
+		})
+		return broker.Event{SessionID: "sessXYZ", Type: "part", Raw: raw}
 	}
 
 	fr.events <- asst("first reply")
-	fr.events <- broker.Event{SessionID: "sessXYZ", Type: "user", Raw: json.RawMessage(`{}`)} // ignored
+	fr.events <- broker.Event{SessionID: "sessXYZ", Type: "turn.user", Raw: json.RawMessage(`{}`)} // ignored
 	fr.events <- asst("second reply")
 	fr.events <- broker.Event{SessionID: "sessXYZ", Type: "subprocess.exit", Raw: json.RawMessage(`{}`)}
 
@@ -249,13 +250,13 @@ func TestHubMirrorsShowImage(t *testing.T) {
 	defer cancel()
 	go func() { _ = hub.Run(ctx) }()
 
-	raw, _ := json.Marshal(map[string]any{"message": map[string]any{
-		"content": []map[string]any{{
-			"type": "tool_use", "name": "mcp__usher__show_image",
-			"input": map[string]any{"file_path": "chart.png"},
-		}},
-	}})
-	fr.events <- broker.Event{SessionID: "s1", Type: "assistant", Raw: raw}
+	raw, _ := json.Marshal(map[string]any{
+		"role": "assistant",
+		"part": map[string]any{
+			"type": "tool", "toolName": "mcp__usher__show_image", "toolTarget": "chart.png",
+		},
+	})
+	fr.events <- broker.Event{SessionID: "s1", Type: "part", Raw: raw}
 
 	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(photos) == 1 })
 
@@ -362,8 +363,8 @@ func TestPromptEchoAndDedup(t *testing.T) {
 	go func() { _ = hub.Run(ctx) }()
 
 	userEv := func(text string) broker.Event {
-		raw, _ := json.Marshal(map[string]any{"message": map[string]any{"content": text}})
-		return broker.Event{SessionID: "s1", Type: "user", Raw: raw}
+		raw, _ := json.Marshal(map[string]any{"role": "user", "content": text})
+		return broker.Event{SessionID: "s1", Type: "turn.user", Raw: raw}
 	}
 
 	// Web-originated prompt (not recorded) → echoed with the ▶ prefix.
@@ -432,10 +433,11 @@ func TestPerSessionIsolation(t *testing.T) {
 	go func() { _ = hub.Run(ctx) }()
 
 	asst := func(sess, text string) broker.Event {
-		raw, _ := json.Marshal(map[string]any{"message": map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-		}})
-		return broker.Event{SessionID: sess, Type: "assistant", Raw: raw}
+		raw, _ := json.Marshal(map[string]any{
+			"role": "assistant",
+			"part": map[string]any{"type": "text", "content": text},
+		})
+		return broker.Event{SessionID: sess, Type: "part", Raw: raw}
 	}
 	fr.events <- asst("s1", "blocks here")
 	fr.events <- asst("s2", "should still send")

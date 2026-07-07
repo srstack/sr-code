@@ -7,34 +7,30 @@ import (
 	"time"
 )
 
-func TestAssistantText(t *testing.T) {
-	cases := []struct {
-		raw, want string
-	}{
-		{`{"message":{"content":[{"type":"text","text":"hello"}]}}`, "hello"},
-		{`{"message":{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}`, "a\n\nb"},
-		{`{"message":{"content":[{"type":"tool_use","id":"x"}]}}`, ""},
-		{`{"message":{"content":[{"type":"text","text":"keep"},{"type":"tool_use"}]}}`, "keep"},
+func TestTurnUserText(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{`{"role":"user","content":"do the thing"}`, "do the thing"},
+		{`{"role":"assistant","content":"nope"}`, ""},
+		{`{"message":{"content":"old shape"}}`, ""},
 		{`not json`, ""},
 	}
 	for _, c := range cases {
-		if got := AssistantText(json.RawMessage(c.raw)); got != c.want {
-			t.Errorf("AssistantText(%s) = %q, want %q", c.raw, got, c.want)
+		if got := TurnUserText(json.RawMessage(c.raw)); got != c.want {
+			t.Errorf("TurnUserText(%s) = %q, want %q", c.raw, got, c.want)
 		}
 	}
 }
 
-func TestExtractUserText(t *testing.T) {
+func TestPartText(t *testing.T) {
 	cases := []struct{ raw, want string }{
-		{`{"message":{"content":"do the thing"}}`, "do the thing"},
-		{`{"message":{"content":[{"type":"text","text":"hello"}]}}`, "hello"},
-		// tool_result user event carries no prompt text → not echoed.
-		{`{"message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"out"}]}}`, ""},
+		{`{"role":"assistant","part":{"type":"text","content":"hello"}}`, "hello"},
+		{`{"role":"assistant","part":{"type":"tool","content":"ignored"}}`, ""},
+		{`{"role":"user","part":{"type":"text","content":"ignored"}}`, ""},
 		{`not json`, ""},
 	}
 	for _, c := range cases {
-		if got := ExtractUserText(json.RawMessage(c.raw)); got != c.want {
-			t.Errorf("ExtractUserText(%s) = %q, want %q", c.raw, got, c.want)
+		if got := PartText(json.RawMessage(c.raw)); got != c.want {
+			t.Errorf("PartText(%s) = %q, want %q", c.raw, got, c.want)
 		}
 	}
 }
@@ -77,26 +73,26 @@ func TestTurnDuration(t *testing.T) {
 	}
 }
 
-func TestImageRefs(t *testing.T) {
+func TestPartImageRefs(t *testing.T) {
 	cases := []struct {
 		raw  string
 		want []string
 	}{
-		{`{"message":{"content":[{"type":"tool_use","name":"mcp__usher__show_image","input":{"file_path":"out/chart.png"}}]}}`, []string{"out/chart.png"}},
-		{`{"message":{"content":[{"type":"tool_use","name":"show_image","input":{"file_path":"/abs/a.jpg"}}]}}`, []string{"/abs/a.jpg"}},
-		{`{"message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`, nil},
-		{`{"message":{"content":[{"type":"tool_use","name":"mcp__x__show_image","input":{}}]}}`, nil}, // empty path skipped
+		{`{"role":"assistant","part":{"type":"tool","toolName":"mcp__usher__show_image","toolTarget":"out/chart.png"}}`, []string{"out/chart.png"}},
+		{`{"role":"assistant","part":{"type":"tool","toolName":"show_image","toolTarget":"/abs/a.jpg"}}`, []string{"/abs/a.jpg"}},
+		{`{"role":"assistant","part":{"type":"tool","toolName":"Bash","toolTarget":"ls"}}`, nil},
+		{`{"role":"assistant","part":{"type":"text","content":"hi"}}`, nil},
 		{`not json`, nil},
 	}
 	for _, c := range cases {
-		got := ImageRefs(json.RawMessage(c.raw))
+		got := PartImageRefs(json.RawMessage(c.raw))
 		if len(got) != len(c.want) {
-			t.Errorf("ImageRefs(%s) = %v, want %v", c.raw, got, c.want)
+			t.Errorf("PartImageRefs(%s) = %v, want %v", c.raw, got, c.want)
 			continue
 		}
 		for i := range got {
 			if got[i] != c.want[i] {
-				t.Errorf("ImageRefs(%s)[%d] = %q, want %q", c.raw, i, got[i], c.want[i])
+				t.Errorf("PartImageRefs(%s)[%d] = %q, want %q", c.raw, i, got[i], c.want[i])
 			}
 		}
 	}
