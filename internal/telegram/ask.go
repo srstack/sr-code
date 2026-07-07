@@ -2,12 +2,12 @@ package telegram
 
 import (
 	"context"
-	"encoding/json"
 	"html"
 	"strconv"
 	"strings"
 
 	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/imutil"
 )
 
 // askEntry remembers a posted AskUserQuestion awaiting an answer: the question
@@ -19,33 +19,13 @@ type askEntry struct {
 	thread   int64
 }
 
-// askQuestion is the subset of an AskUserQuestion question we render.
-type askQuestion struct {
-	Header      string `json:"header"`
-	Question    string `json:"question"`
-	MultiSelect bool   `json:"multiSelect"`
-	Options     []struct {
-		Label string `json:"label"`
-	} `json:"options"`
-}
-
-func parseQuestions(raw json.RawMessage) []askQuestion {
-	var in struct {
-		Questions []askQuestion `json:"questions"`
-	}
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return nil
-	}
-	return in.Questions
-}
-
 // postAskQuestion surfaces an AskUserQuestion in its topic. A single-select
 // question with options gets tappable buttons; any single question can also be
 // answered by just typing a reply in the topic (covering multiSelect and
 // free-form "other"). Only a multi-question prompt can't be mapped to one typed
 // reply, so that alone falls back to the web UI.
 func (h *Hub) postAskQuestion(ctx context.Context, thread int64, p hook.Pending) {
-	qs := parseQuestions(p.ToolInput)
+	qs := imutil.ParseQuestions(p.ToolInput)
 	if len(qs) != 1 {
 		text := "🔢 Multi-step question — please answer in the web UI."
 		h.sendAskPrompt(ctx, thread, p.ID, text, ignoreOnly(p.ID))
@@ -60,16 +40,16 @@ func (h *Hub) postAskQuestion(ctx context.Context, thread int64, p hook.Pending)
 	// Register first so a typed reply in this topic resolves the question.
 	h.putAsk(p.ID, askEntry{question: q.Question, labels: labels, thread: thread})
 
-	head := "❓ " + html.EscapeString(truncate(q.Question, 800))
+	head := "❓ " + html.EscapeString(imutil.Truncate(q.Question, 800))
 	if q.Header != "" {
-		head = "❓ " + html.EscapeString(truncate(q.Header, 200)) + "\n" + html.EscapeString(truncate(q.Question, 800))
+		head = "❓ " + html.EscapeString(imutil.Truncate(q.Header, 200)) + "\n" + html.EscapeString(imutil.Truncate(q.Question, 800))
 	}
 
 	if !q.MultiSelect && len(q.Options) > 0 {
 		rows := make([][]InlineKeyboardButton, 0, len(q.Options))
 		for i, o := range q.Options {
 			rows = append(rows, []InlineKeyboardButton{{
-				Text:         truncate(o.Label, 60),
+				Text:         imutil.Truncate(o.Label, 60),
 				CallbackData: "q:" + p.ID + ":" + strconv.Itoa(i),
 			}})
 		}
@@ -163,7 +143,7 @@ func (h *Hub) handleAskCallback(ctx context.Context, cb *CallbackQuery) {
 	if err := h.router.RespondInteraction(id, resp); err != nil {
 		toast = "already resolved"
 	}
-	_ = h.client.AnswerCallbackQuery(ctx, cb.ID, truncate(toast, 200))
+	_ = h.client.AnswerCallbackQuery(ctx, cb.ID, imutil.Truncate(toast, 200))
 	h.clearKeyboard(ctx, cb)
 }
 
