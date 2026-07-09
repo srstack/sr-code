@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkchannel "github.com/larksuite/oapi-sdk-go/v3/channel"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -31,6 +33,26 @@ type larkAPI interface {
 	ReplyImage(ctx context.Context, rootID, imageKey string) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, messageID, emojiType string) error
+	ThreadMessages(ctx context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error)
+	ChatMemberNames(ctx context.Context, chatID string) (map[string]string, error)
+	BotInfo(ctx context.Context) (string, error)
+}
+
+type mentionRef struct {
+	Key    string
+	OpenID string
+	Name   string
+}
+
+// pulledMsg is the hub-facing shape of one thread-history message.
+type pulledMsg struct {
+	ID         string
+	CreateTime int64
+	SenderOpen string
+	SenderApp  bool
+	MsgType    string
+	Content    string
+	Mentions   []mentionRef
 }
 
 // larkClient implements larkAPI on the official SDK client.
@@ -148,6 +170,143 @@ func (l *larkClient) React(ctx context.Context, messageID, emojiType string) err
 		return apiErr("react", resp.Code, resp.Msg)
 	}
 	return nil
+}
+
+func (l *larkClient) ThreadMessages(ctx context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error) {
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	builder := larkim.NewListMessageReqBuilder().
+		ContainerIdType("thread").
+		ContainerId(threadID).
+		SortType(larkim.ReadHistoryMessageV1SortTypeByCreateTimeAsc).
+		PageSize(50)
+	if afterMs > 0 {
+		builder.StartTime(strconv.FormatInt(afterMs/1000, 10))
+	}
+	var out []pulledMsg
+	truncated := false
+	pageToken := ""
+	for {
+		req := builder
+		if pageToken != "" {
+			req = req.PageToken(pageToken)
+		}
+		resp, err := l.c.Im.V1.Message.List(ctx, req.Build())
+		if err != nil {
+			return nil, false, err
+		}
+		if !resp.Success() {
+			return nil, false, apiErr("list messages", resp.Code, resp.Msg)
+		}
+		if resp.Data != nil {
+			for _, m := range resp.Data.Items {
+				pm := convertPulled(m)
+				// < not <=: same-ms siblings of the watermark must reach
+				// the hub's WMID tie-break.
+				if pm.ID == "" || pm.CreateTime < afterMs {
+					continue
+				}
+				out = append(out, pm)
+				if len(out) > limit {
+					truncated = true
+					out = out[len(out)-limit:]
+				}
+			}
+			if resp.Data.HasMore == nil || !*resp.Data.HasMore {
+				break
+			}
+			pageToken = deref(resp.Data.PageToken)
+			if pageToken == "" {
+				break
+			}
+		} else {
+			break
+		}
+	}
+	return out, truncated, nil
+}
+
+func convertPulled(m *larkim.Message) pulledMsg {
+	if m == nil {
+		return pulledMsg{}
+	}
+	create, _ := strconv.ParseInt(deref(m.CreateTime), 10, 64)
+	pm := pulledMsg{
+		ID:         deref(m.MessageId),
+		CreateTime: create,
+		MsgType:    deref(m.MsgType),
+	}
+	if m.Body != nil {
+		pm.Content = deref(m.Body.Content)
+	}
+	if m.Sender != nil {
+		pm.SenderApp = deref(m.Sender.SenderType) == "app"
+		if !pm.SenderApp {
+			pm.SenderOpen = deref(m.Sender.Id)
+		}
+	}
+	for _, mr := range m.Mentions {
+		if mr == nil {
+			continue
+		}
+		pm.Mentions = append(pm.Mentions, mentionRef{
+			Key:    deref(mr.Key),
+			OpenID: deref(mr.Id),
+			Name:   deref(mr.Name),
+		})
+	}
+	return pm
+}
+
+func (l *larkClient) ChatMemberNames(ctx context.Context, chatID string) (map[string]string, error) {
+	names := map[string]string{}
+	pageToken := ""
+	for {
+		req := larkim.NewGetChatMembersReqBuilder().
+			ChatId(chatID).
+			MemberIdType("open_id").
+			PageSize(100)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
+		resp, err := l.c.Im.V1.ChatMembers.Get(ctx, req.Build())
+		if err != nil {
+			return map[string]string{}, nil
+		}
+		if !resp.Success() {
+			return map[string]string{}, nil
+		}
+		if resp.Data != nil {
+			for _, m := range resp.Data.Items {
+				if m == nil {
+					continue
+				}
+				id, name := deref(m.MemberId), deref(m.Name)
+				if id != "" && name != "" {
+					names[id] = name
+				}
+			}
+			if resp.Data.HasMore == nil || !*resp.Data.HasMore {
+				break
+			}
+			pageToken = deref(resp.Data.PageToken)
+			if pageToken == "" {
+				break
+			}
+		} else {
+			break
+		}
+	}
+	return names, nil
+}
+
+func (l *larkClient) BotInfo(ctx context.Context) (string, error) {
+	identity := larkchannel.NewChannel(l.c, nil).GetBotIdentity(ctx)
+	if identity == nil || identity.OpenID == "" {
+		return "", fmt.Errorf("empty bot open_id")
+	}
+	return identity.OpenID, nil
 }
 
 func apiErr(op string, code int, msg string) error {

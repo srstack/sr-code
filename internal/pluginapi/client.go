@@ -36,6 +36,7 @@ type Client struct {
 // callTimeout bounds the synchronous calls (get / send / respond). SSE
 // subscriptions use their own untimed client.
 const callTimeout = 30 * time.Second
+const startTimeout = 60 * time.Second
 
 // NewClient returns a Client for the plugin API socket at path.
 func NewClient(path string, logger *slog.Logger) *Client {
@@ -95,6 +96,24 @@ func (c *Client) SendToSession(id, text string) error {
 	return c.post(ctx, "/v1/sessions/"+id+"/send", sendReq{Text: text})
 }
 
+// StartSession asks the router to spawn a brand-new session.
+func (c *Client) StartSession(cwd, initialMsg, model string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+	var out struct {
+		ID string `json:"id"`
+	}
+	err := c.postJSON(ctx, "/v1/sessions", startSessionReq{
+		Cwd:            cwd,
+		InitialMessage: initialMsg,
+		Model:          model,
+	}, &out, http.StatusAccepted)
+	if err != nil {
+		return "", err
+	}
+	return out.ID, nil
+}
+
 // RespondInteraction resolves a pending permission interaction.
 func (c *Client) RespondInteraction(id string, resp hook.Response) error {
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
@@ -137,6 +156,10 @@ func (c *Client) getJSON(ctx context.Context, path string, v any) error {
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) error {
+	return c.postJSON(ctx, path, body, nil, http.StatusNoContent)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, body any, out any, wantStatus int) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -151,8 +174,11 @@ func (c *Client) post(ctx context.Context, path string, body any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode != wantStatus {
 		return apiError(resp)
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
 }

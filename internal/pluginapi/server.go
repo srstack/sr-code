@@ -33,6 +33,7 @@ import (
 // list so a (re)connecting plugin can catch up on prompts it missed.
 type RouterAPI interface {
 	GetSession(id string) (core.Session, bool)
+	StartSession(cwd, initialMsg, model string) (string, error)
 	SubscribeAllSessions() (<-chan broker.Event, func())
 	SendToSession(id, text string) error
 	ListPendingInteractions() []hook.Pending
@@ -92,12 +93,33 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("POST /v1/sessions", s.handleStartSession)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/send", s.handleSend)
 	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.HandleFunc("GET /v1/interactions", s.handleInteractions)
 	mux.HandleFunc("POST /v1/interactions/{id}/respond", s.handleRespond)
 	return mux
+}
+
+type startSessionReq struct {
+	Cwd            string `json:"cwd"`
+	InitialMessage string `json:"initial_message"`
+	Model          string `json:"model"`
+}
+
+func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
+	var req startSessionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
+		return
+	}
+	id, err := s.router.StartSession(req.Cwd, req.InitialMessage, req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"id": id})
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {

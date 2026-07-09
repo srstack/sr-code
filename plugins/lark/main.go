@@ -6,7 +6,9 @@
 // Setup (Lark developer console):
 //   - create a self-built app, add the bot capability
 //   - permissions: im:message (send + receive), im:message:send_as_bot,
-//     im:resource (image upload), im:message.reactions:write
+//     im:message.reactions:write, im:resource (image upload), message
+//     history read for guest thread context, optionally im:chat:readonly
+//     for member display names
 //   - events: subscribe to im.message.receive_v1 with the "long connection"
 //     delivery mode; enable card callbacks over the same connection
 //   - add the bot to the target group chat and pass the chat id as --chat-id
@@ -68,6 +70,8 @@ func run(args []string) error {
 		"path to usher's plugin API socket (usher serve creates it in its data dir)")
 	statePath := fs.String("state", defaultStatePath(),
 		"session→thread map file; threads are re-adopted across restarts")
+	defaultCwd := fs.String("default-cwd", "/tmp",
+		"default cwd for Lark guest sessions")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -105,9 +109,10 @@ func run(args []string) error {
 	}
 
 	hub, err := NewHub(newLarkClient(*appID, secret, baseURL), router, Config{
-		ChatID:         *chatID,
-		StatePath:      *statePath,
-		AllowedUserIDs: splitIDs(*allowedUsers),
+		ChatID:          *chatID,
+		StatePath:       *statePath,
+		AllowedUserIDs:  splitIDs(*allowedUsers),
+		GuestDefaultCwd: *defaultCwd,
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("init hub: %w", err)

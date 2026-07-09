@@ -23,7 +23,9 @@ make lark          # from the repo root; builds ./usher-lark
 1. Create a **self-built app** in the [developer console](https://open.feishu.cn/app)
    (or open.larksuite.com for Lark) and enable the **bot** capability.
 2. Grant permissions: read/send group messages (`im:message`), upload images
-   (`im:resource`), add reactions (`im:message.reactions:write`).
+   (`im:resource`), add reactions (`im:message.reactions:write`), and message
+   history read for guest thread context. `im:chat:readonly` is optional and
+   only improves display names in guest transcripts.
 3. Under **Events & callbacks**, set the subscription mode to **long
    connection** (长连接) and subscribe to `im.message.receive_v1`; set the
    card callback mode to the long connection as well.
@@ -38,13 +40,32 @@ export LARK_APP_SECRET=...       # from the app's credentials page
 ./usher-lark \
   --app-id cli_xxx \
   --chat-id oc_xxx \
-  --allowed-user-ids ou_xxx      # your open_id; empty = any group member
+  --allowed-user-ids ou_xxx      # your open_id; empty = any canonical chat member, disables guest sessions
 ```
 
 `--domain lark` switches to open.larksuite.com (default is feishu).
 `usher serve` must already be running on the same machine; the plugin fails
 fast when the socket is unreachable and reconnects automatically if usher
 restarts.
+
+## Guest sessions
+
+When `--allowed-user-ids` is non-empty, an allowlisted user can mention the
+bot in any Lark group where the bot is present:
+
+```text
+@bot [--cwd /path] [--model model-name] instruction
+```
+
+The first mention creates a new usher session rooted at that Lark message.
+Later mentions in the same thread are turn boundaries: messages between
+mentions are pulled from Lark history and included as background context, but
+they are not sent as prompts by themselves.
+
+`--cwd` and `--model` are accepted only on the creation mention. The default
+cwd is `--default-cwd` (default `/tmp`). An empty allowlist disables guest
+sessions entirely; the canonical mirror chat keeps its existing empty
+allowlist behavior.
 
 ## Behavior notes
 

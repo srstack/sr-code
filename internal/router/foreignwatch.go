@@ -106,17 +106,31 @@ func (r *Router) checkForeignTurn(id string) {
 	r.setForeignBaseLocked(id, size)
 	r.sendMu.Unlock()
 
+	turns := foreignTurnsBetween(path, r.backendOf(id), base, size)
+	r.publishForeignTurnEvents(id, turns)
+
 	// Wake any open session-detail view: its turn-end handler refetches the
 	// transcript on exit events, so the foreign turn appears without a
 	// reload. No relay collector can be subscribed here (sends were
-	// excluded above), so nobody mistakes this for an usher turn.
-	r.broker.Publish(broker.Event{SessionID: id, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+	// excluded above), so nobody mistakes this for an usher turn. The
+	// payload carries the same turn stamps a live exit does, built from the
+	// just-parsed region (no re-read, no race with newer prompts).
+	payload := map[string]any{}
+	applyTurnTimestamps(payload, turns)
+	exitRaw, err := json.Marshal(payload)
+	if err != nil {
+		exitRaw = json.RawMessage(`{}`)
+	}
+	r.broker.Publish(broker.Event{SessionID: id, Type: "subprocess.exit", Raw: exitRaw})
 
 	if h := r.onForeignTurn; h != nil {
 		// Relay every turn completed in (base, size] — chained background
 		// continuations can finish more than one turn between polls, and
 		// the marker gate above only proves the LAST one is done.
-		for _, tn := range foreignTurnsBetween(path, r.backendOf(id), base, size) {
+		for _, tn := range turns {
+			if tn.Role != "assistant" {
+				continue
+			}
 			if text := flattenTurnText(tn, false); strings.TrimSpace(text) != "" {
 				h(id, text)
 			}
@@ -124,8 +138,29 @@ func (r *Router) checkForeignTurn(id string) {
 	}
 }
 
+func (r *Router) publishForeignTurnEvents(sessionID string, turns []jsonl.Turn) {
+	for _, tn := range turns {
+		switch tn.Role {
+		case "user":
+			raw, err := json.Marshal(map[string]any{"role": "user", "content": tn.Content, "ts": tn.Time})
+			if err == nil {
+				r.broker.Publish(broker.Event{SessionID: sessionID, Type: "turn.user", Raw: raw})
+			}
+		case "assistant":
+			for _, p := range tn.Parts {
+				raw, err := json.Marshal(map[string]any{
+					"role": "assistant", "ts": tn.Time, "model": tn.Model, "part": p,
+				})
+				if err == nil {
+					r.broker.Publish(broker.Event{SessionID: sessionID, Type: "part", Raw: raw})
+				}
+			}
+		}
+	}
+}
+
 // foreignTurnsBetween parses the log region (base, size] and returns its
-// completed assistant turns in order, via the same per-backend assembler the
+// completed turns in order, via the same per-backend assembler the
 // live path uses. base always sits at a line boundary in practice (it is
 // captured at turn ends / first sight); if a write ever races the capture,
 // the torn first line fails to parse and is skipped, never mis-grouped.
@@ -147,16 +182,12 @@ func foreignTurnsBetween(path, backend string, base, size int64) []jsonl.Turn {
 			continue
 		}
 		completed, _ := asm.FeedLine(line)
-		for _, tn := range completed {
-			if tn.Role == "assistant" {
-				out = append(out, tn)
-			}
-		}
+		out = append(out, completed...)
 	}
 	// Assemblers close an assistant turn on the NEXT user prompt; the
 	// region's final turn (proven complete by the marker gate) is still
 	// open and needs an explicit flush.
-	if tn := asm.Flush(); tn != nil && tn.Role == "assistant" {
+	if tn := asm.Flush(); tn != nil {
 		out = append(out, *tn)
 	}
 	return out

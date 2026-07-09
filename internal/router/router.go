@@ -605,20 +605,29 @@ func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMess
 	if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {
 		payload = map[string]any{}
 	}
-	if len(turns) >= 2 && turns[len(turns)-2].Role == "user" {
-		payload["user_ts"] = turns[len(turns)-2].Time
-	}
-	if turns[len(turns)-1].Role == "assistant" {
-		payload["assistant_ts"] = turns[len(turns)-1].Time
-		// Fork point of the turn that just finished, so the client can arm the
-		// fork control on the promoted-in-place bubble without a refetch.
-		payload["assistant_uuid"] = turns[len(turns)-1].UUID
-	}
+	applyTurnTimestamps(payload, turns)
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return raw
 	}
 	return b
+}
+
+// applyTurnTimestamps stamps payload with the trailing user→assistant
+// exchange's timestamps plus the assistant uuid (the fork anchor). Shared by
+// the live exit enrichment above and the foreign watcher's synthetic exit.
+func applyTurnTimestamps(payload map[string]any, turns []jsonl.Turn) {
+	last := len(turns) - 1
+	if last < 0 {
+		return
+	}
+	if turns[last].Role == "assistant" {
+		payload["assistant_ts"] = turns[last].Time
+		payload["assistant_uuid"] = turns[last].UUID
+	}
+	if last >= 1 && turns[last-1].Role == "user" {
+		payload["user_ts"] = turns[last-1].Time
+	}
 }
 
 func (r *Router) releaseSend(sessionID string, tok *sendToken) {

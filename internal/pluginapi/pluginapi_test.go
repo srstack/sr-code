@@ -26,6 +26,14 @@ type fakeRouter struct {
 	pending   []hook.Pending
 	pendingCh chan hook.Pending
 	responses map[string]hook.Response
+	startErr  error
+	started   []startCall
+}
+
+type startCall struct {
+	cwd     string
+	initial string
+	model   string
 }
 
 func newFakeRouter() *fakeRouter {
@@ -57,6 +65,18 @@ func (f *fakeRouter) SendToSession(id, text string) error {
 	}
 	f.sent[id] = append(f.sent[id], text)
 	return nil
+}
+
+func (f *fakeRouter) StartSession(cwd, initialMsg, model string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return "", f.startErr
+	}
+	id := "s_new"
+	f.started = append(f.started, startCall{cwd: cwd, initial: initialMsg, model: model})
+	f.sessions[id] = core.Session{ID: id, Cwd: cwd}
+	return id, nil
 }
 
 func (f *fakeRouter) ListPendingInteractions() []hook.Pending {
@@ -139,6 +159,30 @@ func TestSessionRoundTrip(t *testing.T) {
 	f.mu.Unlock()
 	if len(got) != 1 || got[0] != "do it" {
 		t.Fatalf("routed sends = %v", got)
+	}
+}
+
+func TestStartSessionRoundTrip(t *testing.T) {
+	f := newFakeRouter()
+	c := startServer(t, f)
+
+	id, err := c.StartSession("/tmp/work", "hello", "codex-test")
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if id != "s_new" {
+		t.Fatalf("id = %q", id)
+	}
+	f.mu.Lock()
+	started := append([]startCall(nil), f.started...)
+	f.startErr = errors.New("bad cwd")
+	f.mu.Unlock()
+	if len(started) != 1 || started[0].cwd != "/tmp/work" || started[0].initial != "hello" || started[0].model != "codex-test" {
+		t.Fatalf("started = %+v", started)
+	}
+
+	if _, err := c.StartSession("/nope", "hello", ""); err == nil || err.Error() != "bad cwd" {
+		t.Fatalf("StartSession error = %v", err)
 	}
 }
 

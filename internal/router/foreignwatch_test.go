@@ -1,8 +1,10 @@
 package router
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
+	"time"
 )
 
 func appendFile(t *testing.T, path, content string) {
@@ -17,8 +19,8 @@ func appendFile(t *testing.T, path, content string) {
 	}
 }
 
-const foreignTurn = `{"type":"user","message":{"role":"user","content":"<task-notification>workflow done</task-notification>"}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the research report"}]}}
+const foreignTurn = `{"type":"user","message":{"role":"user","content":"<task-notification>workflow done</task-notification>"},"timestamp":"2026-06-25T03:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the research report"}]},"uuid":"uu-fork","timestamp":"2026-06-25T03:00:08Z"}
 `
 
 // TestForeignTurnDetectedAndRelayedOnce: a turn the session ran on its own
@@ -55,8 +57,35 @@ func TestForeignTurnDetectedAndRelayedOnce(t *testing.T) {
 	}
 	select {
 	case ev := <-ch:
+		if ev.Type != "turn.user" {
+			t.Errorf("broker event 1 = %q, want turn.user", ev.Type)
+		}
+	default:
+		t.Fatal("no foreign user event published")
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "part" {
+			t.Errorf("broker event 2 = %q, want part", ev.Type)
+		}
+	default:
+		t.Fatal("no foreign assistant part event published")
+	}
+	select {
+	case ev := <-ch:
 		if ev.Type != "subprocess.exit" {
-			t.Errorf("broker event = %q, want subprocess.exit", ev.Type)
+			t.Errorf("broker event 3 = %q, want subprocess.exit", ev.Type)
+		}
+		var p struct {
+			UserTS        time.Time `json:"user_ts"`
+			AssistantTS   time.Time `json:"assistant_ts"`
+			AssistantUUID string    `json:"assistant_uuid"`
+		}
+		if err := json.Unmarshal(ev.Raw, &p); err != nil {
+			t.Fatalf("exit payload: %v", err)
+		}
+		if p.UserTS.IsZero() || p.AssistantTS.IsZero() || p.AssistantUUID != "uu-fork" {
+			t.Errorf("exit payload missing turn stamps: %s", ev.Raw)
 		}
 	default:
 		t.Error("no synthetic exit published for the detail view")

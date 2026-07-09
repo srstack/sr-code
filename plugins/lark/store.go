@@ -15,7 +15,11 @@ type binding struct {
 	Thread string `json:"thread,omitempty"` // thread id (omt_...), learned from the first reply
 	// Title is the session title the root card was last rendered with, so
 	// the hub only patches the card when the title actually changed.
-	Title string `json:"title,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Guest  bool   `json:"guest,omitempty"`
+	Chat   string `json:"chat,omitempty"`
+	WMTime int64  `json:"wm_time,omitempty"`
+	WMID   string `json:"wm_id,omitempty"`
 }
 
 // threadStore persists the session↔thread map so threads are re-adopted
@@ -71,6 +75,40 @@ func (s *threadStore) put(sessionID, rootID string) error {
 	defer s.mu.Unlock()
 	s.m[sessionID] = binding{Root: rootID}
 	s.byRoot[rootID] = sessionID
+	return s.persistLocked()
+}
+
+func (s *threadStore) putGuest(sessionID string, b binding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b.Guest = true
+	s.m[sessionID] = b
+	if b.Root != "" {
+		s.byRoot[b.Root] = sessionID
+	}
+	if b.Thread != "" {
+		s.byThread[b.Thread] = sessionID
+	}
+	return s.persistLocked()
+}
+
+func (s *threadStore) guestBinding(sessionID string) (binding, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.m[sessionID]
+	return b, ok && b.Guest
+}
+
+func (s *threadStore) setWatermark(sessionID string, t int64, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.m[sessionID]
+	if !ok {
+		return nil
+	}
+	b.WMTime = t
+	b.WMID = id
+	s.m[sessionID] = b
 	return s.persistLocked()
 }
 
