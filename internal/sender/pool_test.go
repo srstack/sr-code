@@ -24,6 +24,9 @@ type fakeTmux struct {
 	// captureAfterDown, if set, is returned by capture-pane once a "Down" key has
 	// been sent — lets a test model the resume chooser giving way to the composer.
 	captureAfterDown string
+	// captureAfterEnter, if set, is returned by capture-pane once an "Enter" key
+	// has been sent — models the trust dialog giving way to the composer.
+	captureAfterEnter string
 }
 
 func (f *fakeTmux) runStdin(in string, args ...string) (string, error) {
@@ -66,21 +69,31 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 		f.exists = false
 		return "", nil
 	case "capture-pane":
-		if f.captureAfterDown != "" {
-			for _, c := range f.cmds {
-				if len(c) > 0 && c[0] == "send-keys" {
-					for _, a := range c {
-						if a == "Down" {
-							return f.captureAfterDown, nil
-						}
-					}
-				}
-			}
+		if f.captureAfterDown != "" && f.keySent("Down") {
+			return f.captureAfterDown, nil
+		}
+		if f.captureAfterEnter != "" && f.keySent("Enter") {
+			return f.captureAfterEnter, nil
 		}
 		return f.captureOut, nil
 	default: // set-window-option, set-buffer, paste-buffer, send-keys
 		return "", nil
 	}
+}
+
+// keySent reports whether a send-keys command carrying key was recorded.
+// Caller holds f.mu (invoked from run's switch).
+func (f *fakeTmux) keySent(key string) bool {
+	for _, c := range f.cmds {
+		if len(c) > 0 && c[0] == "send-keys" {
+			for _, a := range c {
+				if a == key {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (f *fakeTmux) addWindow(name string) {

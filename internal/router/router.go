@@ -1412,6 +1412,13 @@ func validateCreateInputs(cwd, initialMsg string) (string, error) {
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		return "", fmt.Errorf("cwd %q: %w", cwd, err)
 	}
+	// Resolve symlinks: backends record the RESOLVED cwd in their logs (macOS
+	// /tmp → /private/tmp), and Codex id discovery matches rollouts to cwd by
+	// string equality — an unresolved alias here never matches, so the create
+	// times out while the session runs on unbound.
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = resolved
+	}
 	return cwd, nil
 }
 

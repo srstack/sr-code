@@ -247,3 +247,48 @@ func TestLockCwdSerializesSameCwdNotDifferent(t *testing.T) {
 		t.Fatalf("same cwd must proceed only after release; got %q", second)
 	}
 }
+
+// TestCodexInputReadyHomeAbbreviation: codex renders $HOME as ~ in the footer,
+// so the footer check must match both spellings — and not treat a mere prefix
+// of home as abbreviatable.
+func TestCodexInputReadyHomeAbbreviation(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	cwd := filepath.Join(home, "lc", "happy")
+	if !codexInputReady("gpt-5.5 default · ~/lc/happy\n", cwd) {
+		t.Error("~-abbreviated footer should match a home-relative cwd")
+	}
+	if !codexInputReady("gpt-5.5 default · ~\n", home) {
+		t.Error("footer · ~ should match cwd == home")
+	}
+	if codexInputReady("gpt-5.5 default · ~xyz\n", home+"xyz") {
+		t.Error("a prefix of home must not be abbreviated")
+	}
+	if codexInputReady("no footer here\n", cwd) {
+		t.Error("unrelated pane text must not read as ready")
+	}
+}
+
+// TestCodexWaitReadyAnswersTrustBeforeReady: with the trust dialog on screen
+// the banner alone must NOT read as ready — waitReady answers the dialog
+// first, then waits for the composer. The post-Enter pane keeps the answered
+// trust line in the transcript: residual trust text must not block readiness.
+func TestCodexWaitReadyAnswersTrustBeforeReady(t *testing.T) {
+	f := &fakeTmux{
+		captureOut: codexBannerMarker + "0.139.0)\n" + codexTrustMarker + " of this folder?\n",
+		captureAfterEnter: codexBannerMarker + "0.139.0)\n" + codexTrustMarker + " of this folder? Yes\n" +
+			"  gpt-5.5 default · /work\n",
+	}
+	s := testCodexSender(f, t.TempDir())
+	b := s.backend.(codexBackend)
+	if err := b.waitReady(context.Background(), "s1", "/work", true, false); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.keySent("Enter") {
+		t.Fatal("trust dialog was never answered")
+	}
+}

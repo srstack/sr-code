@@ -311,6 +311,14 @@ func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fres
 	for {
 		text, _ := b.p.paneText(sessionID)
 		switch {
+		// Trust is checked before readiness: the banner satisfies
+		// codexInputReady while the dialog is up, and a paste into the dialog
+		// is silently lost. The !trusted guard matters too — the answered
+		// trust line can linger in the transcript, and re-matching it would
+		// block the ready check forever.
+		case !trusted && strings.Contains(text, codexTrustMarker):
+			_ = b.p.sendKeys(sessionID, "Enter")
+			trusted = true
 		case codexInputReady(text, cwd):
 			// Settle before the paste so the Enter after it isn't dropped into a
 			// still-rendering composer.
@@ -318,9 +326,6 @@ func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fres
 				return ctx.Err()
 			}
 			return nil
-		case !trusted && strings.Contains(text, codexTrustMarker):
-			_ = b.p.sendKeys(sessionID, "Enter")
-			trusted = true
 		}
 		select {
 		case <-ctx.Done():
@@ -335,8 +340,17 @@ func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fres
 // codexInputReady reports whether the composer is ready: the bottom footer
 // carries "· <cwd>" (always visible when ready, unlike the top banner which can
 // scroll off a long resumed session); the banner is a fallback for short ones.
+// Codex abbreviates $HOME to ~ in the footer, so both spellings are tried.
 func codexInputReady(text, cwd string) bool {
-	return strings.Contains(text, "· "+cwd) || strings.Contains(text, codexBannerMarker)
+	if strings.Contains(text, "· "+cwd) || strings.Contains(text, codexBannerMarker) {
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if rel, ok := strings.CutPrefix(cwd, home); ok && (rel == "" || strings.HasPrefix(rel, "/")) {
+			return strings.Contains(text, "· ~"+rel)
+		}
+	}
+	return false
 }
 
 // rolloutCwd reads the cwd from a rollout's first line (the session_meta header)

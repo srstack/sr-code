@@ -359,3 +359,29 @@ func TestFlushSendQueueAborts(t *testing.T) {
 		t.Fatal("abort callback never ran")
 	}
 }
+
+// TestValidateCreateInputsResolvesSymlinks: a cwd reached through a symlink
+// (macOS /tmp → /private/tmp) must come back resolved, or Codex id discovery
+// never matches the rollout's recorded cwd.
+func TestValidateCreateInputsResolvesSymlinks(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := validateCreateInputs(link, "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("cwd = %q, want %q", got, want)
+	}
+}
