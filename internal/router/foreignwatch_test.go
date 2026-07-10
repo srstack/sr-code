@@ -143,6 +143,7 @@ func TestTurnCompleteMarker(t *testing.T) {
 		{"claude", `{"type":"system","subtype":"turn_duration","durationMs":12}`, true},
 		{"claude", `{"type":"assistant","message":{}}`, false},
 		{"codex", `{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`, true},
+		{"codex", `{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"t1"}}`, true}, // announced v2 rename
 		{"codex", `{"type":"event_msg","payload":{"type":"agent_message"}}`, false},
 		{"claude", `not json`, false},
 	}

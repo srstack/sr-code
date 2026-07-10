@@ -174,6 +174,40 @@ func TestAssemblerTurnEndTime(t *testing.T) {
 	}
 }
 
+// The assembler must honor the announced v2 rename of the end-of-turn event
+// like the tailer's IsTurnComplete does: turn_complete stamps UUID (the fork
+// anchor) and EndTime and flushes the turn — not just task_complete.
+func TestAssemblerTurnCompleteV2Rename(t *testing.T) {
+	asm := NewAssembler()
+	var done []jsonl.Turn
+	for _, ln := range []string{
+		`{"timestamp":"2026-06-15T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}`,
+		`{"timestamp":"2026-06-15T00:00:05Z","type":"event_msg","payload":{"type":"turn_complete","turn_id":"t9"}}`,
+	} {
+		completed, _ := asm.Feed([]byte(ln))
+		done = append(done, completed...)
+	}
+	if len(done) != 1 {
+		t.Fatalf("got %d completed turns, want 1", len(done))
+	}
+	if done[0].UUID != "t9" {
+		t.Errorf("UUID = %q, want t9 (fork anchor from turn_complete)", done[0].UUID)
+	}
+	if want := time.Date(2026, 6, 15, 0, 0, 5, 0, time.UTC); !done[0].EndTime.Equal(want) {
+		t.Errorf("EndTime = %v, want %v", done[0].EndTime, want)
+	}
+}
+
+func TestIsTaskCompleteV2Rename(t *testing.T) {
+	v2 := `{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"t1"}}`
+	if !isTaskComplete([]byte(v2), "t1") {
+		t.Error("turn_complete with matching turn_id not recognized as fork end")
+	}
+	if isTaskComplete([]byte(v2), "other") {
+		t.Error("turn_id mismatch must not match")
+	}
+}
+
 func TestIsTurnComplete(t *testing.T) {
 	complete := `{"timestamp":"2026-06-14T00:00:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"x"}}`
 	if !IsTurnComplete([]byte(complete)) {

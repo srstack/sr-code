@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/jsonl"
 )
 
@@ -241,20 +242,11 @@ func lastFileLine(path string, size int64) ([]byte, error) {
 }
 
 // turnCompleteMarker reports whether line is the backend's end-of-turn log
-// marker — the same facts the send tailer keys on (Claude Code:
+// marker — the same predicates the send tailer keys on (Claude Code:
 // system/turn_duration; Codex: event_msg/task_complete).
 func turnCompleteMarker(backend string, line []byte) bool {
 	if backend == "codex" {
-		var o struct {
-			Type    string `json:"type"`
-			Payload struct {
-				Type string `json:"type"`
-			} `json:"payload"`
-		}
-		if json.Unmarshal(line, &o) != nil {
-			return false
-		}
-		return o.Type == "event_msg" && o.Payload.Type == "task_complete"
+		return codexrollout.IsTurnComplete(line)
 	}
 	var o struct {
 		Type    string `json:"type"`

@@ -101,10 +101,11 @@ func rewriteForkHeader(headerLine []byte, newID, srcID string) ([]byte, error) {
 	return json.Marshal(top)
 }
 
-// isTaskComplete reports whether raw is an event_msg/task_complete with the
-// given turn_id — the inclusive end of the forked turn.
+// isTaskComplete reports whether raw is the end-of-turn event (task_complete,
+// or turn_complete under its announced v2 rename) with the given turn_id — the
+// inclusive end of the forked turn.
 func isTaskComplete(raw []byte, turnID string) bool {
-	var l line
+	var l envelope
 	if err := json.Unmarshal(raw, &l); err != nil || l.Type != "event_msg" {
 		return false
 	}
@@ -115,7 +116,7 @@ func isTaskComplete(raw []byte, turnID string) bool {
 	if err := json.Unmarshal(l.Payload, &p); err != nil {
 		return false
 	}
-	return p.Type == "task_complete" && p.TurnID == turnID
+	return (p.Type == "task_complete" || p.Type == "turn_complete") && p.TurnID == turnID
 }
 
 func quote(s string) json.RawMessage {

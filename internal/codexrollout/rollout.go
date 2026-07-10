@@ -48,11 +48,19 @@ func SessionIDFromPath(path string) string {
 	return uuidRe.FindString(filepath.Base(path))
 }
 
+// envelope is the minimal rollout record shape for the line predicates below —
+// unlike `line` it skips the timestamp, so a malformed timestamp can't fail an
+// unrelated check.
+type envelope struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
 // IsTurnComplete reports whether a rollout line is the end-of-turn marker. The
 // sender/tail layer uses it the same way it uses Claude's system/turn_duration:
 // the signal that the model has truly finished, not merely emitted a message.
 func IsTurnComplete(raw []byte) bool {
-	var l line
+	var l envelope
 	if err := json.Unmarshal(raw, &l); err != nil || l.Type != "event_msg" {
 		return false
 	}
@@ -70,7 +78,7 @@ func IsTurnComplete(raw []byte) bool {
 // turn is in flight. The records codex logs at submit time (turn_context, the
 // user's own message) don't count: they appear whether or not the model runs.
 func IsTurnActivity(raw []byte) bool {
-	var l line
+	var l envelope
 	if err := json.Unmarshal(raw, &l); err != nil {
 		return false
 	}
@@ -273,7 +281,7 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		tp := jsonl.TurnPart{Type: "text", Content: p.Message}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return nil, &tp
-	case "task_complete":
+	case "task_complete", "turn_complete": // v1 wire name and its announced v2 rename
 		// End-of-turn marker: stamp the turn with its turn_id (the fork point a
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
 		if a.cur != nil {
