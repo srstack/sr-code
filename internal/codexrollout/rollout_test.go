@@ -153,6 +153,10 @@ func TestIsTurnComplete(t *testing.T) {
 	if !IsTurnComplete([]byte(complete)) {
 		t.Error("task_complete not detected as turn-complete")
 	}
+	v2 := `{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"x"}}`
+	if !IsTurnComplete([]byte(v2)) {
+		t.Error("turn_complete (announced v2 rename) not detected as turn-complete")
+	}
 	for _, neg := range []string{
 		`{"type":"event_msg","payload":{"type":"task_started"}}`,
 		`{"type":"event_msg","payload":{"type":"agent_message","message":"hi"}}`,
@@ -161,6 +165,34 @@ func TestIsTurnComplete(t *testing.T) {
 	} {
 		if IsTurnComplete([]byte(neg)) {
 			t.Errorf("false positive on %q", neg)
+		}
+	}
+}
+
+func TestIsTurnActivity(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want bool
+	}{
+		// Submit-time records: written whether or not the model ever runs.
+		{`{"type":"turn_context","payload":{"model":"gpt-5"}}`, false},
+		{`{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}`, false},
+		{`{"type":"response_item","payload":{"type":"message","role":"user"}}`, false},
+		// task_complete is completion, not activity — turnComplete's job.
+		{`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"x"}}`, false},
+		{`not json`, false},
+		// Model output: proof a real turn is in flight.
+		{`{"type":"event_msg","payload":{"type":"task_started"}}`, true},
+		{`{"type":"event_msg","payload":{"type":"turn_started"}}`, true}, // announced v2 rename
+		{`{"type":"event_msg","payload":{"type":"agent_message","message":"hello"}}`, true},
+		{`{"type":"event_msg","payload":{"type":"agent_reasoning","text":"…"}}`, true},
+		{`{"type":"response_item","payload":{"type":"message","role":"assistant"}}`, true},
+		{`{"type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1"}}`, true},
+		{`{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}`, true},
+		{`{"type":"response_item","payload":{"type":"reasoning"}}`, true},
+	} {
+		if got := IsTurnActivity([]byte(tc.line)); got != tc.want {
+			t.Errorf("IsTurnActivity(%s) = %v, want %v", tc.line, got, tc.want)
 		}
 	}
 }

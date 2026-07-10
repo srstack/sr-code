@@ -55,6 +55,7 @@ type Sender struct {
 	logger      *slog.Logger
 	t           timing
 	tail        tailConfig
+	leftovers   *idlePaneStore // frames left by turnless '/'-command sends (see tailCfg)
 
 	// busy holds session ids with an in-flight turn. The pool consults it
 	// (via isBusy) so LRU eviction never kills a session mid-turn. Marked
@@ -157,7 +158,8 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		poll:          150 * time.Millisecond,
 	}
 	p := newPool(runner, claudeCmd, extra, env, maxLive, logger)
-	b := claudeBackend{p: p, t: t, projectsDir: projectsDir, claudeCmd: claudeCmd, extraArgs: extra}
+	lp := &idlePaneStore{}
+	b := claudeBackend{p: p, t: t, projectsDir: projectsDir, claudeCmd: claudeCmd, extraArgs: extra, leftovers: lp}
 	s := &Sender{
 		pool:        p,
 		backend:     b,
@@ -165,7 +167,8 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		logger:      logger,
 		busy:        make(map[string]struct{}),
 		t:           t,
-		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete},
+		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity},
+		leftovers:   lp,
 	}
 	s.pool.isBusy = s.isBusy
 	return s
@@ -237,7 +240,7 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		logger:      logger,
 		busy:        make(map[string]struct{}),
 		t:           t,
-		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete},
+		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity},
 	}
 	s.pool.isBusy = s.isBusy
 	return s
@@ -349,7 +352,8 @@ func (s *Sender) StartCodexSession(ctx context.Context, tempID, prompt, cwd, mod
 			return
 		}
 		// Offset 0: a brand-new rollout — tail the whole first turn from the top.
-		for ev := range tailTurn(ctx, path, 0, s.logger, s.tail) {
+		// No idle-frame recording: only the claude backend consumes it.
+		for ev := range tailTurn(ctx, path, 0, s.logger, s.tailCfg(realID, false)) {
 			if !sendEvent(ctx, out, ev) {
 				return
 			}
@@ -503,7 +507,7 @@ func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, 
 			}
 		}
 
-		for ev := range tailTurn(ctx, path, offset, s.logger, s.tail) {
+		for ev := range tailTurn(ctx, path, offset, s.logger, s.tailCfg(sessionID, strings.HasPrefix(prompt, "/"))) {
 			if !sendEvent(ctx, out, ev) {
 				return
 			}
@@ -523,6 +527,57 @@ const (
 	resumeSummaryMarker = "Resume from summary"       // the highlighted default
 	chooserArrow        = "❯"
 )
+
+// busyMarker is shown by both TUIs while a turn runs (claude's footer, codex's
+// "Working (1s • esc to interrupt)"), matched case-insensitively. It is only a
+// supplementary busy vote — the primary signal is pane motion (see tailCfg) —
+// so a reworded string degrades margin, not correctness.
+const busyMarker = "esc to interrupt"
+
+// paneShowsBusy reports whether a pane capture carries the running-turn hint.
+// The whole pane is scanned: a missed hint is the dangerous direction
+// (premature finalize), a stray transcript match only delays the fallback.
+func paneShowsBusy(text string) bool {
+	return strings.Contains(strings.ToLower(text), busyMarker)
+}
+
+// idlePaneStore remembers, per session, the pane frame the idle fallback saw
+// when it finalized a turnless '/'-command send — the dialog that command left
+// behind. dismissLeftoverDialog may clear the pane only while it still shows
+// exactly this frame, so a dialog usher didn't cause (a mirror-started turn's
+// permission or question prompt) is never dismissed. A nil store disables both
+// recording and dismissal.
+type idlePaneStore struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (s *idlePaneStore) set(id, text string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = map[string]string{}
+	}
+	s.m[id] = text
+}
+
+// take returns and removes the recorded frame for id. One-shot: the record
+// describes the pane right after one turnless send, so it is valid for exactly
+// one check — kept longer, it would match a user manually reopening the same
+// (byte-identical) dialog much later.
+func (s *idlePaneStore) take(id string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text, ok := s.m[id]
+	delete(s.m, id)
+	return text, ok
+}
 
 // chooserArrowOn reports whether the chooser's selection arrow sits on `option`
 // — arrow and option text on the SAME line. A loose Contains(option) also
@@ -581,6 +636,37 @@ func isPromptLine(line string) bool {
 	// line like "❯ ────" stays distinct from the empty prompt.
 	s := strings.Trim(line, " \t\u00a0│|╭╮╰╯")
 	return s == "❯" || s == ">"
+}
+
+// tailCfg returns the per-send tail config: the shared defaults plus a paneBusy
+// probe bound to this session's window. Busy = the capture changed since the
+// previous probe (a running TUI animates every second, an idle one is static —
+// version-independent, unlike marker text) OR it carries busyMarker. The first
+// probe only seeds the comparison and reports busy. State lives in the closure:
+// one tailCfg per send, called only from that turn's tail goroutine.
+//
+// recordIdle (set for '/'-prefixed prompts, the only ones that can leave a
+// command dialog behind) stores the finalize-time frame in s.leftovers for
+// dismissLeftoverDialog to match against on the next send.
+func (s *Sender) tailCfg(sessionID string, recordIdle bool) tailConfig {
+	cfg := s.tail
+	var prev string
+	var seeded bool
+	cfg.paneBusy = func() bool {
+		text, err := s.pool.paneText(sessionID)
+		if err != nil {
+			// Can't see the pane — err toward busy: the worst case is the old
+			// wait-forever behavior, never a premature finalize.
+			return true
+		}
+		moved := !seeded || text != prev
+		prev, seeded = text, true
+		return moved || paneShowsBusy(text)
+	}
+	if recordIdle {
+		cfg.onIdleExit = func() { s.leftovers.set(sessionID, prev) }
+	}
+	return cfg
 }
 
 // locate finds the session log for sessionID via the active backend.

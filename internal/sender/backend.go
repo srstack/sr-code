@@ -46,6 +46,10 @@ type backend interface {
 	knownSessionIDs() map[string]bool
 	// turnComplete is the tailer's end-of-turn predicate for this backend's log.
 	turnComplete(line []byte) bool
+	// turnActivity reports whether a log line proves a model turn is in flight
+	// (model output, not submit-time records). It arms the latch that disables
+	// the tailer's idle fallback.
+	turnActivity(line []byte) bool
 	// waitReady prepares the freshly-spawned/resumed TUI to accept a pasted
 	// prompt. Returns nil once ready; ctx.Err() on cancellation, or
 	// errReadyTimeout if the TUI never became injectable within t.resumeReady
@@ -68,10 +72,12 @@ type claudeBackend struct {
 	projectsDir string
 	claudeCmd   string
 	extraArgs   []string
+	leftovers   *idlePaneStore // shared with the Sender (see tailCfg)
 }
 
 func (b claudeBackend) preAssignsID() bool            { return true }
 func (b claudeBackend) turnComplete(line []byte) bool { return isTurnComplete(line) }
+func (b claudeBackend) turnActivity(line []byte) bool { return isTurnActivity(line) }
 
 // discoverNewID / knownSessionIDs are unused for Claude (usher assigns the id
 // up front via --session-id).
@@ -113,7 +119,45 @@ func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fre
 		if !sleepCtx(ctx, b.t.warmSettle) {
 			return ctx.Err()
 		}
+		b.dismissLeftoverDialog(ctx, sessionID)
 		return nil
+	}
+}
+
+// dismissLeftoverDialog clears the dialog a previous turnless '/'-command send
+// left on a warm pane (e.g. /model's picker), which would swallow the upcoming
+// paste. It acts only while the pane still shows the EXACT frame the idle
+// fallback recorded when it finalized that send — a dialog usher didn't cause
+// (a mirror-started turn's permission or question prompt) never matches and is
+// never dismissed. After one Esc it polls briefly for the composer;
+// best-effort, on timeout the caller pastes anyway. Codex gets no analog: a
+// lone Esc there primes backtrack, and a second one opens the edit-previous
+// chooser, worse than the dialog it meant to clear.
+func (b claudeBackend) dismissLeftoverDialog(ctx context.Context, sessionID string) {
+	recorded, ok := b.leftovers.take(sessionID) // one-shot, match or not
+	if !ok {
+		return
+	}
+	text, err := b.p.paneText(sessionID)
+	if err != nil || text != recorded || composerReady(text) || paneShowsBusy(text) {
+		return
+	}
+	_ = b.p.sendKeys(sessionID, "Escape")
+	deadline := time.NewTimer(b.t.trustToInject)
+	defer deadline.Stop()
+	ticker := time.NewTicker(b.t.poll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-ticker.C:
+			if text, err := b.p.paneText(sessionID); err == nil && composerReady(text) {
+				return
+			}
+		}
 	}
 }
 
@@ -195,6 +239,7 @@ type codexBackend struct {
 
 func (b codexBackend) preAssignsID() bool            { return false }
 func (b codexBackend) turnComplete(line []byte) bool { return codexrollout.IsTurnComplete(line) }
+func (b codexBackend) turnActivity(line []byte) bool { return codexrollout.IsTurnActivity(line) }
 
 // spawnCommand builds `env -u CODEX_* codex [resume <id>] [-c model=…] [args]`.
 // New sessions pass no id — Codex has no --session-id flag and generates its own

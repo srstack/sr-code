@@ -45,13 +45,15 @@ func testSender(t *testing.T, runner tmuxRunner, id string) (*Sender, string) {
 		poll:          10 * time.Millisecond,
 	}
 	p := newPool(runner, "claude", nil, nil, 8, quietLogger())
+	lp := &idlePaneStore{}
 	s := &Sender{
 		pool:        p,
-		backend:     claudeBackend{p: p, t: tm, projectsDir: dir, claudeCmd: "claude"},
+		backend:     claudeBackend{p: p, t: tm, projectsDir: dir, claudeCmd: "claude", leftovers: lp},
 		projectsDir: dir,
 		logger:      quietLogger(),
 		t:           tm,
 		tail:        tailConfig{poll: 10 * time.Millisecond, appearWait: 2 * time.Second},
+		leftovers:   lp,
 	}
 	return s, filepath.Join(sub, id+".jsonl")
 }
@@ -65,6 +67,13 @@ const idleComposer = "───────────────────�
 	"────────────────────────────────────\n" +
 	"  ? for shortcuts · ← for agents\n" +
 	"\n\n\n\n\n"
+
+// modelPicker is a fake capture of the dialog a TUI-local /model leaves on the
+// pane: no composer sandwich, no running-turn indicator.
+const modelPicker = "╭─ Select model ─╮\n" +
+	"│ ❯ 1. Default   │\n" +
+	"│   2. Opus      │\n" +
+	"╰────────────────╯\n"
 
 var turnLines = []string{
 	`{"type":"user","message":{"role":"user","content":"hi"}}`,
@@ -131,6 +140,165 @@ func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
 	}
 	if !cmdMatches(f, "send-keys", "Enter") {
 		t.Fatal("fresh window should receive a trust-accept Enter")
+	}
+}
+
+// The reported hang: a TUI-local command (/model) starts no model turn and
+// writes nothing to the jsonl, so the tailer used to wait forever and the UI
+// stayed pending until a manual cancel. The idle fallback must finalize it, and
+// the warm path must have tried an Escape to clear the picker it left behind.
+func TestSend_LocalCommandFinalizesViaIdleFallback(t *testing.T) {
+	f := &fakeTmux{exists: true, windows: []string{"sess-lc"}, captureOut: modelPicker}
+	s, path := testSender(t, f, "sess-lc")
+	s.tail.quiet = 50 * time.Millisecond
+	s.tail.probeEvery = 10 * time.Millisecond
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch, err := s.Send(context.Background(), "sess-lc", "/model", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nothing is ever appended to the jsonl — exactly what /model does.
+	got := collect(t, ch, 3*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "subprocess.exit"}) {
+		t.Fatalf("got %v, want [subprocess.started subprocess.exit]", types(got))
+	}
+}
+
+// sendLocalModel runs a turnless "/model" send to completion: the pane shows
+// the picker, nothing lands in the jsonl, the idle fallback finalizes and
+// records the picker frame for the next send's dismissal check.
+func sendLocalModel(t *testing.T, s *Sender, id string) {
+	t.Helper()
+	s.tail.quiet = 50 * time.Millisecond
+	s.tail.probeEvery = 10 * time.Millisecond
+	ch, err := s.Send(context.Background(), id, "/model", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(t, ch, 3*time.Second)
+}
+
+// A dialog usher didn't cause — a mirror-started turn's permission or question
+// prompt — must never be Escaped: dismissal requires the pane to still show
+// the exact frame a previous turnless '/'-send recorded, and here nothing was
+// recorded.
+func TestSend_ForeignDialogNeverEscaped(t *testing.T) {
+	f := &fakeTmux{exists: true, windows: []string{"sess-fd"}, captureOut: modelPicker}
+	s, path := testSender(t, f, "sess-fd")
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.Send(context.Background(), "sess-fd", "hi", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go appendLines(path, 20*time.Millisecond, turnLines...)
+	collect(t, ch, 6*time.Second)
+	if f.keySent("Escape") {
+		t.Fatal("Escaped a dialog no turnless send of ours recorded")
+	}
+}
+
+// After a turnless /model send recorded the picker frame, the next send
+// Escapes it — but only while the pane still shows that exact frame.
+func TestSend_LeftoverDialogEscapedOnlyWhileFrameMatches(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		nextPane   string // pane content at the time of the second send
+		wantEscape bool
+	}{
+		{"frame unchanged", modelPicker, true},
+		{"frame changed (foreign dialog)", "│ Do you want to allow Write? │\n│ ❯ 1. Yes │\n", false},
+		{"composer back (user cleared it)", idleComposer, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeTmux{exists: true, windows: []string{"sess-ld"}, captureOut: modelPicker}
+			s, path := testSender(t, f, "sess-ld")
+			if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			sendLocalModel(t, s, "sess-ld")
+
+			f.captureOut = tc.nextPane
+			ch, err := s.Send(context.Background(), "sess-ld", "hi", "/work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			go appendLines(path, 20*time.Millisecond, turnLines...)
+			collect(t, ch, 6*time.Second)
+			if f.keySent("Escape") != tc.wantEscape {
+				t.Fatalf("Escape sent = %v, want %v", !tc.wantEscape, tc.wantEscape)
+			}
+		})
+	}
+}
+
+// The recorded frame is one-shot: the first send after the turnless '/'-send
+// consumes it, match or not. Otherwise a stale record would Escape a user
+// manually reopening the same (byte-identical) picker much later.
+func TestSend_LeftoverRecordIsOneShot(t *testing.T) {
+	f := &fakeTmux{exists: true, windows: []string{"sess-os"}, captureOut: modelPicker}
+	s, path := testSender(t, f, "sess-os")
+	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sendLocalModel(t, s, "sess-os")
+
+	send := func(prompt string) {
+		t.Helper()
+		ch, err := s.Send(context.Background(), "sess-os", prompt, "/work")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go appendLines(path, 20*time.Millisecond, turnLines...)
+		collect(t, ch, 6*time.Second)
+	}
+	// User closed the picker via the mirror: this send sees the composer, sends
+	// no Escape — and must still consume the record.
+	f.captureOut = idleComposer
+	send("hi")
+	// User manually reopened the identical picker: without the one-shot take,
+	// the stale record would match and Escape it.
+	f.captureOut = modelPicker
+	send("again")
+	if f.keySent("Escape") {
+		t.Fatal("stale leftover record Escaped a manually reopened dialog")
+	}
+}
+
+// tailCfg's paneBusy votes busy on pane MOTION (version-independent: a running
+// TUI animates, an idle one is static) or on the busy-marker string. The first
+// probe only seeds the baseline and must report busy.
+func TestTailCfgPaneBusyMotionAndMarker(t *testing.T) {
+	f := &fakeTmux{exists: true, windows: []string{"sess-pb"}, captureOut: modelPicker}
+	s, _ := testSender(t, f, "sess-pb")
+	busy := s.tailCfg("sess-pb", false).paneBusy
+
+	if !busy() {
+		t.Fatal("first probe must report busy (baseline seed)")
+	}
+	if busy() {
+		t.Fatal("static marker-free pane must read idle after the seed")
+	}
+	// A spinner frame / elapsed-timer tick: content changed → busy, even
+	// without any known marker string.
+	f.captureOut = modelPicker + "⠧ 3s\n"
+	if !busy() {
+		t.Fatal("pane motion must read busy regardless of marker text")
+	}
+	f.captureOut = modelPicker + "⠧ 3s\n" // static again
+	if busy() {
+		t.Fatal("re-static pane must read idle")
+	}
+	// Static but carrying the marker (codex's capitalized footer — the match
+	// is case-insensitive): the supplementary vote still holds.
+	f.captureOut = "▌ Working (99s · Esc to interrupt)\n"
+	busy() // motion (content changed)
+	if !busy() {
+		t.Fatal("static pane WITH busy marker must stay busy")
 	}
 }
 

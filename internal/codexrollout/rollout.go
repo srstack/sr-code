@@ -62,7 +62,46 @@ func IsTurnComplete(raw []byte) bool {
 	if err := json.Unmarshal(l.Payload, &p); err != nil {
 		return false
 	}
-	return p.Type == "task_complete"
+	// task_complete is the v1 wire name; turn_complete its announced v2 rename.
+	return p.Type == "task_complete" || p.Type == "turn_complete"
+}
+
+// IsTurnActivity reports whether a rollout line is model output — proof a real
+// turn is in flight. The records codex logs at submit time (turn_context, the
+// user's own message) don't count: they appear whether or not the model runs.
+func IsTurnActivity(raw []byte) bool {
+	var l line
+	if err := json.Unmarshal(raw, &l); err != nil {
+		return false
+	}
+	switch l.Type {
+	case "event_msg":
+		var p struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(l.Payload, &p); err != nil {
+			return false
+		}
+		// task_started (v1 wire name; turn_started its announced v2 rename) is
+		// persisted at submit time, so the latch arms as soon as a turn begins.
+		return p.Type == "task_started" || p.Type == "turn_started" ||
+			strings.HasPrefix(p.Type, "agent_")
+	case "response_item":
+		var p struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(l.Payload, &p); err != nil {
+			return false
+		}
+		switch p.Type {
+		case "message":
+			return p.Role == "assistant"
+		case "reasoning", "function_call", "function_call_output", "local_shell_call", "web_search_call", "custom_tool_call":
+			return true
+		}
+	}
+	return false
 }
 
 // ReadSessionMeta reads the lightweight descriptor: id/cwd/start from the
