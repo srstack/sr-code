@@ -202,6 +202,10 @@ type Turn struct {
 	// UUID is the uuid of the last jsonl event folded into an assistant
 	// turn — the fork point ForkCopy expects. User turns carry none.
 	UUID string `json:"uuid,omitempty"`
+
+	// EndTime is the timestamp of the last event folded into an assistant
+	// turn (Time is its first). Server-side only, for turn timing.
+	EndTime time.Time `json:"-"`
 }
 
 // Assembler is the single grouping engine behind both transcript reads and
@@ -257,6 +261,9 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		if ev.UUID != "" {
 			a.cur.UUID = ev.UUID
 		}
+		if !ev.Timestamp.IsZero() {
+			a.cur.EndTime = ev.Timestamp
+		}
 		if ev.SourceToolUseID != "" {
 			for i := len(a.cur.Parts) - 1; i >= 0; i-- {
 				if a.cur.Parts[i].Type == "tool" && a.cur.Parts[i].toolUseID == ev.SourceToolUseID {
@@ -288,10 +295,13 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	} else if m := messageModel(ev.Message); m != "" && a.cur.Model == "" {
 		a.cur.Model = m
 	}
-	// Track the turn's last event — its fork point — even when the event
-	// contributes no visible part.
+	// Track the turn's last event — its fork point and end time — even when
+	// the event contributes no visible part.
 	if ev.UUID != "" {
 		a.cur.UUID = ev.UUID
+	}
+	if !ev.Timestamp.IsZero() {
+		a.cur.EndTime = ev.Timestamp
 	}
 
 	if ev.Type == "assistant" {

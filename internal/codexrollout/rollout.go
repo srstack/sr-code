@@ -278,6 +278,9 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
 		if a.cur != nil {
 			a.cur.UUID = p.TurnID
+			if !l.Timestamp.IsZero() {
+				a.cur.EndTime = l.Timestamp
+			}
 		}
 		if t := a.Flush(); t != nil {
 			completed = append(completed, *t)
@@ -338,6 +341,9 @@ func (a *Assembler) Model() string { return a.model }
 func (a *Assembler) ensureTurn(ts time.Time) {
 	if a.cur == nil {
 		a.cur = &jsonl.Turn{Role: "assistant", Time: ts, Model: a.model}
+	}
+	if !ts.IsZero() {
+		a.cur.EndTime = ts
 	}
 }
 

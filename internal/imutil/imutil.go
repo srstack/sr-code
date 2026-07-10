@@ -96,21 +96,26 @@ func ParseQuestions(raw json.RawMessage) []AskQuestion {
 	return in.Questions
 }
 
-// TurnDuration reads the elapsed time of a turn from a subprocess.exit event,
-// using the user_ts / assistant_ts the router stamps onto it. Returns false
-// when either timestamp is missing (best-effort enrichment) or out of order.
+// TurnDuration reads the elapsed time of a turn from a subprocess.exit event:
+// user_ts → assistant_end_ts, falling back to assistant_ts on older payloads.
+// Returns false when a timestamp is missing or out of order.
 func TurnDuration(raw json.RawMessage) (time.Duration, bool) {
 	var x struct {
-		UserTS      time.Time `json:"user_ts"`
-		AssistantTS time.Time `json:"assistant_ts"`
+		UserTS         time.Time `json:"user_ts"`
+		AssistantTS    time.Time `json:"assistant_ts"`
+		AssistantEndTS time.Time `json:"assistant_end_ts"`
 	}
 	if err := json.Unmarshal(raw, &x); err != nil {
 		return 0, false
 	}
-	if x.UserTS.IsZero() || x.AssistantTS.IsZero() || !x.AssistantTS.After(x.UserTS) {
+	end := x.AssistantEndTS
+	if end.IsZero() {
+		end = x.AssistantTS
+	}
+	if x.UserTS.IsZero() || end.IsZero() || !end.After(x.UserTS) {
 		return 0, false
 	}
-	return x.AssistantTS.Sub(x.UserTS), true
+	return end.Sub(x.UserTS), true
 }
 
 // HumanizeDuration renders a turn duration compactly (e.g. "8s", "1m12s").

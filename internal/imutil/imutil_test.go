@@ -64,6 +64,11 @@ func TestTurnDuration(t *testing.T) {
 	if got := HumanizeDuration(d); got != "1m12s" {
 		t.Errorf("HumanizeDuration = %q, want 1m12s", got)
 	}
+	// assistant_end_ts wins over assistant_ts.
+	raw = json.RawMessage(`{"user_ts":"2026-06-25T03:00:00Z","assistant_ts":"2026-06-25T03:00:08Z","assistant_end_ts":"2026-06-25T03:02:00Z"}`)
+	if d, ok := TurnDuration(raw); !ok || d != 2*time.Minute {
+		t.Fatalf("TurnDuration with end ts = %v,%v want 2m0s,true", d, ok)
+	}
 	// Missing / out-of-order timestamps → no duration.
 	if _, ok := TurnDuration(json.RawMessage(`{}`)); ok {
 		t.Error("empty exit event should yield no duration")

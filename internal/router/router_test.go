@@ -33,7 +33,7 @@ func TestPublishStreamDerivesCodexTurns(t *testing.T) {
 	}
 	go func() {
 		for _, ln := range lines {
-			r.publishStream("s1", asm, sender.StreamEvent{Type: "event_msg", Raw: json.RawMessage(ln)})
+			r.publishStream("s1", asm, sender.StreamEvent{Type: "event_msg", Raw: json.RawMessage(ln)}, time.Time{})
 		}
 		b.Publish(broker.Event{SessionID: "s1", Type: "done"})
 	}()
@@ -267,6 +267,42 @@ func newQueueTestRouter(t *testing.T) *Router {
 		r.releaseSend(sessionID, tok)
 	}
 	return r
+}
+
+// TestEnrichExitSkipsStaleExchange: a turn that logged nothing (idle-fallback
+// exit for a TUI-local command, or a cancel before first output) must not pick
+// up the PREVIOUS exchange's timestamps — IM mirrors would show its duration
+// as the current turn's "responded in".
+func TestEnrichExitSkipsStaleExchange(t *testing.T) {
+	r := newQueueTestRouter(t)
+	path, _ := r.discovery.Path("abc12345")
+	appendFile(t, path, `{"type":"assistant","timestamp":"2026-07-01T10:00:08.000Z","message":{"role":"assistant","content":[{"type":"text","text":"prev reply"}]},"uuid":"uu-prev"}`+"\n")
+
+	stamps := func(raw json.RawMessage) bool {
+		var p struct {
+			UserTS      time.Time `json:"user_ts"`
+			AssistantTS time.Time `json:"assistant_ts"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		return !p.UserTS.IsZero() && !p.AssistantTS.IsZero()
+	}
+
+	// Send began after the exchange completed → it is a previous turn's: skip.
+	after := time.Date(2026, 7, 1, 10, 1, 0, 0, time.UTC)
+	if stamps(r.enrichExitWithTurnTimestamps("abc12345", json.RawMessage(`{}`), after)) {
+		t.Error("stale exchange stamped onto an empty turn's exit")
+	}
+	// Send began before the exchange completed → it is this turn's: stamp.
+	before := time.Date(2026, 7, 1, 10, 0, 1, 0, time.UTC)
+	if !stamps(r.enrichExitWithTurnTimestamps("abc12345", json.RawMessage(`{}`), before)) {
+		t.Error("current turn's exchange not stamped")
+	}
+	// Zero started disables the check (first-turn paths).
+	if !stamps(r.enrichExitWithTurnTimestamps("abc12345", json.RawMessage(`{}`), time.Time{})) {
+		t.Error("zero started should stamp unconditionally")
+	}
 }
 
 // TestSendQueueSerializesAndAttributesReplies: three rapid relayed sends into

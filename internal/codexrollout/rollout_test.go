@@ -3,6 +3,9 @@ package codexrollout
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/nexustar/usher/internal/jsonl"
 )
 
 const toolFixture = "testdata/rollout-tool.jsonl"
@@ -145,6 +148,29 @@ func TestAssemblerModelFromTurnContext(t *testing.T) {
 	}
 	if !stamped {
 		t.Error("no assistant turn carried a model from the rollout's turn_context")
+	}
+}
+
+func TestAssemblerTurnEndTime(t *testing.T) {
+	asm := NewAssembler()
+	var done []jsonl.Turn
+	for _, ln := range []string{
+		`{"timestamp":"2026-06-15T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}`,
+		`{"timestamp":"2026-06-15T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":\"ls\"}"}}`,
+		`{"timestamp":"2026-06-15T00:00:09Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}`,
+		`{"timestamp":"2026-06-15T00:00:12Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+	} {
+		completed, _ := asm.Feed([]byte(ln))
+		done = append(done, completed...)
+	}
+	if len(done) != 1 {
+		t.Fatalf("got %d completed turns, want 1", len(done))
+	}
+	if want := time.Date(2026, 6, 15, 0, 0, 1, 0, time.UTC); !done[0].Time.Equal(want) {
+		t.Errorf("Time = %v, want %v (turn start)", done[0].Time, want)
+	}
+	if want := time.Date(2026, 6, 15, 0, 0, 12, 0, time.UTC); !done[0].EndTime.Equal(want) {
+		t.Errorf("EndTime = %v, want %v (task_complete)", done[0].EndTime, want)
 	}
 }
 

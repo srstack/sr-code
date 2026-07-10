@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLine_User(t *testing.T) {
@@ -212,6 +213,13 @@ func TestReadTurns_Grouped(t *testing.T) {
 	}
 	if at.Parts[1].Type != "text" || at.Parts[1].Content != "done" {
 		t.Errorf("parts[1] = %+v", at.Parts[1])
+	}
+	// Time is the turn's first event; EndTime its last.
+	if want := time.Date(2026, 4, 26, 10, 0, 1, 0, time.UTC); !at.Time.Equal(want) {
+		t.Errorf("Time = %v, want %v", at.Time, want)
+	}
+	if want := time.Date(2026, 4, 26, 10, 0, 3, 0, time.UTC); !at.EndTime.Equal(want) {
+		t.Errorf("EndTime = %v, want %v", at.EndTime, want)
 	}
 }
 

@@ -474,6 +474,7 @@ func (r *Router) injectDirect(sessionID, text, cwd string) {
 func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
 
+	started := time.Now()
 	ch, err := r.senderFor(sessionID).Send(ctx, sessionID, prompt, cwd)
 	if err != nil {
 		r.markSendIdle(sessionID, tok)
@@ -486,7 +487,7 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 		// Publish BEFORE clearing the running bit: once activeSend is empty a
 		// new send's collector may subscribe, and it must not see this
 		// turn's exit.
-		r.publishStream(sessionID, asm, ev)
+		r.publishStream(sessionID, asm, ev, started)
 		if ev.Type == "subprocess.exit" {
 			r.markSendIdle(sessionID, tok)
 		}
@@ -553,9 +554,9 @@ func lineTimestamp(raw json.RawMessage) time.Time {
 	return o.Timestamp
 }
 
-func (r *Router) publishStream(sessionID string, asm streamAssembler, ev sender.StreamEvent) *jsonl.TurnPart {
+func (r *Router) publishStream(sessionID string, asm streamAssembler, ev sender.StreamEvent, started time.Time) *jsonl.TurnPart {
 	if ev.Type == "subprocess.exit" {
-		ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw)
+		ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw, started)
 	}
 	r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
 
@@ -592,13 +593,22 @@ func (r *Router) publishStream(sessionID string, asm streamAssembler, ev sender.
 // the web UI can replace its optimistically-stamped chat messages with the
 // canonical server timestamps. Best-effort: any read failure leaves the
 // payload untouched.
-func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMessage) json.RawMessage {
+//
+// started, when non-zero, is when the send began: a trailing assistant turn
+// older than that is the PREVIOUS exchange (this turn logged nothing — idle
+// fallback for TUI-local commands, or a cancel before first output) and must
+// not be stamped. Zero disables the check (first-turn paths have no previous
+// exchange to mistake).
+func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMessage, started time.Time) json.RawMessage {
 	path, ok := r.discovery.Path(sessionID)
 	if !ok {
 		return raw
 	}
 	turns, _, err := readTurnsForBackend(path, r.backendOf(sessionID), 2)
 	if err != nil || len(turns) == 0 {
+		return raw
+	}
+	if last := turns[len(turns)-1]; !started.IsZero() && last.Role == "assistant" && last.EndTime.Before(started) {
 		return raw
 	}
 	var payload map[string]any
@@ -624,6 +634,10 @@ func applyTurnTimestamps(payload map[string]any, turns []jsonl.Turn) {
 	if turns[last].Role == "assistant" {
 		payload["assistant_ts"] = turns[last].Time
 		payload["assistant_uuid"] = turns[last].UUID
+		// For turn timing; assistant_ts stays the turn start (web keys on it).
+		if !turns[last].EndTime.IsZero() {
+			payload["assistant_end_ts"] = turns[last].EndTime
+		}
 	}
 	if last >= 1 && turns[last-1].Role == "user" {
 		payload["user_ts"] = turns[last-1].Time
@@ -1363,7 +1377,7 @@ func (r *Router) startDiscoveredSession(cwd, initialMsg, model, backend string, 
 			if ev.Type == "subprocess.exit" {
 				r.markSendIdle(realID, tok)
 			}
-			r.publishStream(realID, asm, ev)
+			r.publishStream(realID, asm, ev, time.Time{})
 		}
 	}()
 	return realID, nil
@@ -1381,7 +1395,7 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model, ba
 	asm := newStreamAssembler(backend)
 	for ev := range ch {
 		// Publish before clearing the running bit — same reasoning as runSend.
-		r.publishStream(sessionID, asm, ev)
+		r.publishStream(sessionID, asm, ev, time.Time{})
 		if ev.Type == "subprocess.exit" {
 			r.markSendIdle(sessionID, tok)
 		}
@@ -1542,7 +1556,7 @@ func (r *Router) collectNewSessionText(sessionID string, ch <-chan sender.Stream
 	var buf strings.Builder
 	asm := newStreamAssembler(r.defaultBackend)
 	for ev := range ch {
-		if p := r.publishStream(sessionID, asm, ev); p != nil && p.Type == "text" {
+		if p := r.publishStream(sessionID, asm, ev, time.Time{}); p != nil && p.Type == "text" {
 			if buf.Len() > 0 {
 				buf.WriteString("\n")
 			}
