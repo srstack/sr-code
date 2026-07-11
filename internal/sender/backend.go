@@ -50,6 +50,8 @@ type backend interface {
 	// (model output, not submit-time records). It arms the latch that disables
 	// the tailer's idle fallback.
 	turnActivity(line []byte) bool
+	// turnAborted reports an explicit terminal cancellation/failure marker.
+	turnAborted(line []byte) bool
 	// waitReady prepares the freshly-spawned/resumed TUI to accept a pasted
 	// prompt. Returns nil once ready; ctx.Err() on cancellation, or
 	// errReadyTimeout if the TUI never became injectable within t.resumeReady
@@ -78,6 +80,7 @@ type claudeBackend struct {
 func (b claudeBackend) preAssignsID() bool            { return true }
 func (b claudeBackend) turnComplete(line []byte) bool { return isTurnComplete(line) }
 func (b claudeBackend) turnActivity(line []byte) bool { return isTurnActivity(line) }
+func (b claudeBackend) turnAborted(line []byte) bool  { return false }
 
 // discoverNewID / knownSessionIDs are unused for Claude (usher assigns the id
 // up front via --session-id).
@@ -103,6 +106,10 @@ func (b claudeBackend) locate(sessionID string) string {
 // warm window just needs a beat. cwd is unused (the markers are global). Returns
 // false on ctx cancel.
 func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fresh, resume bool) error {
+	if fresh {
+		// A cold window cannot still contain a dialog recorded from the old one.
+		b.leftovers.clear(sessionID)
+	}
 	switch {
 	case fresh && resume:
 		return b.waitResumeReady(ctx, sessionID)
@@ -119,8 +126,10 @@ func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fre
 		if !sleepCtx(ctx, b.t.warmSettle) {
 			return ctx.Err()
 		}
-		b.dismissLeftoverDialog(ctx, sessionID)
-		return nil
+		if err := b.dismissLeftoverDialog(ctx, sessionID); err != nil {
+			return err
+		}
+		return b.waitWarmComposer(ctx, sessionID)
 	}
 }
 
@@ -133,16 +142,18 @@ func (b claudeBackend) waitReady(ctx context.Context, sessionID, cwd string, fre
 // best-effort, on timeout the caller pastes anyway. Codex gets no analog: a
 // lone Esc there primes backtrack, and a second one opens the edit-previous
 // chooser, worse than the dialog it meant to clear.
-func (b claudeBackend) dismissLeftoverDialog(ctx context.Context, sessionID string) {
+func (b claudeBackend) dismissLeftoverDialog(ctx context.Context, sessionID string) error {
 	recorded, ok := b.leftovers.take(sessionID) // one-shot, match or not
 	if !ok {
-		return
+		return nil
 	}
 	text, err := b.p.paneText(sessionID)
 	if err != nil || text != recorded || composerReady(text) || paneShowsBusy(text) {
-		return
+		return nil
 	}
-	_ = b.p.sendKeys(sessionID, "Escape")
+	if err := b.p.sendKeys(sessionID, "Escape"); err != nil {
+		return err
+	}
 	deadline := time.NewTimer(b.t.trustToInject)
 	defer deadline.Stop()
 	ticker := time.NewTicker(b.t.poll)
@@ -150,13 +161,37 @@ func (b claudeBackend) dismissLeftoverDialog(ctx context.Context, sessionID stri
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-deadline.C:
-			return
+			return nil
 		case <-ticker.C:
 			if text, err := b.p.paneText(sessionID); err == nil && composerReady(text) {
-				return
+				// Match the other readiness paths: let the newly mounted composer
+				// settle so inject's Enter cannot be lost during its repaint.
+				if !sleepCtx(ctx, b.t.trustToInject) {
+					return ctx.Err()
+				}
+				return nil
 			}
+		}
+	}
+}
+
+func (b claudeBackend) waitWarmComposer(ctx context.Context, sessionID string) error {
+	deadline := time.NewTimer(b.t.resumeReady)
+	defer deadline.Stop()
+	ticker := time.NewTicker(b.t.poll)
+	defer ticker.Stop()
+	for {
+		if text, err := b.p.paneText(sessionID); err == nil && composerReady(text) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errReadyTimeout
+		case <-ticker.C:
 		}
 	}
 }
@@ -240,6 +275,7 @@ type codexBackend struct {
 func (b codexBackend) preAssignsID() bool            { return false }
 func (b codexBackend) turnComplete(line []byte) bool { return codexrollout.IsTurnComplete(line) }
 func (b codexBackend) turnActivity(line []byte) bool { return codexrollout.IsTurnActivity(line) }
+func (b codexBackend) turnAborted(line []byte) bool  { return codexrollout.IsTurnAborted(line) }
 
 // spawnCommand builds `env -u CODEX_* codex [resume <id>] [-c model=…] [args]`.
 // New sessions pass no id — Codex has no --session-id flag and generates its own
@@ -346,7 +382,24 @@ func (b codexBackend) waitReady(ctx context.Context, sessionID, cwd string, fres
 		if !sleepCtx(ctx, b.t.warmSettle) {
 			return ctx.Err()
 		}
-		return nil
+		// Do not paste into a picker/permission dialog. Codex cannot safely
+		// auto-Escape it, so surface a visible readiness error instead.
+		deadline := time.NewTimer(b.t.resumeReady)
+		defer deadline.Stop()
+		ticker := time.NewTicker(b.t.poll)
+		defer ticker.Stop()
+		for {
+			if text, err := b.p.paneText(sessionID); err == nil && codexInputReady(text, cwd) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline.C:
+				return errReadyTimeout
+			case <-ticker.C:
+			}
+		}
 	}
 	deadline := time.NewTimer(b.t.resumeReady)
 	defer deadline.Stop()

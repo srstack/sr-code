@@ -148,7 +148,7 @@ func TestSend_NewSessionWaitsForFileAndTrust(t *testing.T) {
 // stayed pending until a manual cancel. The idle fallback must finalize it, and
 // the warm path must have tried an Escape to clear the picker it left behind.
 func TestSend_LocalCommandFinalizesViaIdleFallback(t *testing.T) {
-	f := &fakeTmux{exists: true, windows: []string{"sess-lc"}, captureOut: modelPicker}
+	f := &fakeTmux{exists: true, windows: []string{"sess-lc"}, captureOut: idleComposer, captureAfterPaste: modelPicker}
 	s, path := testSender(t, f, "sess-lc")
 	s.tail.quiet = 50 * time.Millisecond
 	s.tail.probeEvery = 10 * time.Millisecond
@@ -172,6 +172,11 @@ func TestSend_LocalCommandFinalizesViaIdleFallback(t *testing.T) {
 // records the picker frame for the next send's dismissal check.
 func sendLocalModel(t *testing.T, s *Sender, id string) {
 	t.Helper()
+	f := s.pool.runner.(*fakeTmux)
+	f.mu.Lock()
+	f.captureOut = idleComposer
+	f.captureAfterPaste = modelPicker
+	f.mu.Unlock()
 	s.tail.quiet = 50 * time.Millisecond
 	s.tail.probeEvery = 10 * time.Millisecond
 	ch, err := s.Send(context.Background(), id, "/model", "/work")
@@ -215,13 +220,14 @@ func TestSend_LeftoverDialogEscapedOnlyWhileFrameMatches(t *testing.T) {
 		{"composer back (user cleared it)", idleComposer, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeTmux{exists: true, windows: []string{"sess-ld"}, captureOut: modelPicker}
+			f := &fakeTmux{exists: true, windows: []string{"sess-ld"}, captureOut: idleComposer, captureAfterEscape: idleComposer}
 			s, path := testSender(t, f, "sess-ld")
 			if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			sendLocalModel(t, s, "sess-ld")
 
+			f.captureAfterPaste = ""
 			f.captureOut = tc.nextPane
 			ch, err := s.Send(context.Background(), "sess-ld", "hi", "/work")
 			if err != nil {
@@ -240,12 +246,13 @@ func TestSend_LeftoverDialogEscapedOnlyWhileFrameMatches(t *testing.T) {
 // consumes it, match or not. Otherwise a stale record would Escape a user
 // manually reopening the same (byte-identical) picker much later.
 func TestSend_LeftoverRecordIsOneShot(t *testing.T) {
-	f := &fakeTmux{exists: true, windows: []string{"sess-os"}, captureOut: modelPicker}
+	f := &fakeTmux{exists: true, windows: []string{"sess-os"}, captureOut: idleComposer, captureAfterEscape: idleComposer}
 	s, path := testSender(t, f, "sess-os")
 	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sendLocalModel(t, s, "sess-os")
+	f.captureAfterPaste = ""
 
 	send := func(prompt string) {
 		t.Helper()
@@ -299,6 +306,40 @@ func TestTailCfgPaneBusyMotionAndMarker(t *testing.T) {
 	busy() // motion (content changed)
 	if !busy() {
 		t.Fatal("static pane WITH busy marker must stay busy")
+	}
+}
+
+// After maxIdleWait, pane motion alone (a clock statusline animates forever)
+// no longer counts as busy; the footer marker still does.
+func TestTailCfgPaneMotionExpiresButMarkerHolds(t *testing.T) {
+	f := &fakeTmux{exists: true, windows: []string{"sess-mw"}, captureOut: "frame-0\n"}
+	s, _ := testSender(t, f, "sess-mw")
+	s.tail.maxIdleWait = 30 * time.Millisecond
+	busy := s.tailCfg("sess-mw", true).paneBusy
+
+	busy() // seed
+	f.captureOut = "frame-1\n"
+	if !busy() {
+		t.Fatal("motion inside the window must read busy")
+	}
+	time.Sleep(50 * time.Millisecond)
+	f.captureOut = "frame-2\n"
+	if busy() {
+		t.Fatal("motion past maxIdleWait must no longer read busy")
+	}
+	f.captureOut = "Working (99s · esc to interrupt)\n"
+	if !busy() {
+		t.Fatal("busy marker must hold past maxIdleWait")
+	}
+}
+
+func TestPaneShowsBusyIgnoresTranscriptAboveFooter(t *testing.T) {
+	text := "old discussion says esc to interrupt\n" + strings.Repeat("quiet footer row\n", composerScanLines+1)
+	if paneShowsBusy(text) {
+		t.Fatal("busy marker in scrolled transcript must not hold the idle fallback forever")
+	}
+	if !paneShowsBusy(strings.Repeat("row\n", composerScanLines-1) + "Esc to interrupt\n") {
+		t.Fatal("busy marker in bottom UI region was missed")
 	}
 }
 

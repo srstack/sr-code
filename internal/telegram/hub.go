@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"html"
 	"log/slog"
@@ -427,6 +428,8 @@ func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 		h.mirrorAssistant(ctx, ev)
 	case "subprocess.exit":
 		h.notifyTurnComplete(ctx, ev)
+	case "error":
+		h.notifyTurnError(ctx, ev)
 	}
 }
 
@@ -583,6 +586,13 @@ func (h *Hub) imageFailNotice(ctx context.Context, thread int64, name, reason st
 // the "come look" signal after the silent stream. It does not create a topic:
 // a turn that mirrored nothing (no assistant text) gets no ping.
 func (h *Hub) notifyTurnComplete(ctx context.Context, ev broker.Event) {
+	var terminal struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.Unmarshal(ev.Raw, &terminal)
+	if terminal.Reason != "" {
+		return // local command or failed/unconfirmed turn, never a model success
+	}
 	thread, ok := h.store.thread(ev.SessionID)
 	if !ok {
 		return
@@ -600,6 +610,27 @@ func (h *Hub) notifyTurnComplete(ctx context.Context, ev broker.Event) {
 		Text:            text,
 	}); err != nil {
 		h.logger.Warn("telegram: turn-complete ping", "session", ev.SessionID, "err", err)
+	}
+}
+
+func (h *Hub) notifyTurnError(ctx context.Context, ev broker.Event) {
+	thread, ok := h.store.thread(ev.SessionID)
+	if !ok {
+		return
+	}
+	var payload struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(ev.Raw, &payload)
+	if payload.Message == "" {
+		payload.Message = "turn failed"
+	}
+	if _, err := h.client.SendMessage(ctx, SendMessageParams{
+		ChatID:          h.group,
+		MessageThreadID: thread,
+		Text:            "⚠️ " + payload.Message,
+	}); err != nil {
+		h.logger.Warn("telegram: turn-error notice", "session", ev.SessionID, "err", err)
 	}
 }
 

@@ -346,6 +346,8 @@ func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 	case "subprocess.exit":
 		h.notifyTurnComplete(ctx, ev)
 		h.refreshTitle(ctx, ev.SessionID)
+	case "error":
+		h.notifyTurnError(ctx, ev)
 	}
 }
 
@@ -488,6 +490,13 @@ func (h *Hub) imageFailNotice(ctx context.Context, sessionID, root, name, reason
 // "come look" signal. It does not create a thread: a turn that mirrored
 // nothing gets no ping.
 func (h *Hub) notifyTurnComplete(ctx context.Context, ev broker.Event) {
+	var terminal struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.Unmarshal(ev.Raw, &terminal)
+	if terminal.Reason != "" {
+		return // local command or failed turn, never a model success
+	}
 	root, ok := h.store.root(ev.SessionID)
 	if !ok {
 		return
@@ -497,6 +506,22 @@ func (h *Hub) notifyTurnComplete(ctx context.Context, ev broker.Event) {
 		text += " in " + imutil.HumanizeDuration(d)
 	}
 	h.replyText(ctx, ev.SessionID, root, text)
+}
+
+// notifyTurnError surfaces a failed turn in its thread.
+func (h *Hub) notifyTurnError(ctx context.Context, ev broker.Event) {
+	root, ok := h.store.root(ev.SessionID)
+	if !ok {
+		return
+	}
+	var payload struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(ev.Raw, &payload)
+	if payload.Message == "" {
+		payload.Message = "turn failed"
+	}
+	h.replyText(ctx, ev.SessionID, root, "⚠️ "+payload.Message)
 }
 
 // postPermission posts a pending interaction into its session's thread as an

@@ -679,6 +679,12 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
     },
     'subprocess.exit': (d) => {
       stopInlineMirror();
+      // Failed/unconfirmed exits follow an explicit error event. Keep that
+      // error bubble visible instead of reconciling it away as a successful turn.
+      if (d && d.reason && d.reason !== 'local_command') {
+        onIdle();
+        return;
+      }
       // Promote the live bubble in place (its parts are already the
       // canonical server-rendered content), or — when this client missed
       // part of the turn — reconcile via a full fetch. See finalizeTurn.

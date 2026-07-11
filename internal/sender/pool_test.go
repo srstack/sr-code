@@ -27,6 +27,9 @@ type fakeTmux struct {
 	// captureAfterEnter, if set, is returned by capture-pane once an "Enter" key
 	// has been sent — models the trust dialog giving way to the composer.
 	captureAfterEnter string
+	// Additional state transitions used by sender readiness/dialog tests.
+	captureAfterPaste  string
+	captureAfterEscape string
 }
 
 func (f *fakeTmux) runStdin(in string, args ...string) (string, error) {
@@ -69,6 +72,12 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 		f.exists = false
 		return "", nil
 	case "capture-pane":
+		if f.captureAfterEscape != "" && f.keySent("Escape") {
+			return f.captureAfterEscape, nil
+		}
+		if f.captureAfterPaste != "" && f.cmdSeen("paste-buffer") {
+			return f.captureAfterPaste, nil
+		}
 		if f.captureAfterDown != "" && f.keySent("Down") {
 			return f.captureAfterDown, nil
 		}
@@ -79,6 +88,15 @@ func (f *fakeTmux) run(args ...string) (string, error) {
 	default: // set-window-option, set-buffer, paste-buffer, send-keys
 		return "", nil
 	}
+}
+
+func (f *fakeTmux) cmdSeen(name string) bool {
+	for _, c := range f.cmds {
+		if len(c) > 0 && c[0] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // keySent reports whether a send-keys command carrying key was recorded.

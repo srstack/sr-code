@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	"github.com/nexustar/usher/internal/jsonl"
 )
 
 // tailConfig tunes the turn tailer. Zero values fall back to sane defaults
@@ -33,13 +35,16 @@ type tailConfig struct {
 	//     routinely runs tens of seconds).
 	// nil paneBusy disables the fallback.
 	turnActivity func(line []byte) bool
+	turnAborted  func(line []byte) bool
 	paneBusy     func() bool
 	quiet        time.Duration
 	probeEvery   time.Duration
 
 	// onIdleExit, if set, is called once when the idle fallback finalizes the
 	// turn (not on any other exit path).
-	onIdleExit func()
+	onIdleExit  func()
+	idleReason  string
+	maxIdleWait time.Duration // consumed by tailCfg's paneBusy: after this long, motion alone no longer counts as busy
 }
 
 // idleProbeStrikes is how many consecutive idle probes the fallback needs — a
@@ -99,6 +104,15 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 		emitExit := func() {
 			sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
 		}
+		emitExitReason := func(reason string) {
+			raw, _ := json.Marshal(map[string]string{"reason": reason})
+			sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: raw})
+		}
+		emitIOError := func(msg string) {
+			raw, _ := json.Marshal(map[string]string{"message": msg})
+			sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: raw})
+			emitExitReason("tail_error")
+		}
 
 		f, ok := openWhenReady(ctx, path, cfg, out)
 		if !ok {
@@ -114,6 +128,7 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 
 		if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
 			logger.Warn("tail seek", "path", path, "offset", byteOffset, "err", err)
+			emitIOError("tail seek: " + err.Error())
 			return
 		}
 
@@ -126,6 +141,7 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 		// a model turn is in flight; lastGrowth tracks log silence; idleProbes
 		// counts consecutive pane sightings without a running-turn indicator.
 		active := false
+		sawLine := false // any log growth proves the paste was submitted
 		lastGrowth := time.Now()
 		var lastProbe time.Time
 		idleProbes := 0
@@ -136,6 +152,7 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				if len(chunk) > 0 {
 					pending = append(pending, chunk...)
 					lastGrowth = time.Now()
+					sawLine = true
 					idleProbes = 0
 				}
 				if err == io.EOF {
@@ -143,6 +160,7 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				}
 				if err != nil {
 					logger.Warn("tail read", "path", path, "err", err)
+					emitIOError("tail read: " + err.Error())
 					return
 				}
 				// Complete line (ends in '\n').
@@ -159,6 +177,14 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				// released ownership and sent permission prompts to the pane).
 				if cfg.turnComplete(line) {
 					emitExit()
+					return
+				}
+				if cfg.turnAborted != nil && cfg.turnAborted(line) {
+					ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
+					_ = sendEvent(context.Background(), out, ev)
+					errRaw, _ := json.Marshal(map[string]string{"message": "turn aborted before completion"})
+					_ = sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: errRaw})
+					emitExitReason("turn_aborted")
 					return
 				}
 				if !active && cfg.turnActivity(line) {
@@ -186,7 +212,20 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 						if cfg.onIdleExit != nil {
 							cfg.onIdleExit()
 						}
-						emitExit()
+						reason := cfg.idleReason
+						if reason == "" {
+							reason = "idle"
+						}
+						if reason == "submission_unconfirmed" && sawLine {
+							// The log grew, so the paste was delivered: this is a
+							// turnless local command (e.g. ! bash mode), not a failure.
+							reason = "local_command"
+						}
+						if reason == "submission_unconfirmed" {
+							raw, _ := json.Marshal(map[string]string{"message": "prompt submission could not be confirmed"})
+							_ = sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: raw})
+						}
+						emitExitReason(reason)
 						return
 					}
 				}
@@ -238,14 +277,7 @@ func lineType(line []byte) string {
 // truly finished — so unlike assistant stop_reason it does not fire mid-turn
 // (during thinking or a pending tool call).
 func isTurnComplete(line []byte) bool {
-	var o struct {
-		Type    string `json:"type"`
-		Subtype string `json:"subtype"`
-	}
-	if err := json.Unmarshal(line, &o); err != nil {
-		return false
-	}
-	return o.Type == "system" && o.Subtype == "turn_duration"
+	return jsonl.IsTurnComplete(line)
 }
 
 // isTurnActivity reports whether a Claude Code jsonl line proves a model turn

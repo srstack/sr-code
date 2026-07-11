@@ -256,3 +256,30 @@ func TestIsTurnActivity(t *testing.T) {
 		}
 	}
 }
+
+func TestTurnAbortedAndMalformedTimestampCompletion(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"event_msg","payload":{"type":"turn_aborted"}}`,
+		`{"type":"event_msg","payload":{"type":"task_aborted"}}`,
+	} {
+		if !IsTurnAborted([]byte(raw)) {
+			t.Errorf("IsTurnAborted(%s) = false", raw)
+		}
+	}
+	// Errors may be retried and followed by a normal completion: not an abort.
+	for _, raw := range []string{
+		`{"type":"error","payload":{"message":"rate limited"}}`,
+		`{"type":"event_msg","payload":{"type":"error"}}`,
+	} {
+		if IsTurnAborted([]byte(raw)) {
+			t.Errorf("IsTurnAborted(%s) = true", raw)
+		}
+	}
+
+	a := NewAssembler()
+	a.Feed([]byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}`))
+	done, _ := a.Feed([]byte(`{"timestamp":"v2-not-rfc3339","type":"event_msg","payload":{"type":"turn_complete","turn_id":"t-v2"}}`))
+	if len(done) != 1 || done[0].UUID != "t-v2" {
+		t.Fatalf("malformed timestamp completion = %+v, want one turn with UUID t-v2", done)
+	}
+}

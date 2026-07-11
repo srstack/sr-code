@@ -82,6 +82,25 @@ func TestCodexSend_ResumeStreamsTurn(t *testing.T) {
 	}
 }
 
+func TestCodexWarmDialogRejectsPaste(t *testing.T) {
+	root := t.TempDir()
+	id := "019ec1ab-6a76-7e32-9499-040331a92a4c"
+	_ = writeRollout(t, root, id, "/work", time.Now())
+	f := &fakeTmux{exists: true, windows: []string{id}, captureOut: "Select model\n❯ default\n"}
+	s := testCodexSender(f, root)
+	ch, err := s.Send(context.Background(), id, "do work", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collect(t, ch, 2*time.Second)
+	if !eq(types(got), []string{"subprocess.started", "error"}) {
+		t.Fatalf("got %v", types(got))
+	}
+	if f.countCmd("paste-buffer") != 0 {
+		t.Fatal("prompt was pasted into a Codex dialog")
+	}
+}
+
 func TestNewCodexWiring(t *testing.T) {
 	s := NewCodex("codex", "/home/u/.codex/sessions", "", "", []string{"--sandbox", "workspace-write"}, 8, true, quietLogger())
 	if s.pool.spawnOverride == nil {

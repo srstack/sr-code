@@ -608,8 +608,20 @@ func (r *Router) enrichExitWithTurnTimestamps(sessionID string, raw json.RawMess
 	if err != nil || len(turns) == 0 {
 		return raw
 	}
-	if last := turns[len(turns)-1]; !started.IsZero() && last.Role == "assistant" && last.EndTime.Before(started) {
-		return raw
+	if last := turns[len(turns)-1]; !started.IsZero() {
+		// A normal completed send must end in an assistant turn. A trailing user
+		// means this send was cancelled before output; do not borrow an earlier
+		// user's timestamp from a [userA,userB] suffix.
+		if last.Role != "assistant" {
+			return raw
+		}
+		end := last.EndTime
+		if end.IsZero() {
+			end = last.Time
+		}
+		if end.IsZero() || end.Before(started) {
+			return raw
+		}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {

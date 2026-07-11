@@ -167,7 +167,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 		logger:      logger,
 		busy:        make(map[string]struct{}),
 		t:           t,
-		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity},
+		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity, turnAborted: b.turnAborted},
 		leftovers:   lp,
 	}
 	s.pool.isBusy = s.isBusy
@@ -240,7 +240,7 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		logger:      logger,
 		busy:        make(map[string]struct{}),
 		t:           t,
-		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity},
+		tail:        tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: b.turnComplete, turnActivity: b.turnActivity, turnAborted: b.turnAborted},
 	}
 	s.pool.isBusy = s.isBusy
 	return s
@@ -413,7 +413,10 @@ func (s *Sender) Interrupt(sessionID string) error { return s.pool.interrupt(ses
 
 // Kill tears down usher's live window for sessionID, if any (its claude
 // exits). Used when deleting a session; a no-op when nothing is live.
-func (s *Sender) Kill(sessionID string) error { return s.pool.kill(sessionID) }
+func (s *Sender) Kill(sessionID string) error {
+	s.leftovers.clear(sessionID)
+	return s.pool.kill(sessionID)
+}
 
 // CapturePane returns the current rendered contents (with colour escapes) of
 // the session's interactive pane, for the read-only terminal mirror. Errors
@@ -535,10 +538,14 @@ const (
 const busyMarker = "esc to interrupt"
 
 // paneShowsBusy reports whether a pane capture carries the running-turn hint.
-// The whole pane is scanned: a missed hint is the dangerous direction
-// (premature finalize), a stray transcript match only delays the fallback.
+// Only the bottom rows are scanned (both TUIs render it there): a copy of the
+// marker in the scrolled transcript must not hold the idle fallback forever.
 func paneShowsBusy(text string) bool {
-	return strings.Contains(strings.ToLower(text), busyMarker)
+	lines := strings.Split(text, "\n")
+	if len(lines) > composerScanLines {
+		lines = lines[len(lines)-composerScanLines:]
+	}
+	return strings.Contains(strings.ToLower(strings.Join(lines, "\n")), busyMarker)
 }
 
 // idlePaneStore remembers, per session, the pane frame the idle fallback saw
@@ -577,6 +584,15 @@ func (s *idlePaneStore) take(id string) (string, bool) {
 	text, ok := s.m[id]
 	delete(s.m, id)
 	return text, ok
+}
+
+func (s *idlePaneStore) clear(id string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, id)
 }
 
 // chooserArrowOn reports whether the chooser's selection arrow sits on `option`
@@ -650,6 +666,10 @@ func isPromptLine(line string) bool {
 // dismissLeftoverDialog to match against on the next send.
 func (s *Sender) tailCfg(sessionID string, recordIdle bool) tailConfig {
 	cfg := s.tail
+	if cfg.maxIdleWait == 0 {
+		cfg.maxIdleWait = 30 * time.Second
+	}
+	start := time.Now()
 	var prev string
 	var seeded bool
 	cfg.paneBusy = func() bool {
@@ -661,10 +681,18 @@ func (s *Sender) tailCfg(sessionID string, recordIdle bool) tailConfig {
 		}
 		moved := !seeded || text != prev
 		prev, seeded = text, true
+		if time.Since(start) >= cfg.maxIdleWait {
+			// Motion this long with no log line is a clock/status animation, not
+			// a running turn; a really-running TUI still shows busyMarker.
+			return paneShowsBusy(text)
+		}
 		return moved || paneShowsBusy(text)
 	}
 	if recordIdle {
+		cfg.idleReason = "local_command"
 		cfg.onIdleExit = func() { s.leftovers.set(sessionID, prev) }
+	} else {
+		cfg.idleReason = "submission_unconfirmed"
 	}
 	return cfg
 }

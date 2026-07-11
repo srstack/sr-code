@@ -116,7 +116,7 @@ func isTaskComplete(raw []byte, turnID string) bool {
 	if err := json.Unmarshal(l.Payload, &p); err != nil {
 		return false
 	}
-	return (p.Type == "task_complete" || p.Type == "turn_complete") && p.TurnID == turnID
+	return isTurnCompleteType(p.Type) && p.TurnID == turnID
 }
 
 func quote(s string) json.RawMessage {

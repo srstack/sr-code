@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/codexrollout"
 )
 
 func types(evs []StreamEvent) []string {
@@ -170,6 +172,71 @@ func TestTailTurn_IdleFallback_NoJsonlAtAll(t *testing.T) {
 	got := collect(t, ch, 2*time.Second)
 	if !eq(types(got), []string{"subprocess.exit"}) {
 		t.Fatalf("got %v, want [subprocess.exit]", types(got))
+	}
+}
+
+func TestTailTurn_UnconfirmedSubmissionIsVisibleFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := idleCfg()
+	cfg.idleReason = "submission_unconfirmed"
+	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
+	if !eq(types(got), []string{"error", "subprocess.exit"}) {
+		t.Fatalf("got %v, want visible error followed by exit", types(got))
+	}
+	if !strings.Contains(string(got[1].Raw), "submission_unconfirmed") {
+		t.Fatalf("exit lacks reason: %s", got[1].Raw)
+	}
+}
+
+func TestTailTurn_CodexAbortTerminatesAfterActivityLatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := idleCfg()
+	cfg.turnActivity = codexrollout.IsTurnActivity
+	cfg.turnComplete = codexrollout.IsTurnComplete
+	cfg.turnAborted = codexrollout.IsTurnAborted
+	go appendLines(path, 5*time.Millisecond,
+		`{"type":"event_msg","payload":{"type":"task_started"}}`,
+		`{"type":"event_msg","payload":{"type":"turn_aborted"}}`,
+	)
+	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
+	if !eq(types(got), []string{"event_msg", "event_msg", "error", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
+	}
+}
+
+// A send whose lines reached the log was definitely submitted: the fallback
+// must finalize it as a benign local command, not a submission failure.
+func TestTailTurn_UnconfirmedDowngradedWhenLogGrew(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := idleCfg()
+	cfg.idleReason = "submission_unconfirmed"
+	go appendLines(path, 5*time.Millisecond, `{"type":"user","isMeta":true}`)
+	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
+	if !eq(types(got), []string{"user", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
+	}
+	if !strings.Contains(string(got[1].Raw), "local_command") {
+		t.Fatalf("exit reason not downgraded: %s", got[1].Raw)
+	}
+}
+
+func TestTailTurn_SeekErrorEmitsErrorAndExit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := collect(t, tailTurn(context.Background(), path, -1, nil, fastCfg()), 2*time.Second)
+	if !eq(types(got), []string{"error", "subprocess.exit"}) {
+		t.Fatalf("got %v", types(got))
 	}
 }
 

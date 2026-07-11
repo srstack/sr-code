@@ -80,7 +80,7 @@ func forkPrefix(srcPath, afterUUID, oldID, newID string) ([]byte, error) {
 					completed = true
 					break // cut: this prompt and everything after stay out
 				}
-				if ev.Type == "system" && ev.Subtype == "turn_duration" {
+				if IsTurnComplete(line) {
 					completed = true
 				}
 			}

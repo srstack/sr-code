@@ -38,8 +38,8 @@ type Event struct {
 
 	// IsMeta marks harness-injected context (e.g. skill content loaded after
 	// a Skill tool call). These are user-role messages but not real user input.
-	IsMeta           bool   `json:"isMeta,omitempty"`
-	SourceToolUseID  string `json:"sourceToolUseID,omitempty"`
+	IsMeta          bool   `json:"isMeta,omitempty"`
+	SourceToolUseID string `json:"sourceToolUseID,omitempty"`
 
 	Raw json.RawMessage `json:"-"`
 }
@@ -208,6 +208,22 @@ type Turn struct {
 	EndTime time.Time `json:"-"`
 }
 
+// Touch advances the server-side end timestamp when ts is usable.
+func (t *Turn) Touch(ts time.Time) {
+	if t != nil && !ts.IsZero() {
+		t.EndTime = ts
+	}
+}
+
+// IsTurnComplete reports Claude Code's persisted end-of-turn marker.
+func IsTurnComplete(raw []byte) bool {
+	var o struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+	}
+	return json.Unmarshal(raw, &o) == nil && o.Type == "system" && o.Subtype == "turn_duration"
+}
+
 // Assembler is the single grouping engine behind both transcript reads and
 // the live event stream: feed it user/assistant events in file order and it
 // yields the same turns/parts ReadTurns serves in batch. ReadTurns is itself
@@ -261,9 +277,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		if ev.UUID != "" {
 			a.cur.UUID = ev.UUID
 		}
-		if !ev.Timestamp.IsZero() {
-			a.cur.EndTime = ev.Timestamp
-		}
+		a.cur.Touch(ev.Timestamp)
 		if ev.SourceToolUseID != "" {
 			for i := len(a.cur.Parts) - 1; i >= 0; i-- {
 				if a.cur.Parts[i].Type == "tool" && a.cur.Parts[i].toolUseID == ev.SourceToolUseID {
@@ -300,9 +314,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	if ev.UUID != "" {
 		a.cur.UUID = ev.UUID
 	}
-	if !ev.Timestamp.IsZero() {
-		a.cur.EndTime = ev.Timestamp
-	}
+	a.cur.Touch(ev.Timestamp)
 
 	if ev.Type == "assistant" {
 		// Collect tool_use id→info for later matching.

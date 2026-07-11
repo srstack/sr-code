@@ -305,6 +305,26 @@ func TestEnrichExitSkipsStaleExchange(t *testing.T) {
 	}
 }
 
+func TestEnrichExitSkipsConsecutiveUsersAndZeroEndTime(t *testing.T) {
+	r := newQueueTestRouter(t)
+	path, _ := r.discovery.Path("abc12345")
+	appendFile(t, path, `{"type":"user","timestamp":"2026-07-01T10:00:01Z","message":{"role":"user","content":"A"}}`+"\n")
+	appendFile(t, path, `{"type":"user","timestamp":"2026-07-01T10:00:02Z","message":{"role":"user","content":"B"}}`+"\n")
+	raw := r.enrichExitWithTurnTimestamps("abc12345", json.RawMessage(`{}`), time.Date(2026, 7, 1, 10, 0, 1, 500000000, time.UTC))
+	if string(raw) != `{}` {
+		t.Fatalf("consecutive-user exit was enriched: %s", raw)
+	}
+
+	r2 := newQueueTestRouter(t)
+	path2, _ := r2.discovery.Path("abc12345")
+	appendFile(t, path2, `{"type":"user","timestamp":"2026-07-01T10:00:01Z","message":{"role":"user","content":"current"}}`+"\n")
+	appendFile(t, path2, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"undated"}]}}`+"\n")
+	raw = r2.enrichExitWithTurnTimestamps("abc12345", json.RawMessage(`{}`), time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC))
+	if string(raw) != `{}` {
+		t.Fatalf("zero-time assistant exit was enriched: %s", raw)
+	}
+}
+
 // TestSendQueueSerializesAndAttributesReplies: three rapid relayed sends into
 // one session must run as three ordered turns, each collector receiving ITS
 // OWN turn's reply — not the previous turn's tail (the busy-session

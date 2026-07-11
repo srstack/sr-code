@@ -71,7 +71,34 @@ func IsTurnComplete(raw []byte) bool {
 		return false
 	}
 	// task_complete is the v1 wire name; turn_complete its announced v2 rename.
-	return p.Type == "task_complete" || p.Type == "turn_complete"
+	return isTurnCompleteType(p.Type)
+}
+
+func isTurnCompleteType(t string) bool {
+	return t == "task_complete" || t == "turn_complete"
+}
+
+// IsTurnAborted reports an explicit abort marker: the turn is over but no
+// completion marker will follow. Error events are deliberately NOT matched —
+// codex may retry and continue after one, and cutting a live turn short is
+// worse than the wait it would save.
+func IsTurnAborted(raw []byte) bool {
+	var l envelope
+	if err := json.Unmarshal(raw, &l); err != nil || l.Type != "event_msg" {
+		return false
+	}
+	var p struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(l.Payload, &p); err != nil {
+		return false
+	}
+	switch p.Type {
+	case "task_aborted", "turn_aborted", "task_cancelled", "turn_cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsTurnActivity reports whether a rollout line is model output — proof a real
@@ -219,9 +246,19 @@ func NewAssembler() *Assembler {
 // part is set when the line appended a part to the in-progress assistant turn
 // (the per-event increment a live stream publishes — a copy, not mutated later).
 func (a *Assembler) Feed(raw []byte) (completed []jsonl.Turn, part *jsonl.TurnPart) {
-	var l line
-	if err := json.Unmarshal(raw, &l); err != nil {
+	// Parse the timestamp independently. A new or malformed timestamp format
+	// must not make us discard the event type/payload (especially turn_complete).
+	var wire struct {
+		Timestamp json.RawMessage `json:"timestamp"`
+		Type      string          `json:"type"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, nil
+	}
+	l := line{Type: wire.Type, Payload: wire.Payload}
+	if len(wire.Timestamp) != 0 {
+		_ = json.Unmarshal(wire.Timestamp, &l.Timestamp)
 	}
 	switch l.Type {
 	case "event_msg":
@@ -281,14 +318,12 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		tp := jsonl.TurnPart{Type: "text", Content: p.Message}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return nil, &tp
-	case "task_complete", "turn_complete": // v1 wire name and its announced v2 rename
+	case "task_complete", "turn_complete": // kept explicit for the switch; predicate is shared elsewhere
 		// End-of-turn marker: stamp the turn with its turn_id (the fork point a
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
 		if a.cur != nil {
 			a.cur.UUID = p.TurnID
-			if !l.Timestamp.IsZero() {
-				a.cur.EndTime = l.Timestamp
-			}
+			a.cur.Touch(l.Timestamp)
 		}
 		if t := a.Flush(); t != nil {
 			completed = append(completed, *t)
@@ -350,9 +385,7 @@ func (a *Assembler) ensureTurn(ts time.Time) {
 	if a.cur == nil {
 		a.cur = &jsonl.Turn{Role: "assistant", Time: ts, Model: a.model}
 	}
-	if !ts.IsZero() {
-		a.cur.EndTime = ts
-	}
+	a.cur.Touch(ts)
 }
 
 // Flush commits and returns the in-progress assistant turn, or nil when there is

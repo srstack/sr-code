@@ -248,12 +248,5 @@ func turnCompleteMarker(backend string, line []byte) bool {
 	if backend == "codex" {
 		return codexrollout.IsTurnComplete(line)
 	}
-	var o struct {
-		Type    string `json:"type"`
-		Subtype string `json:"subtype"`
-	}
-	if json.Unmarshal(line, &o) != nil {
-		return false
-	}
-	return o.Type == "system" && o.Subtype == "turn_duration"
+	return jsonl.IsTurnComplete(line)
 }
