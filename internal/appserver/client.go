@@ -1,0 +1,455 @@
+// Package appserver implements the newline-delimited JSON-RPC transport used
+// by `codex app-server`.
+package appserver
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/nexustar/usher/internal/hook"
+)
+
+type rpcMessage struct {
+	JSONRPC string          `json:"jsonrpc,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+type response struct {
+	result json.RawMessage
+	err    error
+}
+
+// TurnResult is delivered when app-server announces a terminal turn state.
+type TurnResult struct{ Status string }
+
+type initState struct {
+	done     chan struct{}
+	err      error
+	finished bool
+}
+
+// Client owns one lazily-started app-server process shared by all threads.
+type Client struct {
+	bin     string
+	logger  *slog.Logger
+	hooks   *hook.Manager
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	in      io.WriteCloser
+	pending map[string]chan response
+	turns   map[string]chan TurnResult
+	threads map[string]string // thread id -> cwd
+	next    atomic.Uint64
+	init    *initState
+	sandbox map[string]any
+	config  map[string]any
+	env     []string
+}
+
+func New(bin string, hooks *hook.Manager, sandbox, config map[string]any, env []string, logger *slog.Logger) *Client {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Client{bin: bin, hooks: hooks, sandbox: cloneMap(sandbox), config: cloneMap(config), env: append([]string(nil), env...), logger: logger, pending: map[string]chan response{}, turns: map[string]chan TurnResult{}, threads: map[string]string{}}
+}
+
+func scrubEnv() []string {
+	out := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		name := strings.SplitN(e, "=", 2)[0]
+		if strings.HasPrefix(name, "CODEX_") && name != "CODEX_HOME" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func (c *Client) ensure(ctx context.Context) error {
+	c.mu.Lock()
+	if c.cmd != nil {
+		state := c.init
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-state.done:
+			return state.err
+		}
+	}
+	state := &initState{done: make(chan struct{})}
+	cmd := exec.CommandContext(context.Background(), c.bin, "app-server")
+	cmd.Env = append(scrubEnv(), c.env...)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	cmd.Stderr = os.Stderr
+	if err = cmd.Start(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.cmd, c.in, c.init = cmd, in, state
+	c.mu.Unlock()
+	go c.readLoop(cmd, out)
+	go func() { err := cmd.Wait(); c.died(cmd, err) }()
+	var init struct {
+		UserAgent string `json:"userAgent"`
+	}
+	if err := c.call(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "usher", "version": "1"}}, &init); err != nil {
+		err = fmt.Errorf("initialize app-server: %w", err)
+		c.finishInit(cmd, err)
+		c.stopProcess(cmd, err)
+		return err
+	}
+	if err := c.write(map[string]any{"jsonrpc": "2.0", "method": "initialized"}); err != nil {
+		c.finishInit(cmd, err)
+		c.stopProcess(cmd, err)
+		return err
+	}
+	c.finishInit(cmd, nil)
+	c.logger.Info("codex app-server initialized", "server", init.UserAgent)
+	return nil
+}
+
+func (c *Client) finishInit(cmd *exec.Cmd, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd != cmd || c.init == nil || c.init.finished {
+		return
+	}
+	c.init.err, c.init.finished = err, true
+	close(c.init.done)
+}
+
+func (c *Client) write(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.in == nil {
+		return errors.New("app-server is not running")
+	}
+	_, err = c.in.Write(b)
+	return err
+}
+func (c *Client) call(ctx context.Context, method string, params any, dst any) error {
+	id := fmt.Sprint(c.next.Add(1))
+	ch := make(chan response, 1)
+	c.mu.Lock()
+	c.pending[id] = ch
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
+	if err := c.write(map[string]any{"jsonrpc": "2.0", "id": json.Number(id), "method": method, "params": params}); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return r.err
+		}
+		if dst != nil {
+			return json.Unmarshal(r.result, dst)
+		}
+		return nil
+	}
+}
+
+func (c *Client) readLoop(cmd *exec.Cmd, r io.Reader) {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 64<<10), 64<<20)
+	for s.Scan() {
+		var m rpcMessage
+		if json.Unmarshal(s.Bytes(), &m) != nil {
+			continue
+		}
+		c.dispatch(m)
+	}
+	err := s.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	c.stopProcess(cmd, fmt.Errorf("app-server stdout closed: %w", err))
+}
+func idString(raw json.RawMessage) string {
+	var n json.Number
+	if json.Unmarshal(raw, &n) == nil {
+		return n.String()
+	}
+	var s string
+	_ = json.Unmarshal(raw, &s)
+	return s
+}
+func (c *Client) dispatch(m rpcMessage) {
+	if len(m.ID) > 0 && m.Method == "" {
+		id := idString(m.ID)
+		c.mu.Lock()
+		ch := c.pending[id]
+		c.mu.Unlock()
+		if ch != nil {
+			if m.Error != nil {
+				ch <- response{err: fmt.Errorf("rpc %d: %s", m.Error.Code, m.Error.Message)}
+			} else {
+				ch <- response{result: m.Result}
+			}
+		}
+		return
+	}
+	if len(m.ID) > 0 && m.Method != "" {
+		go c.approval(m)
+		return
+	}
+	if m.Method == "turn/completed" {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Turn     struct {
+				Status string `json:"status"`
+			} `json:"turn"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		c.mu.Lock()
+		ch := c.turns[p.ThreadID]
+		delete(c.turns, p.ThreadID)
+		c.mu.Unlock()
+		if ch != nil {
+			ch <- TurnResult{Status: p.Turn.Status}
+			close(ch)
+		}
+	}
+}
+
+func (c *Client) approval(m rpcMessage) {
+	var p map[string]json.RawMessage
+	_ = json.Unmarshal(m.Params, &p)
+	var sid, cwd, command string
+	_ = json.Unmarshal(p["threadId"], &sid)
+	_ = json.Unmarshal(p["cwd"], &cwd)
+	_ = json.Unmarshal(p["command"], &command)
+	tool := "Bash"
+	if strings.Contains(strings.ToLower(m.Method), "filechange") || strings.Contains(strings.ToLower(m.Method), "applypatch") {
+		tool = "Edit"
+	}
+	c.mu.Lock()
+	h := c.hooks
+	if cwd == "" {
+		cwd = c.threads[sid]
+	}
+	c.mu.Unlock()
+	input := json.RawMessage(m.Params)
+	if tool == "Bash" {
+		input, _ = json.Marshal(map[string]any{"command": command})
+	}
+	decision := "decline"
+	known := m.Method == "item/commandExecution/requestApproval" ||
+		m.Method == "item/fileChange/requestApproval" ||
+		m.Method == "execCommandApproval" || m.Method == "applyPatchApproval"
+	if known && h != nil {
+		if r, err := h.Submit(context.Background(), hook.Event{SessionID: sid, Event: "PermissionRequest", ToolName: tool, ToolInput: input, Cwd: cwd}); err == nil && r.Behavior == "allow" {
+			decision = "accept"
+		}
+	}
+	// The legacy request methods use the older ReviewDecision enum.
+	if m.Method == "execCommandApproval" || m.Method == "applyPatchApproval" {
+		if decision == "accept" {
+			decision = "approved"
+		} else {
+			decision = "denied"
+		}
+	}
+	if !known {
+		c.logger.Warn("declining unknown app-server request", "method", m.Method)
+	}
+	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(m.ID), "result": map[string]any{"decision": decision}})
+}
+
+func (c *Client) died(cmd *exec.Cmd, err error) {
+	c.failProcess(cmd, fmt.Errorf("codex app-server exited: %w", err))
+}
+
+func (c *Client) failProcess(cmd *exec.Cmd, err error) {
+	c.mu.Lock()
+	if c.cmd != cmd {
+		c.mu.Unlock()
+		return
+	}
+	if c.init != nil && !c.init.finished {
+		c.init.err = err
+		c.init.finished = true
+		close(c.init.done)
+	}
+	c.cmd = nil
+	c.in = nil
+	pending := c.pending
+	turns := c.turns
+	c.pending = map[string]chan response{}
+	c.turns = map[string]chan TurnResult{}
+	c.threads = map[string]string{}
+	c.mu.Unlock()
+	for _, ch := range pending {
+		ch <- response{err: err}
+	}
+	for _, ch := range turns {
+		ch <- TurnResult{Status: "failed"}
+		close(ch)
+	}
+}
+func (c *Client) stopProcess(cmd *exec.Cmd, reason error) {
+	c.mu.Lock()
+	if c.cmd != cmd {
+		c.mu.Unlock()
+		return
+	}
+	in := c.in
+	c.mu.Unlock()
+	if in != nil {
+		_ = in.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	c.failProcess(cmd, reason)
+}
+func (c *Client) Shutdown() {
+	c.mu.Lock()
+	cmd := c.cmd
+	c.mu.Unlock()
+	if cmd != nil {
+		c.stopProcess(cmd, errors.New("app-server shutdown"))
+	}
+}
+
+func cloneMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+func (c *Client) threadParams(cwd, model string) map[string]any {
+	config := cloneMap(c.config)
+	if model != "" {
+		config["model"] = model
+	}
+	if _, ok := config["mcp_servers.usher.command"]; ok {
+		config["mcp_servers.usher.cwd"] = cwd
+	}
+	p := map[string]any{"cwd": cwd, "approvalPolicy": "on-request", "config": config}
+	for k, v := range c.sandbox {
+		p[k] = v
+	}
+	return p
+}
+
+func (c *Client) StartThread(ctx context.Context, cwd, model string) (string, error) {
+	if err := c.ensure(ctx); err != nil {
+		return "", err
+	}
+	params := c.threadParams(cwd, model)
+	var out struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := c.call(ctx, "thread/start", params, &out); err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.threads[out.Thread.ID] = cwd
+	c.mu.Unlock()
+	return out.Thread.ID, nil
+}
+func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, error) {
+	if err := c.ensure(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	_, ok := c.threads[id]
+	c.mu.Unlock()
+	if !ok {
+		params := c.threadParams(cwd, "")
+		params["threadId"] = id
+		if err := c.call(ctx, "thread/resume", params, nil); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.threads[id] = cwd
+		c.mu.Unlock()
+	}
+	ch := make(chan TurnResult, 1)
+	c.mu.Lock()
+	c.turns[id] = ch
+	c.mu.Unlock()
+	if err := c.call(ctx, "turn/start", map[string]any{"threadId": id, "input": []map[string]string{{"type": "text", "text": prompt}}}, nil); err != nil {
+		c.mu.Lock()
+		delete(c.turns, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+	return ch, nil
+}
+func (c *Client) Interrupt(ctx context.Context, id string) error {
+	c.mu.Lock()
+	running := c.cmd != nil
+	_, turning := c.turns[id]
+	c.mu.Unlock()
+	if !running || !turning {
+		return nil
+	}
+	return c.call(ctx, "turn/interrupt", map[string]any{"threadId": id}, nil)
+}
+func (c *Client) Has(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.threads[id]
+	return ok
+}
+func (c *Client) LiveSessions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.threads))
+	for id := range c.threads {
+		out = append(out, id)
+	}
+	return out
+}
+func (c *Client) Kill(ctx context.Context, id string) error {
+	_ = c.Interrupt(ctx, id)
+	c.mu.Lock()
+	ch := c.turns[id]
+	delete(c.threads, id)
+	delete(c.turns, id)
+	c.mu.Unlock()
+	if ch != nil {
+		ch <- TurnResult{Status: "interrupted"}
+		close(ch)
+	}
+	return nil
+}

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/hook"
 )
 
 func newCodexBackend(sessionsDir string, extra ...string) codexBackend {
@@ -102,7 +104,7 @@ func TestCodexWarmDialogRejectsPaste(t *testing.T) {
 }
 
 func TestNewCodexWiring(t *testing.T) {
-	s := NewCodex("codex", "/home/u/.codex/sessions", "", "", []string{"--sandbox", "workspace-write"}, 8, true, quietLogger())
+	s := NewCodex("codex", "/home/u/.codex/sessions", "", "", []string{"--sandbox", "workspace-write"}, 8, true, hook.New(""), quietLogger())
 	if s.pool.spawnOverride == nil {
 		t.Error("NewCodex must route spawn through codexBackend.spawnCommand")
 	}

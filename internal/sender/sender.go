@@ -24,6 +24,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nexustar/usher/internal/appserver"
+	"github.com/nexustar/usher/internal/hook"
 )
 
 // StreamEvent is one event for a turn. Type is the jsonl line's "type"
@@ -37,6 +40,8 @@ type StreamEvent struct {
 	Raw  json.RawMessage
 }
 
+var ErrHeadless = errors.New("terminal mirror is unavailable for headless sessions")
+
 // timing groups the tunable delays for driving the TUI. Defaults are set in
 // New; tests override them for speed.
 type timing struct {
@@ -49,6 +54,7 @@ type timing struct {
 }
 
 type Sender struct {
+	app         *appserver.Client // non-nil for the headless Codex backend
 	pool        *pool
 	backend     backend
 	projectsDir string
@@ -179,7 +185,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 // and gates USHER_HOOK_SOCK, since codex doesn't forward env to MCP children).
 // Values are TOML (exe as a basic string, arrays as TOML arrays); each is later
 // emitted as `-c <shellQuote(value)>`. Returns nil if the exe can't be resolved.
-func codexMCPConfigArgs(logger *slog.Logger) []string {
+func codexMCPConfig(logger *slog.Logger) map[string]any {
 	exe, err := os.Executable()
 	if err == nil {
 		exe, err = filepath.Abs(exe)
@@ -188,12 +194,29 @@ func codexMCPConfigArgs(logger *slog.Logger) []string {
 		logger.Warn("codex mcp: cannot resolve usher executable; show_image disabled", "err", err)
 		return nil
 	}
+	return map[string]any{
+		"mcp_servers.usher.command":             exe,
+		"mcp_servers.usher.args":                []string{"mcp-stdio"},
+		"mcp_servers.usher.env_vars":            []string{"USHER_HOOK_SOCK"},
+		"code_mode.direct_only_tool_namespaces": []string{"usher"},
+	}
+}
+
+// codexMCPConfigArgs derives the legacy TUI -c overrides from the same native
+// values used by app-server.
+func codexMCPConfigArgs(logger *slog.Logger) []string {
+	cfg := codexMCPConfig(logger)
+	if cfg == nil {
+		return nil
+	}
+	exe := cfg["mcp_servers.usher.command"].(string)
 	tomlExe := strings.ReplaceAll(exe, `\`, `\\`)
 	tomlExe = strings.ReplaceAll(tomlExe, `"`, `\"`)
 	return []string{
 		`mcp_servers.usher.command="` + tomlExe + `"`,
 		`mcp_servers.usher.args=["mcp-stdio"]`,
 		`mcp_servers.usher.env_vars=["USHER_HOOK_SOCK"]`,
+		`code_mode.direct_only_tool_namespaces=["usher"]`,
 	}
 }
 
@@ -205,7 +228,7 @@ func codexMCPConfigArgs(logger *slog.Logger) []string {
 //
 // Resume goes straight in (`codex resume <id>`, no chooser); a brand-new session
 // (Codex assigns its own id) is created via StartCodexSession.
-func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []string, maxLive int, injectMCPTools bool, logger *slog.Logger) *Sender {
+func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []string, maxLive int, injectMCPTools bool, hooks *hook.Manager, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -233,7 +256,16 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 	b := codexBackend{p: p, t: t, codexCmd: codexCmd, sessionsDir: sessionsDir, extraArgs: sandboxArgs, mcpConfArgs: mcpConf}
 	// Codex's command differs from the Claude default; route spawn through it.
 	p.spawnOverride = b.spawnCommand
+	appConfig := map[string]any{}
+	if injectMCPTools {
+		appConfig = codexMCPConfig(logger)
+	}
+	sandbox, config := codexHeadlessParams(sandboxArgs, logger)
+	for k, v := range appConfig {
+		config[k] = v
+	}
 	s := &Sender{
+		app:         appserver.New(codexCmd, hooks, sandbox, config, env, logger),
 		pool:        p,
 		backend:     b,
 		projectsDir: sessionsDir,
@@ -244,6 +276,40 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 	}
 	s.pool.isBusy = s.isBusy
 	return s
+}
+
+func codexHeadlessParams(args []string, logger *slog.Logger) (map[string]any, map[string]any) {
+	p, cfg := map[string]any{}, map[string]any{}
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "--sandbox" || args[i] == "-s") && i+1 < len(args):
+			p["sandbox"] = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--sandbox="):
+			p["sandbox"] = strings.TrimPrefix(args[i], "--sandbox=")
+		case args[i] == "-c" && i+1 < len(args):
+			kv := strings.SplitN(args[i+1], "=", 2)
+			if len(kv) == 2 {
+				cfg[kv[0]] = codexConfigValue(kv[1])
+			} else {
+				logger.Warn("headless codex: invalid -c override", "value", args[i+1])
+			}
+			i++
+		default:
+			logger.Warn("headless codex: unsupported --codex-args option", "option", args[i])
+		}
+	}
+	return p, cfg
+}
+
+// Codex's common TOML literals (strings, booleans, numbers and arrays) are
+// also valid JSON. Preserve bare TOML words as strings.
+func codexConfigValue(raw string) any {
+	var v any
+	if json.Unmarshal([]byte(raw), &v) == nil {
+		return v
+	}
+	return raw
 }
 
 // isBusy reports whether sessionID has an in-flight turn (the pool's eviction
@@ -274,6 +340,9 @@ func (s *Sender) clearBusy(sessionID string) {
 // spawning it as needed) and streams the resulting turn's events. The channel
 // closes when the turn ends or ctx is cancelled.
 func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-chan StreamEvent, error) {
+	if s.app != nil {
+		return s.appTurn(ctx, sessionID, prompt, cwd, false)
+	}
 	// Resumes keep their original model, so no model is threaded here.
 	return s.run(ctx, sessionID, prompt, cwd, "", true)
 }
@@ -298,6 +367,14 @@ func (s *Sender) PreAssignsID() bool { return s.backend.preAssignsID() }
 // is flushed at start, so this is quick); the turn then streams in the returned
 // channel. Callers gate on PreAssignsID()==false.
 func (s *Sender) StartCodexSession(ctx context.Context, tempID, prompt, cwd, model string, discoverTimeout time.Duration) (string, <-chan StreamEvent, error) {
+	if s.app != nil {
+		id, err := s.app.StartThread(ctx, cwd, model)
+		if err != nil {
+			return "", nil, err
+		}
+		ch, err := s.appTurn(ctx, id, prompt, cwd, true)
+		return id, ch, err
+	}
 	// Serialize same-cwd creates across snapshot→spawn→discover (released on
 	// return, before the tail goroutine, which runs unlocked).
 	defer s.lockCwd(cwd)()
@@ -389,6 +466,10 @@ func (s *Sender) discoverWait(ctx context.Context, cwd string, known map[string]
 // starting a model turn (a leading '!', claude's own bash mode), which logs no
 // turn_duration and would otherwise wedge the tailer. Never starts a session.
 func (s *Sender) Inject(ctx context.Context, sessionID, prompt, cwd string) error {
+	if s.app != nil {
+		_, err := s.app.StartTurn(ctx, sessionID, prompt, cwd)
+		return err
+	}
 	fresh, err := s.pool.ensure(sessionID, cwd, "", true)
 	if err != nil {
 		return err
@@ -401,19 +482,41 @@ func (s *Sender) Inject(ctx context.Context, sessionID, prompt, cwd string) erro
 
 // Has reports whether usher currently holds a live interactive process for
 // sessionID.
-func (s *Sender) Has(sessionID string) bool { return s.pool.has(sessionID) }
+func (s *Sender) Has(sessionID string) bool {
+	if s.app != nil {
+		return s.app.Has(sessionID)
+	}
+	return s.pool.has(sessionID)
+}
 
 // LiveSessions returns the ids of all sessions usher currently holds a live
 // interactive process for. One tmux query; use it to decorate session lists.
-func (s *Sender) LiveSessions() []string { return s.pool.liveSessions() }
+func (s *Sender) LiveSessions() []string {
+	if s.app != nil {
+		return s.app.LiveSessions()
+	}
+	return s.pool.liveSessions()
+}
 
 // Interrupt stops the in-flight turn for sessionID without killing the
 // process (Ctrl-C into the pane).
-func (s *Sender) Interrupt(sessionID string) error { return s.pool.interrupt(sessionID) }
+func (s *Sender) Interrupt(sessionID string) error {
+	if s.app != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return s.app.Interrupt(ctx, sessionID)
+	}
+	return s.pool.interrupt(sessionID)
+}
 
 // Kill tears down usher's live window for sessionID, if any (its claude
 // exits). Used when deleting a session; a no-op when nothing is live.
 func (s *Sender) Kill(sessionID string) error {
+	if s.app != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return s.app.Kill(ctx, sessionID)
+	}
 	s.leftovers.clear(sessionID)
 	return s.pool.kill(sessionID)
 }
@@ -422,24 +525,109 @@ func (s *Sender) Kill(sessionID string) error {
 // the session's interactive pane, for the read-only terminal mirror. Errors
 // if usher holds no live window for sessionID.
 func (s *Sender) CapturePane(sessionID string) (string, error) {
+	if s.app != nil {
+		return "", ErrHeadless
+	}
 	return s.pool.capturePane(sessionID)
 }
 
 // SendKeys forwards tmux key names to the session's pane, powering the
 // terminal mirror's soft keys.
 func (s *Sender) SendKeys(sessionID string, keys ...string) error {
+	if s.app != nil {
+		return ErrHeadless
+	}
 	return s.pool.sendKeys(sessionID, keys...)
 }
 
 // ResizeCanvas sets the session pane to cols×rows for the terminal mirror (also
 // repairs any manual-attach drift). Called when the mirror opens.
 func (s *Sender) ResizeCanvas(sessionID string, cols, rows int) error {
+	if s.app != nil {
+		return ErrHeadless
+	}
 	return s.pool.resizeCanvas(sessionID, cols, rows)
 }
 
 // Shutdown tears down usher's tmux server (all live windows). Call on exit if
 // you do NOT want processes to survive for the next usher run.
-func (s *Sender) Shutdown() { s.pool.shutdown() }
+func (s *Sender) Shutdown() {
+	if s.app != nil {
+		s.app.Shutdown()
+		return
+	}
+	s.pool.shutdown()
+}
+
+// appTurn keeps rollout jsonl as the content plane while app-server supplies
+// the driving and terminal lifecycle signal.
+func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool) (<-chan StreamEvent, error) {
+	path := s.locate(id)
+	var offset int64
+	if path != "" {
+		if fi, e := os.Stat(path); e == nil {
+			offset = fi.Size()
+		}
+	}
+	done, err := s.app.StartTurn(ctx, id, prompt, cwd)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan StreamEvent, 64)
+	go func() {
+		defer close(out)
+		started, _ := json.Marshal(map[string]any{"cwd": cwd, "fresh": fresh})
+		if !sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started}) {
+			return
+		}
+		if path == "" {
+			path = s.locateWait(ctx, id, s.t.confirm)
+		}
+		if path == "" {
+			emitError(ctx, out, "codex session log did not appear after prompt")
+			return
+		}
+		tailCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		events := tailTurn(tailCtx, path, offset, s.logger, s.tailCfg(id, false))
+		for {
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					// File completion is only a straggler backstop. Give the
+					// protocol event a grace period before finalizing without it.
+					select {
+					case result := <-done:
+						if result.Status == "failed" {
+							emitError(ctx, out, "codex turn failed")
+						}
+					case <-time.After(5 * time.Second):
+						s.logger.Warn("codex turn finalized from rollout backstop", "thread_id", id)
+					case <-ctx.Done():
+					}
+					return
+				}
+				if !sendEvent(ctx, out, ev) {
+					return
+				}
+			case result := <-done:
+				if result.Status == "failed" {
+					emitError(ctx, out, "codex turn failed")
+				}
+				cancel()
+				for ev := range events {
+					if !sendEvent(ctx, out, ev) {
+						return
+					}
+				}
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
 
 func (s *Sender) run(ctx context.Context, sessionID, prompt, cwd, model string, resume bool) (<-chan StreamEvent, error) {
 	fresh, err := s.pool.ensure(sessionID, cwd, model, resume)

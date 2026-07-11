@@ -166,6 +166,7 @@ func serve(args []string) error {
 	// each other's windows. defaultBackend (new-session/fallback) prefers Claude.
 	sources := []discovery.Source{}
 	senders := map[string]*sender.Sender{}
+	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	defaultBackend := ""
 	var codexModelsPath string
 
@@ -177,7 +178,7 @@ func serve(args []string) error {
 	}
 	if dir := *codexSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewCodexSource(dir))
-		senders["codex"] = sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, logger)
+		senders["codex"] = sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger)
 		// codex's per-account model catalog sits next to the sessions dir.
 		codexModelsPath = filepath.Join(filepath.Dir(dir), "models_cache.json")
 		if defaultBackend == "" {
@@ -197,7 +198,6 @@ func serve(args []string) error {
 		return err
 	}
 	b := broker.New()
-	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	meta := sessionmeta.New(
 		filepath.Join(*dataDir, "sessions.json"),
 		time.Duration(*autoArchiveDays)*24*time.Hour,

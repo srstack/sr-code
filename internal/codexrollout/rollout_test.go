@@ -283,3 +283,35 @@ func TestTurnAbortedAndMalformedTimestampCompletion(t *testing.T) {
 		t.Fatalf("malformed timestamp completion = %+v, want one turn with UUID t-v2", done)
 	}
 }
+
+func TestAssemblerAppServerMCPToolCall(t *testing.T) {
+	a := NewAssembler()
+	raw := `{"timestamp":"2026-07-11T17:39:19Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"mcp-1","invocation":{"server":"usher","tool":"show_image","arguments":{"file_path":"/tmp/grassland.png"}},"result":{"Ok":{"content":[{"type":"text","text":"{\"w\":1536,\"h\":1024}"}],"isError":false}}}}`
+	_, part := a.Feed([]byte(raw))
+	if part == nil {
+		t.Fatal("mcp_tool_call_end did not produce a turn part")
+	}
+	if part.Type != "tool" || part.ToolName != "mcp__usher__show_image" || part.ToolTarget != "/tmp/grassland.png" {
+		t.Fatalf("unexpected part: %+v", *part)
+	}
+	if !strings.Contains(part.Content, `"w":1536`) {
+		t.Fatalf("missing MCP result dimensions: %q", part.Content)
+	}
+}
+
+func TestAssemblerCanonicalMCPItemAndLegacyDedup(t *testing.T) {
+	a := NewAssembler()
+	canonical := `{"timestamp":"2026-07-11T17:39:19Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"mcp_tool_call","id":"mcp-1","server":"usher","tool":"show_image","arguments":{"file_path":"/tmp/a.png"},"status":"completed","result":{"content":[{"type":"text","text":"{\"w\":10,\"h\":20}"}],"isError":false}}}}`
+	_, part := a.Feed([]byte(canonical))
+	if part == nil || part.ToolName != "mcp__usher__show_image" || part.ToolTarget != "/tmp/a.png" {
+		t.Fatalf("canonical part: %+v", part)
+	}
+	legacy := `{"timestamp":"2026-07-11T17:39:20Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"mcp-1","invocation":{"server":"usher","tool":"show_image","arguments":{"file_path":"/tmp/a.png"}},"result":{"Ok":{"content":[{"type":"text","text":"duplicate"}]}}}}`
+	if _, duplicate := a.Feed([]byte(legacy)); duplicate != nil {
+		t.Fatalf("legacy duplicate emitted: %+v", duplicate)
+	}
+	turn := a.Flush()
+	if turn == nil || len(turn.Parts) != 1 {
+		t.Fatalf("deduped turn: %+v", turn)
+	}
+}

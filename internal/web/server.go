@@ -1009,6 +1009,10 @@ func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if s.router.IsHeadless(id) {
+		writeErr(w, http.StatusGone, router.ErrHeadless.Error())
+		return
+	}
 	flusher, ok := sseStart(w)
 	if !ok {
 		return
@@ -1118,6 +1122,10 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.router.SendKeys(id, tmuxKey); err != nil {
+		if errors.Is(err, router.ErrHeadless) {
+			writeErr(w, http.StatusGone, err.Error())
+			return
+		}
 		// No live window to receive the key (or the session is the user's own,
 		// unowned). 409: the client shows the pane is not live.
 		writeErr(w, http.StatusConflict, err.Error())

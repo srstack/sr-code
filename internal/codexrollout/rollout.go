@@ -229,6 +229,7 @@ func ReadTurns(path string, limit int) (turns []jsonl.Turn, total int, err error
 type Assembler struct {
 	cur     *jsonl.Turn
 	pending map[string]toolStash // call_id -> tool call awaiting its output
+	seenMCP map[string]struct{}  // canonical/legacy/response-item deduplication
 	model   string               // last model seen on a turn_context line (sticky)
 }
 
@@ -238,7 +239,7 @@ type toolStash struct {
 }
 
 func NewAssembler() *Assembler {
-	return &Assembler{pending: map[string]toolStash{}}
+	return &Assembler{pending: map[string]toolStash{}, seenMCP: map[string]struct{}{}}
 }
 
 // Feed consumes one rollout line. completed holds turns this line finished (a
@@ -318,6 +319,13 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		tp := jsonl.TurnPart{Type: "text", Content: p.Message}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return nil, &tp
+	case "mcp_tool_call_end":
+		// app-server records MCP calls as lifecycle events rather than the
+		// function_call/function_call_output pair emitted by the old TUI path.
+		// Normalize both wires into the same tool TurnPart consumed by web/IM.
+		return nil, a.mcpToolPart(l)
+	case "item_completed":
+		return nil, a.completedMCPToolPart(l)
 	case "task_complete", "turn_complete": // kept explicit for the switch; predicate is shared elsewhere
 		// End-of-turn marker: stamp the turn with its turn_id (the fork point a
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
@@ -331,6 +339,115 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		return completed, nil
 	}
 	return nil, nil
+}
+
+func (a *Assembler) mcpToolPart(l line) *jsonl.TurnPart {
+	var p struct {
+		CallID     string `json:"call_id"`
+		Invocation struct {
+			Server    string                     `json:"server"`
+			Tool      string                     `json:"tool"`
+			Arguments map[string]json.RawMessage `json:"arguments"`
+		} `json:"invocation"`
+		Result struct {
+			OK *struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"Ok"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(l.Payload, &p); err != nil || p.Invocation.Tool == "" {
+		return nil
+	}
+	if !a.markMCP(p.CallID) {
+		return nil
+	}
+	name := p.Invocation.Tool
+	if p.Invocation.Server != "" {
+		name = "mcp__" + p.Invocation.Server + "__" + name
+	}
+	target := toolTargetMap(p.Invocation.Arguments)
+	var texts []string
+	if p.Result.OK != nil {
+		for _, c := range p.Result.OK.Content {
+			if c.Type == "text" && c.Text != "" {
+				texts = append(texts, c.Text)
+			}
+		}
+	}
+	a.ensureTurn(l.Timestamp)
+	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+	if len(texts) > 0 {
+		tp.Content = fence(clampBody(strings.Join(texts, "\n")))
+	}
+	a.cur.Parts = append(a.cur.Parts, tp)
+	return &tp
+}
+
+func (a *Assembler) completedMCPToolPart(l line) *jsonl.TurnPart {
+	var p struct {
+		Item struct {
+			Type      string                     `json:"type"`
+			ID        string                     `json:"id"`
+			Server    string                     `json:"server"`
+			Tool      string                     `json:"tool"`
+			Arguments map[string]json.RawMessage `json:"arguments"`
+			Result    *struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(l.Payload, &p); err != nil || (p.Item.Type != "mcp_tool_call" && p.Item.Type != "McpToolCall") || p.Item.Tool == "" {
+		return nil
+	}
+	if !a.markMCP(p.Item.ID) {
+		return nil
+	}
+	var texts []string
+	if p.Item.Result != nil {
+		for _, c := range p.Item.Result.Content {
+			if c.Type == "text" && c.Text != "" {
+				texts = append(texts, c.Text)
+			}
+		}
+	}
+	if p.Item.Error != nil && p.Item.Error.Message != "" {
+		texts = append(texts, p.Item.Error.Message)
+	}
+	return a.appendMCPPart(l.Timestamp, p.Item.Server, p.Item.Tool, p.Item.Arguments, texts)
+}
+
+func (a *Assembler) markMCP(callID string) bool {
+	if callID == "" {
+		return true
+	}
+	if _, ok := a.seenMCP[callID]; ok {
+		return false
+	}
+	a.seenMCP[callID] = struct{}{}
+	return true
+}
+
+func (a *Assembler) appendMCPPart(ts time.Time, server, tool string, arguments map[string]json.RawMessage, texts []string) *jsonl.TurnPart {
+	name := tool
+	if server != "" {
+		name = "mcp__" + server + "__" + tool
+	}
+	a.ensureTurn(ts)
+	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: toolTargetMap(arguments)}
+	if len(texts) > 0 {
+		tp.Content = fence(clampBody(strings.Join(texts, "\n")))
+	}
+	a.cur.Parts = append(a.cur.Parts, tp)
+	return &tp
 }
 
 // feedResponseItem handles the model-item stream. Only tool calls/outputs are
@@ -358,6 +475,9 @@ func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
 	case "function_call_output":
 		stash := a.pending[p.CallID]
 		delete(a.pending, p.CallID)
+		if strings.HasPrefix(stash.name, "mcp__") && !a.markMCP(p.CallID) {
+			return nil
+		}
 		a.ensureTurn(l.Timestamp)
 		tp := jsonl.TurnPart{
 			Type:       "tool",
@@ -424,6 +544,10 @@ func toolTarget(arguments string) string {
 	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
 		return ""
 	}
+	return toolTargetMap(m)
+}
+
+func toolTargetMap(m map[string]json.RawMessage) string {
 	for _, key := range []string{"cmd", "command", "file_path", "path"} {
 		if raw, ok := m[key]; ok {
 			var s string

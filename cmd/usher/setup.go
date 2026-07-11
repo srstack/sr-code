@@ -72,8 +72,12 @@ func runSetup(args []string) error {
 		fmt.Println("claude not detected (~/.claude absent); skipped claude hook.")
 	}
 
-	if err := setupCodexHook(home, exe, sock, *remove); err != nil {
-		fmt.Fprintln(os.Stderr, "codex hook setup:", err)
+	// app-server approvals are protocol requests, so new installs must not
+	// write Codex's global hook. Keep --remove as a migration cleanup path.
+	if *remove {
+		if err := setupCodexHook(home, exe, sock, true); err != nil {
+			fmt.Fprintln(os.Stderr, "codex hook cleanup:", err)
+		}
 	}
 
 	if !*remove {

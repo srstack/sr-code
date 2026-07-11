@@ -33,6 +33,7 @@ import (
 // ErrSessionNotFound is returned when an operation targets a session with no
 // log on disk (so its path/backend can't be resolved).
 var ErrSessionNotFound = errors.New("session not found")
+var ErrHeadless = sender.ErrHeadless
 
 type Router struct {
 	discovery *discovery.Discovery
@@ -122,6 +123,9 @@ func (r *Router) Backends() []string {
 	sort.Strings(out)
 	return out
 }
+
+// IsHeadless reports whether the session's backend has no terminal pane.
+func (r *Router) IsHeadless(id string) bool { return r.backendOf(id) == "codex" }
 
 // senderForBackend returns the Sender for a backend, falling back to the
 // default when the backend is empty or unregistered.
@@ -793,6 +797,9 @@ func (r *Router) SubscribePendingInteractions() (<-chan hook.Pending, func()) {
 // mirror unless usher has a live window (sender.Has), and we must not reach
 // into the user's own terminal/IDE claude on a shared socket.
 func (r *Router) CaptureScreen(id string) (string, error) {
+	if r.backendOf(id) == "codex" {
+		return "", ErrHeadless
+	}
 	snd := r.senderFor(id)
 	if !snd.Has(id) {
 		return "", errors.New("session not live")
@@ -804,6 +811,9 @@ func (r *Router) CaptureScreen(id string) (string, error) {
 // terminal mirror's soft keys. Same ownership gate as CaptureScreen. The web
 // layer restricts which key names reach here; this only enforces ownership.
 func (r *Router) SendKeys(id string, keys ...string) error {
+	if r.backendOf(id) == "codex" {
+		return ErrHeadless
+	}
 	snd := r.senderFor(id)
 	if !snd.Has(id) {
 		return errors.New("session not live")
@@ -835,6 +845,9 @@ func (r *Router) SendKeys(id string, keys ...string) error {
 // derived client-side from the viewer. Same ownership gate; a no-op error for
 // unowned sessions is ignored by the caller.
 func (r *Router) ResizeCanvas(id string, cols, rows int) error {
+	if r.backendOf(id) == "codex" {
+		return ErrHeadless
+	}
 	snd := r.senderFor(id)
 	if !snd.Has(id) {
 		return errors.New("session not live")
