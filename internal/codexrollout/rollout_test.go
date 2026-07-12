@@ -315,3 +315,49 @@ func TestAssemblerCanonicalMCPItemAndLegacyDedup(t *testing.T) {
 		t.Fatalf("deduped turn: %+v", turn)
 	}
 }
+
+func TestAssemblerCurrentCodexToolEvents(t *testing.T) {
+	a := NewAssembler()
+	lines := []string{
+		`{"timestamp":"2026-07-12T00:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec","input":"const r = await tools.exec_command({cmd:\"git status --short\"}); text(r.output)"}}`,
+		`{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","name":"exec","output":[{"type":"input_text","text":" M file.go"}]}}`,
+		`{"timestamp":"2026-07-12T00:00:02Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"p1","success":true,"status":"completed","changes":{"internal/a.go":{"type":"update","unified_diff":"@@ -1 +1 @@\n-old\n+new"}}}}`,
+		`{"timestamp":"2026-07-12T00:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"e1","command":["go","test","./..."],"aggregated_output":"ok"}}`,
+		`{"timestamp":"2026-07-12T00:00:04Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"w1","query":"Codex protocol","action":{"type":"search"}}}`,
+		`{"timestamp":"2026-07-12T00:00:05Z","type":"event_msg","payload":{"type":"image_generation_end","call_id":"i1","status":"completed","result":"very-large-base64-must-not-render","saved_path":"/tmp/generated.png"}}`,
+	}
+	for _, line := range lines {
+		a.Feed([]byte(line))
+	}
+	turn := a.Flush()
+	if turn == nil || len(turn.Parts) != 5 {
+		t.Fatalf("parts = %+v, want 5", turn)
+	}
+	checks := []struct{ name, target, content string }{
+		{"Shell", "git status --short", "M file.go"},
+		{"Edit", "internal/a.go", "+new"},
+		{"Shell", "go test ./...", "ok"},
+		{"WebSearch", "Codex protocol", "search"},
+		{"ImageGeneration", "/tmp/generated.png", "completed"},
+	}
+	for i, want := range checks {
+		got := turn.Parts[i]
+		if got.ToolName != want.name || got.ToolTarget != want.target || !strings.Contains(got.Content, want.content) {
+			t.Errorf("part %d = %+v, want name=%q target=%q content~%q", i, got, want.name, want.target, want.content)
+		}
+	}
+	if strings.Contains(turn.Parts[4].Content, "very-large-base64") {
+		t.Error("image base64 leaked into transcript")
+	}
+}
+
+func TestAssemblerCustomWrapperDeduplicatesCanonicalPatch(t *testing.T) {
+	a := NewAssembler()
+	a.Feed([]byte(`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"outer","name":"exec","input":"text(await tools.apply_patch(\"*** Begin Patch\"))"}}`))
+	a.Feed([]byte(`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"outer","output":"done"}}`))
+	_, part := a.Feed([]byte(`{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"patch","success":true,"changes":{"a.go":{"unified_diff":"+x"}}}}`))
+	turn := a.Flush()
+	if part == nil || turn == nil || len(turn.Parts) != 1 || turn.Parts[0].ToolName != "Edit" {
+		t.Fatalf("canonical patch dedup failed: part=%+v turn=%+v", part, turn)
+	}
+}

@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -236,6 +237,7 @@ type Assembler struct {
 type toolStash struct {
 	name   string
 	target string
+	skip   bool
 }
 
 func NewAssembler() *Assembler {
@@ -326,6 +328,18 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		return nil, a.mcpToolPart(l)
 	case "item_completed":
 		return nil, a.completedMCPToolPart(l)
+	case "patch_apply_end":
+		return nil, a.patchApplyPart(l)
+	case "exec_command_end":
+		return nil, a.execCommandPart(l)
+	case "web_search_end":
+		return nil, a.simpleEventToolPart(l, "WebSearch")
+	case "image_generation_end":
+		return nil, a.imageGenerationPart(l)
+	case "view_image_tool_call":
+		return nil, a.simpleEventToolPart(l, "ViewImage")
+	case "dynamic_tool_call_response":
+		return nil, a.dynamicToolPart(l)
 	case "task_complete", "turn_complete": // kept explicit for the switch; predicate is shared elsewhere
 		// End-of-turn marker: stamp the turn with its turn_id (the fork point a
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
@@ -339,6 +353,133 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		return completed, nil
 	}
 	return nil, nil
+}
+
+func (a *Assembler) appendTool(ts time.Time, name, target, body string) *jsonl.TurnPart {
+	a.ensureTurn(ts)
+	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+	if body != "" {
+		tp.Content = fence(clampBody(body))
+	}
+	a.cur.Parts = append(a.cur.Parts, tp)
+	return &tp
+}
+
+func (a *Assembler) patchApplyPart(l line) *jsonl.TurnPart {
+	var p struct {
+		Stdout  string `json:"stdout"`
+		Stderr  string `json:"stderr"`
+		Success bool   `json:"success"`
+		Status  string `json:"status"`
+		Changes map[string]struct {
+			UnifiedDiff string `json:"unified_diff"`
+		} `json:"changes"`
+	}
+	if json.Unmarshal(l.Payload, &p) != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(p.Changes))
+	var body []string
+	for path, change := range p.Changes {
+		paths = append(paths, path)
+		if change.UnifiedDiff != "" {
+			body = append(body, change.UnifiedDiff)
+		}
+	}
+	sort.Strings(paths)
+	if p.Stdout != "" {
+		body = append(body, p.Stdout)
+	}
+	if p.Stderr != "" {
+		body = append(body, p.Stderr)
+	}
+	if len(body) == 0 && (!p.Success || p.Status != "") {
+		body = append(body, p.Status)
+	}
+	return a.appendTool(l.Timestamp, "Edit", strings.Join(paths, ", "), strings.Join(body, "\n"))
+}
+
+func (a *Assembler) execCommandPart(l line) *jsonl.TurnPart {
+	var p struct {
+		Command          []string `json:"command"`
+		AggregatedOutput string   `json:"aggregated_output"`
+		Stdout           string   `json:"stdout"`
+		Stderr           string   `json:"stderr"`
+	}
+	if json.Unmarshal(l.Payload, &p) != nil {
+		return nil
+	}
+	body := p.AggregatedOutput
+	if body == "" {
+		body = strings.TrimSpace(p.Stdout + "\n" + p.Stderr)
+	}
+	return a.appendTool(l.Timestamp, "Shell", strings.Join(p.Command, " "), body)
+}
+
+func (a *Assembler) simpleEventToolPart(l line, name string) *jsonl.TurnPart {
+	var p struct {
+		Query  string          `json:"query"`
+		Path   string          `json:"path"`
+		Action json.RawMessage `json:"action"`
+	}
+	if json.Unmarshal(l.Payload, &p) != nil {
+		return nil
+	}
+	target := p.Query
+	if target == "" {
+		target = p.Path
+	}
+	body := ""
+	if len(p.Action) > 0 && string(p.Action) != "null" {
+		body = string(p.Action)
+	}
+	return a.appendTool(l.Timestamp, name, target, body)
+}
+
+func (a *Assembler) imageGenerationPart(l line) *jsonl.TurnPart {
+	var p struct {
+		Status        string `json:"status"`
+		RevisedPrompt string `json:"revised_prompt"`
+		SavedPath     string `json:"saved_path"`
+	}
+	if json.Unmarshal(l.Payload, &p) != nil {
+		return nil
+	}
+	body := p.Status
+	if p.RevisedPrompt != "" {
+		body = strings.TrimSpace(body + "\n" + p.RevisedPrompt)
+	}
+	return a.appendTool(l.Timestamp, "ImageGeneration", p.SavedPath, body)
+}
+
+func (a *Assembler) dynamicToolPart(l line) *jsonl.TurnPart {
+	var p struct {
+		Namespace    string                     `json:"namespace"`
+		Tool         string                     `json:"tool"`
+		Arguments    map[string]json.RawMessage `json:"arguments"`
+		ContentItems []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_items"`
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(l.Payload, &p) != nil || p.Tool == "" {
+		return nil
+	}
+	name := p.Tool
+	if p.Namespace != "" {
+		name = p.Namespace + "__" + name
+	}
+	var body []string
+	for _, item := range p.ContentItems {
+		if item.Text != "" {
+			body = append(body, item.Text)
+		}
+	}
+	if p.Error != "" {
+		body = append(body, p.Error)
+	}
+	return a.appendTool(l.Timestamp, name, toolTargetMap(p.Arguments), strings.Join(body, "\n"))
 }
 
 func (a *Assembler) mcpToolPart(l line) *jsonl.TurnPart {
@@ -457,6 +598,7 @@ func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
 		Type      string          `json:"type"`
 		Name      string          `json:"name"`
 		Arguments string          `json:"arguments"`
+		Input     string          `json:"input"`
 		CallID    string          `json:"call_id"`
 		Output    json.RawMessage `json:"output"`
 	}
@@ -487,6 +629,20 @@ func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
 		}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return &tp
+	case "custom_tool_call":
+		target := customExecTarget(p.Input)
+		a.pending[p.CallID] = toolStash{
+			name: prettyToolName(p.Name), target: target,
+			skip: customCallHasCanonicalEvent(p.Name, p.Input),
+		}
+		return nil
+	case "custom_tool_call_output":
+		stash, ok := a.pending[p.CallID]
+		delete(a.pending, p.CallID)
+		if !ok || stash.skip {
+			return nil
+		}
+		return a.appendTool(l.Timestamp, stash.name, stash.target, renderOutputBody(p.Output))
 	}
 	return nil
 }
@@ -572,11 +728,60 @@ func renderOutput(output json.RawMessage) string {
 	return fence(clampBody(string(output)))
 }
 
+func renderOutputBody(output json.RawMessage) string {
+	if len(output) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(output, &s) == nil {
+		return s
+	}
+	var items []struct{ Type, Text string }
+	if json.Unmarshal(output, &items) == nil {
+		var texts []string
+		for _, item := range items {
+			if item.Text != "" {
+				texts = append(texts, item.Text)
+			}
+		}
+		if len(texts) > 0 {
+			return strings.Join(texts, "\n")
+		}
+	}
+	return string(output)
+}
+
+var customCmdRe = regexp.MustCompile(`(?s)\b(?:cmd|command)\s*:\s*("(?:\\.|[^"\\])*")`)
+
+func customExecTarget(input string) string {
+	m := customCmdRe.FindStringSubmatch(input)
+	if len(m) != 2 {
+		return ""
+	}
+	var command string
+	if json.Unmarshal([]byte(m[1]), &command) != nil {
+		return ""
+	}
+	return firstLine(command)
+}
+
+func customCallHasCanonicalEvent(name, input string) bool {
+	if name != "exec" {
+		return false
+	}
+	for _, marker := range []string{"tools.apply_patch", "tools.mcp__", "tools.image_gen__", "tools.web__"} {
+		if strings.Contains(input, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // prettyToolName maps Codex's internal tool names to friendlier labels; unknown
 // names pass through unchanged (low-maintenance, honest about new tools).
 func prettyToolName(name string) string {
 	switch name {
-	case "exec_command", "shell", "local_shell":
+	case "exec", "exec_command", "shell", "local_shell":
 		return "Shell"
 	case "apply_patch":
 		return "Edit"
