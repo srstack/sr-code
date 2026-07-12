@@ -1138,6 +1138,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 
 type hookPayload struct {
 	SessionID      string          `json:"session_id"`
+	ToolUseID      string          `json:"tool_use_id"`
 	HookEventName  string          `json:"hook_event_name"`
 	ToolName       string          `json:"tool_name"`
 	ToolInput      json.RawMessage `json:"tool_input"`
@@ -1188,6 +1189,7 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.router.HandleHook(r.Context(), hook.Event{
 		SessionID: ev.SessionID,
+		ToolUseID: ev.ToolUseID,
 		Event:     eventName,
 		ToolName:  ev.ToolName,
 		ToolInput: ev.ToolInput,

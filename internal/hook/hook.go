@@ -71,6 +71,7 @@ type Rule struct {
 // Event is the input usher receives from `usher hook` and forwards to Submit.
 type Event struct {
 	SessionID string
+	ToolUseID string
 	Event     string
 	ToolName  string
 	ToolInput json.RawMessage
@@ -94,6 +95,15 @@ type Manager struct {
 
 	subMu       sync.Mutex
 	pendingSubs map[*pendingSub]struct{} // notified when a new interaction is submitted
+
+	dedupMu sync.Mutex
+	dedup   map[string]*dedupDecision
+}
+
+type dedupDecision struct {
+	done     chan struct{}
+	response Response
+	err      error
 }
 
 // pendingSub subscribes to new-pending notifications. Buffered and drop-on-full,
@@ -113,6 +123,7 @@ func New(autoPath string) *Manager {
 		autoApprove: map[string]bool{},
 		autoPath:    autoPath,
 		pendingSubs: map[*pendingSub]struct{}{},
+		dedup:       map[string]*dedupDecision{},
 	}
 	if autoPath != "" {
 		m.loadAutoApprove()
@@ -201,6 +212,37 @@ func (m *Manager) QuickDecide(ev Event) (Response, bool) {
 // Short-circuits via QuickDecide first. A Scope="session" response is
 // stored as a rule before returning.
 func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
+	if ev.ToolUseID == "" {
+		return m.submit(ctx, ev)
+	}
+	key := ev.SessionID + "\x00" + ev.ToolUseID
+	m.dedupMu.Lock()
+	d := m.dedup[key]
+	if d == nil {
+		d = &dedupDecision{done: make(chan struct{})}
+		m.dedup[key] = d
+		m.dedupMu.Unlock()
+		d.response, d.err = m.submit(ctx, ev)
+		close(d.done)
+		time.AfterFunc(time.Minute, func() {
+			m.dedupMu.Lock()
+			if m.dedup[key] == d {
+				delete(m.dedup, key)
+			}
+			m.dedupMu.Unlock()
+		})
+		return d.response, d.err
+	}
+	m.dedupMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return Response{}, ctx.Err()
+	case <-d.done:
+		return d.response, d.err
+	}
+}
+
+func (m *Manager) submit(ctx context.Context, ev Event) (Response, error) {
 	if resp, ok := m.QuickDecide(ev); ok {
 		return resp, nil
 	}

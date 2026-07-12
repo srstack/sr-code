@@ -26,8 +26,8 @@ approve or deny tool-permission prompts — without being at the keyboard.
 
 ## Install
 
-Needs `tmux` ≥ 2.6 and at least one of the `claude` or `codex` CLIs you've
-already signed in to. On Windows, run usher inside
+Needs at least one of the `claude` or `codex` CLIs you've already signed in
+to. On Windows, run usher inside
 [WSL](https://learn.microsoft.com/en-us/windows/wsl/install).
 
 ### One-line install (recommended)
@@ -36,14 +36,13 @@ already signed in to. On Windows, run usher inside
 curl -fsSL https://raw.githubusercontent.com/nexustar/usher/main/install.sh | bash
 ```
 
-Installs the binary, registers permission hooks, and starts a user-level
-service (launchd / systemd). No `sudo` required.
+Installs the binary and starts a user-level service (launchd / systemd). Hooks
+for managed Claude sessions are supplied inline. No `sudo` required.
 
 ### Build from source
 
 ```
 go install github.com/nexustar/usher/cmd/usher@latest
-usher setup         # register permission hooks (once; --remove to undo)
 usher serve         # http://127.0.0.1:7777
 ```
 
@@ -143,49 +142,31 @@ flowchart LR
   phone["browser / phone"]
   subgraph host["your machine"]
     usher["usher<br/>web · API · hook listener"]
-    tmux["tmux<br/>interactive claude / codex per session"]
+    drivers["protocol drivers<br/>claude stream-json · codex app-server"]
     files[("~/.claude/projects · ~/.codex/sessions<br/>session logs")]
   end
   phone <-->|"HTTP · SSE"| usher
-  usher -->|"resume + paste message"| tmux
-  tmux -->|"writes turns"| files
+  usher -->|"send · resume · interrupt"| drivers
+  drivers -->|"writes turns"| files
   usher -.->|"watch + tail (read-only)"| files
-  tmux -->|"PreToolUse / PermissionRequest"| usher
-  usher -->|"allow / deny"| tmux
+  drivers -->|"PreToolUse / approval request"| usher
+  usher -->|"allow / deny"| drivers
 ```
 
 - **Discovery** is read-only: usher watches `~/.claude/projects/` and
   `~/.codex/sessions/`, listing every session — including ones you started in a
   terminal or IDE — tagged with the CLI that produced it. It never takes ownership.
-- **Sending** drives a real interactive `claude` or `codex` per session, each in
-  its own tmux window (the two CLIs on separate sockets): usher resumes it, pastes
-  your message, and tails the session log to stream the turn — running under your
-  own subscription, unlike headless `claude -p`. New sessions route by the model
+- **Sending** uses a long-running `claude -p` stream-json process per active
+  Claude session and one shared `codex app-server`. Session logs remain the
+  content source; protocols provide lifecycle, interrupts, and approvals. New
+  sessions route by the model
   you pick: `claude-*` → Claude Code, `gpt-*` → Codex.
-- **Permissions** flow through Claude's `PreToolUse` and Codex's
-  `PermissionRequest` hooks that `usher setup` installs for the CLIs present
-  (`--remove` to undo). A tool request reaches usher over a local Unix socket and
-  blocks until you decide in the UI; if usher isn't running, sessions fall back to
-  the CLI's own prompt.
-
-### Attaching to a session
-
-Each session's CLI runs in a tmux window, so you can watch or take over one:
-
-```
-tmux -L usher-claude attach          # Claude on usher-claude, Codex on usher-codex (the --tmux-socket prefix)
-```
-
-Windows are named by session id
-(`Ctrl-b w` switches, `Ctrl-b d` detaches). Useful for watching live output or
-answering a native prompt usher doesn't cover — but your keystrokes can collide
-with usher's mid-turn injection, so tread lightly. Closing a window is harmless;
-usher re-spawns on the next send.
+- **Permissions** flow through an inline Claude `PreToolUse` hook and Codex
+  app-server approval requests. A request blocks until you decide in the UI;
+  remembered rules and auto-approve work for both backends.
 
 ## Roadmap
 
-- **Terminal view** — stream a session's live tmux pane (xterm.js) for full
-  output and every Claude Code feature, not just send + approve.
 - **Richer main chat** — manage sessions and reach it from IM apps (Telegram,
   Slack); still early today.
 - **File viewing** — open images, HTML, and markdown a session produced.
@@ -199,4 +180,3 @@ usher re-spawns on the next send.
   third.
 - **Owning your sessions.** Discovery stays read-only and observational; usher
   drives the official CLIs rather than replacing them with its own agent loop.
-

@@ -64,12 +64,10 @@ func runSetup(args []string) error {
 		return fmt.Errorf("no backend found: neither ~/.claude (Claude Code) nor ~/.codex (Codex) exists; install/run one first")
 	}
 
-	if claudePresent {
-		if err := setupClaudeHook(home, exe, sock, *remove); err != nil {
+	if claudePresent && *remove {
+		if err := setupClaudeHook(home, exe, sock, true); err != nil {
 			return err
 		}
-	} else if !*remove {
-		fmt.Println("claude not detected (~/.claude absent); skipped claude hook.")
 	}
 
 	// app-server approvals are protocol requests, so new installs must not
@@ -81,8 +79,8 @@ func runSetup(args []string) error {
 	}
 
 	if !*remove {
-		fmt.Println()
-		fmt.Println("Re-run with --remove to uninstall.")
+		fmt.Println("usher setup no longer installs hooks; managed sessions receive hooks inline.")
+		fmt.Println("Run with --remove to clean up hooks installed by older releases.")
 	}
 	return nil
 }

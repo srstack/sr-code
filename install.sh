@@ -5,8 +5,7 @@
 #
 # What it does:
 #   1. Downloads the latest release binary to ~/.local/bin/usher (override with USHER_INSTALL_DIR)
-#   2. Runs `usher setup` (registers permission hooks for installed CLIs)
-#   3. Installs a user-level service (launchd on macOS, systemd on Linux)
+#   2. Installs a user-level service (launchd on macOS, systemd on Linux)
 #
 # To uninstall:
 #   usher setup --remove
@@ -90,13 +89,6 @@ ensure_path() {
   fi
 }
 
-# --- usher setup ------------------------------------------------------------
-
-run_setup() {
-  info "Running usher setup (registers permission hooks)"
-  "${INSTALL_DIR}/usher" setup
-}
-
 # --- service install --------------------------------------------------------
 
 install_service_darwin() {
@@ -106,9 +98,9 @@ install_service_darwin() {
 
   mkdir -p "$plist_dir"
 
-  # Collect PATH dirs that contain tmux / claude / codex / usher.
+  # Collect PATH dirs that contain claude / codex / usher.
   local svc_path=""
-  for cmd in tmux claude codex; do
+  for cmd in claude codex; do
     local p
     p="$(command -v "$cmd" 2>/dev/null || true)"
     [ -n "$p" ] && svc_path="${svc_path:+${svc_path}:}$(dirname "$p")"
@@ -159,9 +151,9 @@ install_service_linux() {
 
   need systemctl
 
-  # Collect PATH dirs that contain tmux / claude / codex / usher.
+  # Collect PATH dirs that contain claude / codex / usher.
   local svc_path=""
-  for cmd in tmux claude codex; do
+  for cmd in claude codex; do
     local p
     p="$(command -v "$cmd" 2>/dev/null || true)"
     [ -n "$p" ] && svc_path="${svc_path:+${svc_path}:}$(dirname "$p")"
@@ -209,7 +201,6 @@ main() {
   detect_platform
   download_binary
   ensure_path
-  run_setup
   install_service
 
   echo

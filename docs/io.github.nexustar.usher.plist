@@ -5,7 +5,7 @@
   macOS LaunchAgent for usher.
 
   1. Copy to ~/Library/LaunchAgents/ and edit the paths below.
-  2. Ensure PATH includes tmux and your CLI (claude / codex).
+  2. Ensure PATH includes your CLI (claude / codex).
   3. Load:   launchctl load ~/Library/LaunchAgents/io.github.nexustar.usher.plist
      Unload: launchctl unload ~/Library/LaunchAgents/io.github.nexustar.usher.plist
      Status: launchctl list | grep usher
@@ -37,7 +37,7 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- Must include dirs for tmux, claude/codex CLIs, and usher itself. -->
+    <!-- Must include dirs for claude/codex CLIs and usher itself. -->
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>

@@ -80,7 +80,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  serve              start the web server")
-	fmt.Fprintln(os.Stderr, "  setup              register usher's permission hook with installed backends (Claude/Codex)")
+	fmt.Fprintln(os.Stderr, "  setup --remove     remove hooks installed by older usher releases")
 	fmt.Fprintln(os.Stderr, "  set-password       set/change the web UI password (required for non-loopback bind)")
 	fmt.Fprintln(os.Stderr, "  hook <event-name>  invoked by Claude Code; not for direct use")
 	fmt.Fprintln(os.Stderr, "  version            print version")
@@ -102,9 +102,9 @@ func serve(args []string) error {
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
-		"prefix for usher's dedicated tmux server sockets (tmux -L <prefix>-claude / <prefix>-codex)")
+		"deprecated; retained for command-line compatibility")
 	maxLiveSessions := fs.Int("max-live-sessions", 8,
-		"max concurrent live interactive claude processes; least-recently-used sessions are evicted beyond this")
+		"max concurrent live Claude stream-json processes; least-recently-used sessions are evicted beyond this")
 	agentMode := fs.String("agent-mode", "rule",
 		"main-chat agent backend: rule | llm")
 	llmBaseURL := fs.String("llm-base-url", "https://api.openai.com/v1",

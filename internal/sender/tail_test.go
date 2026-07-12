@@ -74,6 +74,25 @@ func TestTailTurn_SimpleTurn(t *testing.T) {
 	}
 }
 
+func TestTailTurnSkipsQueuedSpontaneousCompletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	go appendLines(path, 10*time.Millisecond,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"scheduled"}]}}`,
+		`{"type":"system","subtype":"turn_duration"}`,
+		`{"type":"user","message":{"role":"user","content":"queued"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}`,
+		`{"type":"system","subtype":"turn_duration"}`)
+	cfg := fastCfg()
+	cfg.skipCompletions = 1
+	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 3*time.Second)
+	if want := []string{"assistant", "system", "user", "assistant", "subprocess.exit"}; !eq(types(got), want) {
+		t.Fatalf("got %v, want %v", types(got), want)
+	}
+}
+
 func TestTailTurn_EndTurnStopReasonDoesNotEndEarly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.jsonl")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {

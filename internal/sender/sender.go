@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/nexustar/usher/internal/appserver"
+	"github.com/nexustar/usher/internal/claudestream"
 	"github.com/nexustar/usher/internal/hook"
 )
 
@@ -55,6 +56,7 @@ type timing struct {
 
 type Sender struct {
 	app         *appserver.Client // non-nil for the headless Codex backend
+	claude      *claudestream.Manager
 	pool        *pool
 	backend     backend
 	projectsDir string
@@ -151,8 +153,10 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	}
 	// Register the show_image MCP server (unless --disable-usher-tools). Additive
 	// — no --strict-mcp-config — so the user's own MCP servers are untouched.
+	var mcpArgs []string
 	if injectMCPTools {
-		extra = append(extra, claudeMCPConfigArgs(hookSock, logger)...)
+		mcpArgs = claudeMCPConfigArgs(hookSock, logger)
+		extra = append(extra, mcpArgs...)
 	}
 	runner := execRunner{bin: "tmux", socket: socket}
 	t := timing{
@@ -167,6 +171,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	lp := &idlePaneStore{}
 	b := claudeBackend{p: p, t: t, projectsDir: projectsDir, claudeCmd: claudeCmd, extraArgs: extra, leftovers: lp}
 	s := &Sender{
+		claude:      claudestream.New(claudeCmd, claudeHookSettings(hookSock, logger), hookSock, extra, maxLive, logger),
 		pool:        p,
 		backend:     b,
 		projectsDir: projectsDir,
@@ -178,6 +183,28 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	}
 	s.pool.isBusy = s.isBusy
 	return s
+}
+
+func claudeHookSettings(hookSock string, logger *slog.Logger) string {
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.Abs(exe)
+	}
+	if err != nil {
+		logger.Warn("claude hook: cannot resolve usher executable", "err", err)
+		return ""
+	}
+	cmd := exe + " hook PreToolUse"
+	if hookSock != "" {
+		cmd = "USHER_HOOK_SOCK=" + hookSock + " " + cmd
+	}
+	settings := map[string]any{"hooks": map[string]any{"PreToolUse": []any{
+		map[string]any{"matcher": "", "hooks": []any{
+			map[string]any{"type": "command", "command": cmd, "timeout": 604800},
+		}},
+	}}}
+	b, _ := json.Marshal(settings)
+	return string(b)
 }
 
 // codexMCPConfigArgs returns the `-c` override VALUES registering the show_image
@@ -343,6 +370,9 @@ func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-cha
 	if s.app != nil {
 		return s.appTurn(ctx, sessionID, prompt, cwd, false)
 	}
+	if s.claude != nil {
+		return s.claudeTurn(ctx, sessionID, prompt, cwd, "", true)
+	}
 	// Resumes keep their original model, so no model is threaded here.
 	return s.run(ctx, sessionID, prompt, cwd, "", true)
 }
@@ -351,6 +381,9 @@ func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-cha
 // (`--session-id`). The jsonl is created lazily once claude writes the first
 // turn; the tailer waits for it to appear.
 func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model string) (<-chan StreamEvent, error) {
+	if s.claude != nil {
+		return s.claudeTurn(ctx, sessionID, prompt, cwd, model, false)
+	}
 	return s.run(ctx, sessionID, prompt, cwd, model, false)
 }
 
@@ -470,6 +503,10 @@ func (s *Sender) Inject(ctx context.Context, sessionID, prompt, cwd string) erro
 		_, err := s.app.StartTurn(ctx, sessionID, prompt, cwd)
 		return err
 	}
+	if s.claude != nil {
+		_, _, _, err := s.claude.Send(ctx, sessionID, prompt, cwd, "", true)
+		return err
+	}
 	fresh, err := s.pool.ensure(sessionID, cwd, "", true)
 	if err != nil {
 		return err
@@ -486,6 +523,9 @@ func (s *Sender) Has(sessionID string) bool {
 	if s.app != nil {
 		return s.app.Has(sessionID)
 	}
+	if s.claude != nil {
+		return s.claude.Has(sessionID)
+	}
 	return s.pool.has(sessionID)
 }
 
@@ -494,6 +534,9 @@ func (s *Sender) Has(sessionID string) bool {
 func (s *Sender) LiveSessions() []string {
 	if s.app != nil {
 		return s.app.LiveSessions()
+	}
+	if s.claude != nil {
+		return s.claude.LiveSessions()
 	}
 	return s.pool.liveSessions()
 }
@@ -506,6 +549,9 @@ func (s *Sender) Interrupt(sessionID string) error {
 		defer cancel()
 		return s.app.Interrupt(ctx, sessionID)
 	}
+	if s.claude != nil {
+		return s.claude.Interrupt(sessionID)
+	}
 	return s.pool.interrupt(sessionID)
 }
 
@@ -517,6 +563,9 @@ func (s *Sender) Kill(sessionID string) error {
 		defer cancel()
 		return s.app.Kill(ctx, sessionID)
 	}
+	if s.claude != nil {
+		return s.claude.Kill(sessionID)
+	}
 	s.leftovers.clear(sessionID)
 	return s.pool.kill(sessionID)
 }
@@ -525,7 +574,7 @@ func (s *Sender) Kill(sessionID string) error {
 // the session's interactive pane, for the read-only terminal mirror. Errors
 // if usher holds no live window for sessionID.
 func (s *Sender) CapturePane(sessionID string) (string, error) {
-	if s.app != nil {
+	if s.app != nil || s.claude != nil {
 		return "", ErrHeadless
 	}
 	return s.pool.capturePane(sessionID)
@@ -534,7 +583,7 @@ func (s *Sender) CapturePane(sessionID string) (string, error) {
 // SendKeys forwards tmux key names to the session's pane, powering the
 // terminal mirror's soft keys.
 func (s *Sender) SendKeys(sessionID string, keys ...string) error {
-	if s.app != nil {
+	if s.app != nil || s.claude != nil {
 		return ErrHeadless
 	}
 	return s.pool.sendKeys(sessionID, keys...)
@@ -543,7 +592,7 @@ func (s *Sender) SendKeys(sessionID string, keys ...string) error {
 // ResizeCanvas sets the session pane to cols×rows for the terminal mirror (also
 // repairs any manual-attach drift). Called when the mirror opens.
 func (s *Sender) ResizeCanvas(sessionID string, cols, rows int) error {
-	if s.app != nil {
+	if s.app != nil || s.claude != nil {
 		return ErrHeadless
 	}
 	return s.pool.resizeCanvas(sessionID, cols, rows)
@@ -556,7 +605,79 @@ func (s *Sender) Shutdown() {
 		s.app.Shutdown()
 		return
 	}
+	if s.claude != nil {
+		s.claude.Shutdown()
+		return
+	}
 	s.pool.shutdown()
+}
+
+func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, resume bool) (<-chan StreamEvent, error) {
+	path := s.locate(id)
+	var offset int64
+	if path != "" {
+		if fi, e := os.Stat(path); e == nil {
+			offset = fi.Size()
+		}
+	}
+	done, fresh, queuedAhead, err := s.claude.Send(ctx, id, prompt, cwd, model, resume)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan StreamEvent, 64)
+	go func() {
+		defer close(out)
+		started, _ := json.Marshal(map[string]any{"cwd": cwd, "fresh": fresh})
+		if !sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started}) {
+			return
+		}
+		if path == "" {
+			path = s.locateWait(ctx, id, s.t.confirm)
+		}
+		if path == "" {
+			emitError(ctx, out, "claude session jsonl did not appear after prompt")
+			return
+		}
+		tailCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		cfg := s.tailCfg(id, false)
+		cfg.skipCompletions = queuedAhead
+		events := tailTurn(tailCtx, path, offset, s.logger, cfg)
+		for {
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					select {
+					case result := <-done:
+						if result.IsError && result.Subtype != "error_during_execution" {
+							emitError(ctx, out, "claude turn failed: "+result.Subtype)
+						}
+					case <-time.After(3 * time.Second):
+						s.logger.Warn("claude turn finalized from jsonl backstop", "session_id", id)
+					case <-ctx.Done():
+					}
+					return
+				}
+				if !sendEvent(ctx, out, ev) {
+					return
+				}
+			case result := <-done:
+				if result.IsError && result.Subtype != "error_during_execution" {
+					emitError(ctx, out, "claude turn failed: "+result.Subtype)
+				}
+				cancel()
+				for ev := range events {
+					if !sendEvent(ctx, out, ev) {
+						return
+					}
+				}
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
 }
 
 // appTurn keeps rollout jsonl as the content plane while app-server supplies

@@ -1,7 +1,7 @@
 # systemd user service for usher.
 #
 # 1. Copy to ~/.config/systemd/user/usher.service and edit paths below.
-# 2. Ensure PATH includes tmux and your CLI (claude / codex).
+# 2. Ensure PATH includes your CLI (claude / codex).
 # 3. Enable:
 #      systemctl --user daemon-reload
 #      systemctl --user enable --now usher

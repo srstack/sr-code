@@ -22,7 +22,8 @@ type tailConfig struct {
 	// turnComplete reports whether a session-log line is the backend's
 	// end-of-turn marker. Backend-specific: Claude Code uses system/turn_duration
 	// (the default below); Codex uses event_msg/task_complete. nil → Claude.
-	turnComplete func(line []byte) bool
+	turnComplete    func(line []byte) bool
+	skipCompletions int // completed turns already ahead of this queued send
 
 	// Idle fallback for prompts that never start a model turn (TUI-local
 	// commands like /model log no end-of-turn marker, often nothing at all).
@@ -176,6 +177,12 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				// trusting it ends the turn before the tool even runs — which
 				// released ownership and sent permission prompts to the pane).
 				if cfg.turnComplete(line) {
+					if cfg.skipCompletions > 0 {
+						cfg.skipCompletions--
+						ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
+						_ = sendEvent(context.Background(), out, ev)
+						continue
+					}
 					emitExit()
 					return
 				}

@@ -125,7 +125,7 @@ func (r *Router) Backends() []string {
 }
 
 // IsHeadless reports whether the session's backend has no terminal pane.
-func (r *Router) IsHeadless(id string) bool { return r.backendOf(id) == "codex" }
+func (r *Router) IsHeadless(id string) bool { return true }
 
 // senderForBackend returns the Sender for a backend, falling back to the
 // default when the backend is empty or unregistered.
@@ -418,17 +418,6 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 	sess, ok := r.discovery.Get(id)
 	if !ok {
 		return errors.New("session not found")
-	}
-	// A '!'-prefixed message is not a model turn: Claude Code runs it as a TUI
-	// bash command, which logs no turn_duration for the tailer to wait on
-	// (and bracketed paste can't neutralize a leading '!', unlike '/' or
-	// '@'). Bash lines skip the queue: claude runs them even mid-turn.
-	if strings.HasPrefix(text, "!") {
-		if pre != nil {
-			pre()
-		}
-		go r.injectDirect(sess.ID, text, sess.Cwd)
-		return nil
 	}
 	// Reorder the sidebar the instant the user sends, without waiting for the
 	// prompt to land in the jsonl (see discovery.MarkInput).
@@ -797,7 +786,7 @@ func (r *Router) SubscribePendingInteractions() (<-chan hook.Pending, func()) {
 // mirror unless usher has a live window (sender.Has), and we must not reach
 // into the user's own terminal/IDE claude on a shared socket.
 func (r *Router) CaptureScreen(id string) (string, error) {
-	if r.backendOf(id) == "codex" {
+	if r.IsHeadless(id) {
 		return "", ErrHeadless
 	}
 	snd := r.senderFor(id)
@@ -811,7 +800,7 @@ func (r *Router) CaptureScreen(id string) (string, error) {
 // terminal mirror's soft keys. Same ownership gate as CaptureScreen. The web
 // layer restricts which key names reach here; this only enforces ownership.
 func (r *Router) SendKeys(id string, keys ...string) error {
-	if r.backendOf(id) == "codex" {
+	if r.IsHeadless(id) {
 		return ErrHeadless
 	}
 	snd := r.senderFor(id)
@@ -845,7 +834,7 @@ func (r *Router) SendKeys(id string, keys ...string) error {
 // derived client-side from the viewer. Same ownership gate; a no-op error for
 // unowned sessions is ignored by the caller.
 func (r *Router) ResizeCanvas(id string, cols, rows int) error {
-	if r.backendOf(id) == "codex" {
+	if r.IsHeadless(id) {
 		return ErrHeadless
 	}
 	snd := r.senderFor(id)

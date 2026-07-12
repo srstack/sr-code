@@ -47,6 +47,31 @@ func TestManager_SubmitAndRespond(t *testing.T) {
 	}
 }
 
+func TestManagerDeduplicatesToolUseID(t *testing.T) {
+	m := New("")
+	ev := Event{SessionID: "s", ToolUseID: "tool-1", ToolName: "Bash"}
+	results := make(chan Response, 2)
+	for range 2 {
+		go func() { r, _ := m.Submit(context.Background(), ev); results <- r }()
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(m.List()) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	pending := m.List()
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d, want 1", len(pending))
+	}
+	if err := m.Respond(pending[0].ID, Response{Behavior: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if r := <-results; r.Behavior != "allow" {
+			t.Fatalf("response=%+v", r)
+		}
+	}
+}
+
 func TestManager_ContextCancelReleases(t *testing.T) {
 	m := New("")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -188,11 +213,13 @@ func TestManager_RememberRule_DoesNotLeakAcrossSessions(t *testing.T) {
 	<-done
 
 	// Different session — should still prompt.
-	go func() { _, _ = m.Submit(context.Background(), Event{
-		SessionID: "s2",
-		ToolName:  "Bash",
-		ToolInput: []byte(`{"command":"rm /tmp/x"}`),
-	}) }()
+	go func() {
+		_, _ = m.Submit(context.Background(), Event{
+			SessionID: "s2",
+			ToolName:  "Bash",
+			ToolInput: []byte(`{"command":"rm /tmp/x"}`),
+		})
+	}()
 
 	id2 := waitForPending(t, m)
 	if id2 == "" {
@@ -317,7 +344,9 @@ func TestQuickDecide(t *testing.T) {
 	m.SetAutoApprove("s", false)
 
 	// Remembered rule (deny) wins over absent auto-approve.
-	go func() { _, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"rm -rf /"}`)}) }()
+	go func() {
+		_, _ = m.Submit(context.Background(), Event{SessionID: "s", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"rm -rf /"}`)})
+	}()
 	id := waitForPending(t, m)
 	_ = m.Respond(id, Response{Behavior: "deny", Scope: "session"})
 	time.Sleep(20 * time.Millisecond)
