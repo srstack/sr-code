@@ -24,33 +24,8 @@ type tailConfig struct {
 	// (the default below); Codex uses event_msg/task_complete. nil → Claude.
 	turnComplete    func(line []byte) bool
 	skipCompletions int // completed turns already ahead of this queued send
-
-	// Idle fallback for prompts that never start a model turn (TUI-local
-	// commands like /model log no end-of-turn marker, often nothing at all).
-	// The turn is finalized early only when ALL hold:
-	//   - turnActivity has matched no line yet (a latch: once a model turn is
-	//     proven in flight, the fallback is permanently disarmed),
-	//   - the log has been silent for `quiet`,
-	//   - idleProbeStrikes consecutive paneBusy probes, probeEvery apart,
-	//     reported idle (guards the submit→first-model-line window, which
-	//     routinely runs tens of seconds).
-	// nil paneBusy disables the fallback.
-	turnActivity func(line []byte) bool
-	turnAborted  func(line []byte) bool
-	paneBusy     func() bool
-	quiet        time.Duration
-	probeEvery   time.Duration
-
-	// onIdleExit, if set, is called once when the idle fallback finalizes the
-	// turn (not on any other exit path).
-	onIdleExit  func()
-	idleReason  string
-	maxIdleWait time.Duration // consumed by tailCfg's paneBusy: after this long, motion alone no longer counts as busy
+	turnAborted     func(line []byte) bool
 }
-
-// idleProbeStrikes is how many consecutive idle probes the fallback needs — a
-// single capture can catch the TUI mid-repaint.
-const idleProbeStrikes = 2
 
 func (c tailConfig) withDefaults() tailConfig {
 	if c.poll <= 0 {
@@ -61,15 +36,6 @@ func (c tailConfig) withDefaults() tailConfig {
 	}
 	if c.turnComplete == nil {
 		c.turnComplete = isTurnComplete
-	}
-	if c.turnActivity == nil {
-		c.turnActivity = isTurnActivity
-	}
-	if c.quiet <= 0 {
-		c.quiet = 5 * time.Second
-	}
-	if c.probeEvery <= 0 {
-		c.probeEvery = max(c.poll, c.quiet/5)
 	}
 	return c
 }
@@ -85,9 +51,8 @@ func (c tailConfig) withDefaults() tailConfig {
 // synthesized "subprocess.exit" and closes the channel.
 //
 // The channel also closes on ctx cancellation, or if the file never appears
-// within cfg.appearWait (brand-new sessions create their jsonl lazily). Unlike
-// the old subprocess sender, nothing here owns a process: the interactive
-// claude lives in the tmux pool and outlives the turn.
+// within cfg.appearWait (brand-new sessions create their jsonl lazily). Process
+// lifecycle is owned by the headless backend manager, not the tailer.
 func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.Logger, cfg tailConfig) <-chan StreamEvent {
 	cfg = cfg.withDefaults()
 	if logger == nil {
@@ -138,23 +103,11 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 		ticker := time.NewTicker(cfg.poll)
 		defer ticker.Stop()
 
-		// Idle-fallback state (see tailConfig): active latches once a line proves
-		// a model turn is in flight; lastGrowth tracks log silence; idleProbes
-		// counts consecutive pane sightings without a running-turn indicator.
-		active := false
-		sawLine := false // any log growth proves the paste was submitted
-		lastGrowth := time.Now()
-		var lastProbe time.Time
-		idleProbes := 0
-
 		for {
 			for {
 				chunk, err := reader.ReadBytes('\n')
 				if len(chunk) > 0 {
 					pending = append(pending, chunk...)
-					lastGrowth = time.Now()
-					sawLine = true
-					idleProbes = 0
 				}
 				if err == io.EOF {
 					break
@@ -194,9 +147,6 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 					emitExitReason("turn_aborted")
 					return
 				}
-				if !active && cfg.turnActivity(line) {
-					active = true
-				}
 				ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
 				if !sendEvent(ctx, out, ev) {
 					emitExit() // ctx cancelled mid-stream
@@ -209,33 +159,6 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 				emitExit()
 				return
 			case <-ticker.C:
-				if cfg.paneBusy != nil && !active &&
-					time.Since(lastGrowth) >= cfg.quiet && time.Since(lastProbe) >= cfg.probeEvery {
-					lastProbe = time.Now()
-					if cfg.paneBusy() {
-						idleProbes = 0
-					} else if idleProbes++; idleProbes >= idleProbeStrikes {
-						logger.Debug("turn produced no model activity and the pane is idle; finalizing", "path", path)
-						if cfg.onIdleExit != nil {
-							cfg.onIdleExit()
-						}
-						reason := cfg.idleReason
-						if reason == "" {
-							reason = "idle"
-						}
-						if reason == "submission_unconfirmed" && sawLine {
-							// The log grew, so the paste was delivered: this is a
-							// turnless local command (e.g. ! bash mode), not a failure.
-							reason = "local_command"
-						}
-						if reason == "submission_unconfirmed" {
-							raw, _ := json.Marshal(map[string]string{"message": "prompt submission could not be confirmed"})
-							_ = sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: raw})
-						}
-						emitExitReason(reason)
-						return
-					}
-				}
 			}
 		}
 	}()
@@ -285,24 +208,4 @@ func lineType(line []byte) string {
 // (during thinking or a pending tool call).
 func isTurnComplete(line []byte) bool {
 	return jsonl.IsTurnComplete(line)
-}
-
-// isTurnActivity reports whether a Claude Code jsonl line proves a model turn
-// is in flight: an "assistant" line with real model output. TUI-local commands
-// never write one. Claude Code's own synthetic assistant lines ("No response
-// requested.", API-error messages — model "<synthetic>") don't count: they
-// often end a turn with no turn_duration, exactly what the fallback must
-// finalize.
-func isTurnActivity(line []byte) bool {
-	var o struct {
-		Type     string `json:"type"`
-		IsAPIErr bool   `json:"isApiErrorMessage"`
-		Message  struct {
-			Model string `json:"model"`
-		} `json:"message"`
-	}
-	if err := json.Unmarshal(line, &o); err != nil {
-		return false
-	}
-	return o.Type == "assistant" && !o.IsAPIErr && o.Message.Model != "<synthetic>"
 }

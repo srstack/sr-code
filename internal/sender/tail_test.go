@@ -31,6 +31,24 @@ func eq(a, b []string) bool {
 	return true
 }
 
+func collect(t *testing.T, ch <-chan StreamEvent, timeout time.Duration) []StreamEvent {
+	t.Helper()
+	var out []StreamEvent
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		case <-timer.C:
+			t.Fatal("timed out waiting for stream")
+		}
+	}
+}
+
 // appendLines appends each line (a '\n' is added) to path with a small delay
 // between them, simulating claude writing the turn out over time. Runs in a
 // goroutine, so it panics rather than calling t.Fatal on error.
@@ -157,68 +175,13 @@ func TestTailTurn_FileNeverAppears(t *testing.T) {
 	}
 }
 
-// idleCfg arms the idle fallback with a short quiet window and a scripted
-// paneBusy: successive probes pop verdicts from busy (true = spinner visible);
-// past the end the pane reads idle.
-func idleCfg(busy ...bool) tailConfig {
-	i := 0
-	return tailConfig{
-		poll:       10 * time.Millisecond,
-		appearWait: 2 * time.Second,
-		quiet:      60 * time.Millisecond,
-		probeEvery: 10 * time.Millisecond,
-		paneBusy: func() bool {
-			if i < len(busy) {
-				i++
-				return busy[i-1]
-			}
-			return false
-		},
-	}
-}
-
-// A TUI-local command like /model writes nothing to the jsonl at all. With the
-// pane idle, the tailer must finalize the turn instead of waiting forever on a
-// turn_duration that isn't coming.
-func TestTailTurn_IdleFallback_NoJsonlAtAll(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, []byte(`{"type":"mode"}`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	off, _ := os.Stat(path)
-
-	ch := tailTurn(context.Background(), path, off.Size(), nil, idleCfg())
-	got := collect(t, ch, 2*time.Second)
-	if !eq(types(got), []string{"subprocess.exit"}) {
-		t.Fatalf("got %v, want [subprocess.exit]", types(got))
-	}
-}
-
-func TestTailTurn_UnconfirmedSubmissionIsVisibleFailure(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := idleCfg()
-	cfg.idleReason = "submission_unconfirmed"
-	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
-	if !eq(types(got), []string{"error", "subprocess.exit"}) {
-		t.Fatalf("got %v, want visible error followed by exit", types(got))
-	}
-	if !strings.Contains(string(got[1].Raw), "submission_unconfirmed") {
-		t.Fatalf("exit lacks reason: %s", got[1].Raw)
-	}
-}
-
 func TestTailTurn_CodexAbortTerminatesAfterActivityLatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.jsonl")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := idleCfg()
-	cfg.turnActivity = codexrollout.IsTurnActivity
-	cfg.turnComplete = codexrollout.IsTurnComplete
-	cfg.turnAborted = codexrollout.IsTurnAborted
+	cfg := tailConfig{poll: 10 * time.Millisecond, appearWait: 2 * time.Second,
+		turnComplete: codexrollout.IsTurnComplete, turnAborted: codexrollout.IsTurnAborted}
 	go appendLines(path, 5*time.Millisecond,
 		`{"type":"event_msg","payload":{"type":"task_started"}}`,
 		`{"type":"event_msg","payload":{"type":"turn_aborted"}}`,
@@ -226,25 +189,6 @@ func TestTailTurn_CodexAbortTerminatesAfterActivityLatch(t *testing.T) {
 	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
 	if !eq(types(got), []string{"event_msg", "event_msg", "error", "subprocess.exit"}) {
 		t.Fatalf("got %v", types(got))
-	}
-}
-
-// A send whose lines reached the log was definitely submitted: the fallback
-// must finalize it as a benign local command, not a submission failure.
-func TestTailTurn_UnconfirmedDowngradedWhenLogGrew(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := idleCfg()
-	cfg.idleReason = "submission_unconfirmed"
-	go appendLines(path, 5*time.Millisecond, `{"type":"user","isMeta":true}`)
-	got := collect(t, tailTurn(context.Background(), path, 0, nil, cfg), 2*time.Second)
-	if !eq(types(got), []string{"user", "subprocess.exit"}) {
-		t.Fatalf("got %v", types(got))
-	}
-	if !strings.Contains(string(got[1].Raw), "local_command") {
-		t.Fatalf("exit reason not downgraded: %s", got[1].Raw)
 	}
 }
 
@@ -259,132 +203,6 @@ func TestTailTurn_SeekErrorEmitsErrorAndExit(t *testing.T) {
 	}
 }
 
-// Some local commands (! bash mode, /compact's echo) write a few isMeta "user"
-// lines but never an assistant line or turn_duration. They must stream through
-// and then finalize via the fallback.
-func TestTailTurn_IdleFallback_MetaUserLinesOnly(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	go appendLines(path, 5*time.Millisecond,
-		`{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>…</local-command-caveat>"}}`,
-		`{"type":"user","isMeta":true,"message":{"role":"user","content":"<bash-input>ls</bash-input>"}}`,
-	)
-
-	ch := tailTurn(context.Background(), path, 0, nil, idleCfg())
-	got := collect(t, ch, 2*time.Second)
-	if !eq(types(got), []string{"user", "user", "subprocess.exit"}) {
-		t.Fatalf("got %v, want [user user subprocess.exit]", types(got))
-	}
-}
-
-// The submit→first-assistant window routinely runs tens of seconds with a
-// silent jsonl; the spinner on the pane is what holds the fallback off. A busy
-// pane must never finalize, no matter how long the log is quiet.
-func TestTailTurn_IdleFallback_SpinnerHoldsThroughSlowFirstToken(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := idleCfg()
-	cfg.paneBusy = func() bool { return true } // spinner never leaves the pane
-
-	// User line lands, then a long silence (>> quiet) before the model replies.
-	go func() {
-		appendLines(path, 5*time.Millisecond, `{"type":"user","message":{"role":"user","content":"hi"}}`)
-		time.Sleep(300 * time.Millisecond)
-		appendLines(path, 5*time.Millisecond,
-			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`,
-			`{"type":"system","subtype":"turn_duration","durationMs":42}`,
-		)
-	}()
-
-	ch := tailTurn(context.Background(), path, 0, nil, cfg)
-	got := collect(t, ch, 2*time.Second)
-	if !eq(types(got), []string{"user", "assistant", "subprocess.exit"}) {
-		t.Fatalf("got %v, want the full turn (no premature exit)", types(got))
-	}
-}
-
-// Once an assistant line has landed, the latch is armed: even a pane that reads
-// idle (e.g. the spinner string changed in a future claude) must not finalize —
-// only turn_duration may. The mid-silence assistant line after the quiet window
-// proves the tailer was still alive.
-func TestTailTurn_IdleFallback_ActivityLatchDisablesFallback(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := idleCfg()
-	cfg.paneBusy = func() bool { return false } // pane always reads idle
-
-	go func() {
-		appendLines(path, 5*time.Millisecond,
-			`{"type":"user","message":{"role":"user","content":"hi"}}`,
-			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}`,
-		)
-		time.Sleep(300 * time.Millisecond) // long tool run, silent jsonl, idle-looking pane
-		appendLines(path, 5*time.Millisecond,
-			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}`,
-			`{"type":"system","subtype":"turn_duration","durationMs":42}`,
-		)
-	}()
-
-	ch := tailTurn(context.Background(), path, 0, nil, cfg)
-	got := collect(t, ch, 2*time.Second)
-	if !eq(types(got), []string{"user", "assistant", "assistant", "subprocess.exit"}) {
-		t.Fatalf("got %v, want the full turn (latch must hold)", types(got))
-	}
-}
-
-func TestIsTurnActivity(t *testing.T) {
-	for _, tc := range []struct {
-		line string
-		want bool
-	}{
-		{`{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}]}}`, true},
-		{`{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}`, false},
-		{`{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: 500"}]}}`, false},
-		{`{"type":"user","message":{"role":"user","content":"hi"}}`, false},
-		{`{"type":"user","isMeta":true,"message":{"role":"user","content":"<bash-input>ls</bash-input>"}}`, false},
-		{`{"type":"system","subtype":"turn_duration","durationMs":42}`, false},
-		{`not json`, false},
-	} {
-		if got := isTurnActivity([]byte(tc.line)); got != tc.want {
-			t.Errorf("isTurnActivity(%s) = %v, want %v", tc.line, got, tc.want)
-		}
-	}
-}
-
-// A single idle sighting can be a mid-repaint frame with the spinner briefly
-// absent; only consecutive idle probes finalize. busy,idle,busy,idle,idle →
-// exit on the second consecutive idle, not the first transient one.
-func TestTailTurn_IdleFallback_NeedsConsecutiveIdleProbes(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.jsonl")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	probes := 0
-	cfg := idleCfg()
-	cfg.paneBusy = func() bool {
-		probes++
-		return probes == 1 || probes == 3 // idle at 2, then busy again, then idle 4,5…
-	}
-
-	ch := tailTurn(context.Background(), path, 0, nil, cfg)
-	got := collect(t, ch, 2*time.Second)
-	if !eq(types(got), []string{"subprocess.exit"}) {
-		t.Fatalf("got %v, want [subprocess.exit]", types(got))
-	}
-	if probes < 5 {
-		t.Fatalf("exited after %d probes; a transient idle frame must not finalize", probes)
-	}
-}
-
-// Cancelling a send before the jsonl appears (a fast cancel on a brand-new
-// session) must still emit subprocess.exit — otherwise the web UI never
-// finalizes the turn and leaves send disabled until a manual refresh.
 func TestTailTurn_CancelBeforeFileAppears(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.jsonl")
 	ctx, cancel := context.WithCancel(context.Background())

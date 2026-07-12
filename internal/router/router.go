@@ -450,20 +450,6 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 // turn would, so the web client adopts the echo and returns to idle with no
 // special-casing. No activeSend: nothing to cancel, and the session stays
 // "live" rather than "running". The 45s budget covers a cold window's resume.
-func (r *Router) injectDirect(sessionID, text, cwd string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	if err := r.senderFor(sessionID).Inject(ctx, sessionID, text, cwd); err != nil {
-		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
-		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "error", Raw: errMsg})
-		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
-		return
-	}
-	uraw, _ := json.Marshal(map[string]any{"role": "user", "content": text, "ts": time.Now().UTC()})
-	r.broker.Publish(broker.Event{SessionID: sessionID, Type: "turn.user", Raw: uraw})
-	r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
-}
-
 func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
 
