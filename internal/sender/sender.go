@@ -401,12 +401,11 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 				if result.IsError && result.Subtype != "error_during_execution" {
 					emitError(ctx, out, "claude turn failed: "+result.Subtype)
 				}
-				cancel()
-				for ev := range events {
-					if !sendEvent(ctx, out, ev) {
-						return
-					}
-				}
+				// The protocol result can beat the tailer's next file poll even
+				// though the final assistant/tool lines are already on disk. Let
+				// the log reach its completion marker before cancelling it.
+				drainTail(ctx, out, events, cancel, 3*time.Second, s.logger,
+					"claude rollout drain timed out", "session_id", id)
 				return
 			case <-ctx.Done():
 				return
@@ -471,12 +470,8 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 				if result.Status == "failed" {
 					emitError(ctx, out, "codex turn failed")
 				}
-				cancel()
-				for ev := range events {
-					if !sendEvent(ctx, out, ev) {
-						return
-					}
-				}
+				drainTail(ctx, out, events, cancel, 5*time.Second, s.logger,
+					"codex rollout drain timed out", "thread_id", id)
 				return
 			case <-ctx.Done():
 				return
@@ -484,6 +479,40 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 		}
 	}()
 	return out, nil
+}
+
+// drainTail lets a completed backend protocol flush the final log records into
+// the live event stream. Protocol completion and file visibility are separate
+// clocks; cancelling the tail immediately can strand already-written parts
+// until the browser next reloads the transcript.
+func drainTail(ctx context.Context, out chan<- StreamEvent, events <-chan StreamEvent,
+	cancel context.CancelFunc, timeout time.Duration, logger *slog.Logger, msg, key, id string) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			if !sendEvent(ctx, out, ev) {
+				cancel()
+				return
+			}
+		case <-timer.C:
+			logger.Warn(msg, key, id)
+			cancel()
+			for ev := range events {
+				if !sendEvent(ctx, out, ev) {
+					return
+				}
+			}
+			return
+		case <-ctx.Done():
+			cancel()
+			return
+		}
+	}
 }
 
 func locateClaude(root, id string) string {

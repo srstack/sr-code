@@ -920,13 +920,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
+	// Register before flushing the 200 response: once EventSource observes the
+	// connection as open, every later broker event must have a subscriber.
+	ch, cancel := s.router.SubscribeSession(id)
+	defer cancel()
+
 	flusher, ok := sseStart(w)
 	if !ok {
 		return
 	}
-
-	ch, cancel := s.router.SubscribeSession(id)
-	defer cancel()
 
 	// Snapshot-on-connect: the broker has no replay, so a turn whose start (or
 	// end) happened before this subscribe is invisible to the client. Emit the
