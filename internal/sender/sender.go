@@ -36,7 +36,7 @@ var ErrHeadless = errors.New("terminal mirror is unavailable for headless sessio
 type timing struct{ confirm, poll time.Duration }
 
 type Sender struct {
-	app          *appserver.Client // non-nil for the headless Codex backend
+	app          *appserver.Manager // non-nil for the headless Codex backend
 	claude       *claudestream.Manager
 	preAssignsID bool
 	locateFn     func(string) string
@@ -149,20 +149,18 @@ func codexMCPConfig(logger *slog.Logger) map[string]any {
 	}
 }
 
-// NewCodex builds a Sender that drives interactive `codex` instead of `claude`.
+// NewCodex builds a Sender that drives Codex through per-session app-server
+// workers.
 // codexCmd is the codex binary; sessionsDir is ~/.codex/sessions (the rollout
 // root, used to locate logs); sandboxArgs are extra codex flags (e.g.
 // --sandbox workspace-write); hookSock, if set, routes the codex permission hook
-// back to this instance; maxLive caps live processes.
-//
-// Resume goes straight in (`codex resume <id>`, no chooser); a brand-new session
-// (Codex assigns its own id) is created via StartCodexSession.
+// back to this instance. maxLive caps Codex workers; idle workers are shut down
+// and cold-resumed on the next send. Codex assigns ids for new threads.
 func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []string, maxLive int, injectMCPTools bool, hooks *hook.Manager, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	_ = socket  // retained for CLI/config compatibility
-	_ = maxLive // currently enforced by Claude's manager; retained for Codex compatibility
+	_ = socket // retained for CLI/config compatibility
 	var env []string
 	if hookSock != "" {
 		env = append(env, "USHER_HOOK_SOCK="+hookSock)
@@ -177,7 +175,7 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		config[k] = v
 	}
 	return &Sender{
-		app:          appserver.New(codexCmd, hooks, sandbox, config, env, logger),
+		app:          appserver.NewManager(codexCmd, hooks, sandbox, config, env, maxLive, logger),
 		preAssignsID: false,
 		locateFn:     func(id string) string { return locateCodex(sessionsDir, id) },
 		logger:       logger,

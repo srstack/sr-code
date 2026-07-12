@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/nexustar/usher/internal/procutil"
 )
 
 type Result struct {
@@ -29,6 +31,7 @@ type process struct {
 	turns    []chan Result // nil entry represents a spontaneous turn
 	lastUsed time.Time
 	stopping bool
+	done     chan struct{}
 }
 
 type Manager struct {
@@ -91,6 +94,7 @@ func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool
 	}
 	args = append(args, m.mcpArgs...)
 	cmd := exec.CommandContext(context.Background(), m.bin, args...)
+	procutil.ConfigureGroup(cmd)
 	cmd.Dir = cwd
 	cmd.Env = scrubEnv(m.hookSock)
 	in, err := cmd.StdinPipe()
@@ -108,7 +112,7 @@ func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool
 		m.mu.Unlock()
 		return nil, false, err
 	}
-	p := &process{id: id, cmd: cmd, in: in, cwd: cwd, lastUsed: time.Now()}
+	p := &process{id: id, cmd: cmd, in: in, cwd: cwd, lastUsed: time.Now(), done: make(chan struct{})}
 	m.processes[id] = p
 	m.mu.Unlock()
 	go m.readLoop(p, out)
@@ -207,7 +211,7 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 	if err := s.Err(); err != nil {
 		m.logger.Warn("claude stream-json read failed", "session", p.id, "err", err)
 		if p.cmd.Process != nil {
-			_ = p.cmd.Process.Kill()
+			_ = procutil.KillGroup(p.cmd)
 		}
 	}
 }
@@ -222,6 +226,7 @@ func marksSpontaneousTurn(typ, subtype string) bool {
 	return typ == "assistant" || typ == "user"
 }
 func (m *Manager) died(p *process, err error) {
+	close(p.done)
 	m.mu.Lock()
 	if m.processes[p.id] == p {
 		delete(m.processes, p.id)
@@ -279,8 +284,15 @@ func stop(p *process) {
 	cmd := p.cmd
 	p.mu.Unlock()
 	_ = in.Close()
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	select {
+	case <-p.done:
+		return
+	case <-time.After(2 * time.Second):
+	}
+	_ = procutil.KillGroup(cmd)
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
 	}
 }
 func (m *Manager) Has(id string) bool {
@@ -305,7 +317,10 @@ func (m *Manager) Shutdown() {
 	}
 	m.processes = map[string]*process{}
 	m.mu.Unlock()
+	var wg sync.WaitGroup
 	for _, p := range ps {
-		_ = p.in.Close()
+		wg.Add(1)
+		go func() { defer wg.Done(); stop(p) }()
 	}
+	wg.Wait()
 }

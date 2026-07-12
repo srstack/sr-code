@@ -368,11 +368,9 @@ func (r *Router) DeleteSession(id string) error {
 	return nil
 }
 
-// PauseSession kills usher's live window for a session without touching its
-// jsonl or per-session state: it cancels any in-flight turn and the tmux
-// window, dropping the session to "idle". The conversation survives and
-// resumes (via --resume) on the next Send. The manual equivalent of LRU
-// eviction. Idempotent for an already-idle session; errors only on unknown id.
+// PauseSession stops usher's live backend worker without touching its
+// transcript or metadata. The conversation cold-resumes on the next Send.
+// It is the manual equivalent of LRU eviction.
 func (r *Router) PauseSession(id string) error {
 	if _, ok := r.discovery.Path(id); !ok {
 		return errors.New("session not found")
@@ -382,7 +380,7 @@ func (r *Router) PauseSession(id string) error {
 }
 
 // stopLive drops a session to idle: cancels any in-flight turn, drops queued
-// sends, and kills its live window. Best-effort; idempotent. Shared by
+// sends, and stops its live worker. Best-effort; idempotent. Shared by
 // PauseSession/DeleteSession.
 func (r *Router) stopLive(id string) {
 	r.flushSendQueue(id, errors.New("session stopped"))

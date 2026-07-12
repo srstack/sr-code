@@ -599,7 +599,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
-// handlePauseSession tears down the session's live window without deleting
+// handlePauseSession tears down the session's live worker without deleting
 // anything — the conversation stays on disk and resumes on the next send.
 // Non-destructive and distinct from DELETE (which removes the jsonl). Returns
 // 404 for an unknown id.

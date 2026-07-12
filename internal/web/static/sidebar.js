@@ -488,7 +488,7 @@ async function deleteSession(id) {
   }
 }
 
-// pauseSession tears down the session's live TUI window without deleting
+// pauseSession tears down the session's live backend worker without deleting
 // anything — the conversation stays on disk and resumes on the next send.
 // Non-destructive, so no confirm. The session simply drops back to "idle".
 async function pauseSession(id) {

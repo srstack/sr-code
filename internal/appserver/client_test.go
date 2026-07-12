@@ -2,6 +2,7 @@ package appserver
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,5 +90,17 @@ while IFS= read -r line; do :; done
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	if len(lines) != 2 || !strings.Contains(lines[1], `"method":"initialized"`) {
 		t.Fatalf("handshake requests: %s", b)
+	}
+}
+
+func TestClientTracksSpontaneousTurnActivity(t *testing.T) {
+	c := New("unused", nil, nil, nil, nil, nil)
+	c.dispatch(rpcMessage{Method: "turn/started", Params: json.RawMessage(`{"threadId":"session-1","turn":{"id":"turn-1"}}`)})
+	if !c.Busy("session-1") {
+		t.Fatal("turn/started did not mark the session busy")
+	}
+	c.dispatch(rpcMessage{Method: "turn/completed", Params: json.RawMessage(`{"threadId":"session-1","turn":{"id":"turn-1","status":"completed"}}`)})
+	if c.Busy("session-1") {
+		t.Fatal("turn/completed did not clear session activity")
 	}
 }

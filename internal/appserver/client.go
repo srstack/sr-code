@@ -15,8 +15,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/procutil"
 )
 
 type rpcMessage struct {
@@ -45,29 +47,33 @@ type initState struct {
 	finished bool
 }
 
-// Client owns one lazily-started app-server process shared by all threads.
+// Client owns one lazily-started app-server process. Manager assigns one
+// Client to each live root session; derived Codex threads remain internal to
+// that worker.
 type Client struct {
-	bin     string
-	logger  *slog.Logger
-	hooks   *hook.Manager
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	in      io.WriteCloser
-	pending map[string]chan response
-	turns   map[string]chan TurnResult
-	threads map[string]string // thread id -> cwd
-	next    atomic.Uint64
-	init    *initState
-	sandbox map[string]any
-	config  map[string]any
-	env     []string
+	bin      string
+	logger   *slog.Logger
+	hooks    *hook.Manager
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	in       io.WriteCloser
+	pending  map[string]chan response
+	turns    map[string]chan TurnResult
+	active   map[string]struct{}
+	threads  map[string]string // thread id -> cwd
+	next     atomic.Uint64
+	init     *initState
+	waitDone chan struct{}
+	sandbox  map[string]any
+	config   map[string]any
+	env      []string
 }
 
 func New(bin string, hooks *hook.Manager, sandbox, config map[string]any, env []string, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Client{bin: bin, hooks: hooks, sandbox: cloneMap(sandbox), config: cloneMap(config), env: append([]string(nil), env...), logger: logger, pending: map[string]chan response{}, turns: map[string]chan TurnResult{}, threads: map[string]string{}}
+	return &Client{bin: bin, hooks: hooks, sandbox: cloneMap(sandbox), config: cloneMap(config), env: append([]string(nil), env...), logger: logger, pending: map[string]chan response{}, turns: map[string]chan TurnResult{}, active: map[string]struct{}{}, threads: map[string]string{}}
 }
 
 func scrubEnv() []string {
@@ -96,6 +102,7 @@ func (c *Client) ensure(ctx context.Context) error {
 	}
 	state := &initState{done: make(chan struct{})}
 	cmd := exec.CommandContext(context.Background(), c.bin, "app-server")
+	procutil.ConfigureGroup(cmd)
 	cmd.Env = append(scrubEnv(), c.env...)
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -112,10 +119,15 @@ func (c *Client) ensure(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
-	c.cmd, c.in, c.init = cmd, in, state
+	waitDone := make(chan struct{})
+	c.cmd, c.in, c.init, c.waitDone = cmd, in, state, waitDone
 	c.mu.Unlock()
 	go c.readLoop(cmd, out)
-	go func() { err := cmd.Wait(); c.died(cmd, err) }()
+	go func() {
+		err := cmd.Wait()
+		close(waitDone)
+		c.died(cmd, err)
+	}()
 	var init struct {
 		UserAgent string `json:"userAgent"`
 	}
@@ -227,6 +239,18 @@ func (c *Client) dispatch(m rpcMessage) {
 		go c.approval(m)
 		return
 	}
+	if m.Method == "turn/started" {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		if p.ThreadID != "" {
+			c.mu.Lock()
+			c.active[p.ThreadID] = struct{}{}
+			c.mu.Unlock()
+		}
+		return
+	}
 	if m.Method == "turn/completed" {
 		var p struct {
 			ThreadID string `json:"threadId"`
@@ -238,6 +262,7 @@ func (c *Client) dispatch(m rpcMessage) {
 		c.mu.Lock()
 		ch := c.turns[p.ThreadID]
 		delete(c.turns, p.ThreadID)
+		delete(c.active, p.ThreadID)
 		c.mu.Unlock()
 		if ch != nil {
 			ch <- TurnResult{Status: p.Turn.Status}
@@ -307,10 +332,12 @@ func (c *Client) failProcess(cmd *exec.Cmd, err error) {
 	}
 	c.cmd = nil
 	c.in = nil
+	c.waitDone = nil
 	pending := c.pending
 	turns := c.turns
 	c.pending = map[string]chan response{}
 	c.turns = map[string]chan TurnResult{}
+	c.active = map[string]struct{}{}
 	c.threads = map[string]string{}
 	c.mu.Unlock()
 	for _, ch := range pending {
@@ -332,18 +359,29 @@ func (c *Client) stopProcess(cmd *exec.Cmd, reason error) {
 	if in != nil {
 		_ = in.Close()
 	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	_ = procutil.KillGroup(cmd)
 	c.failProcess(cmd, reason)
 }
 func (c *Client) Shutdown() {
 	c.mu.Lock()
 	cmd := c.cmd
+	in := c.in
+	done := c.waitDone
 	c.mu.Unlock()
-	if cmd != nil {
-		c.stopProcess(cmd, errors.New("app-server shutdown"))
+	if cmd == nil {
+		return
 	}
+	if in != nil {
+		_ = in.Close()
+	}
+	if done != nil {
+		select {
+		case <-done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+	c.stopProcess(cmd, errors.New("app-server shutdown timeout"))
 }
 
 func cloneMap(in map[string]any) map[string]any {
@@ -415,10 +453,28 @@ func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan 
 	}
 	return ch, nil
 }
+
+func (c *Client) ResumeThread(ctx context.Context, id, cwd string) error {
+	if err := c.ensure(ctx); err != nil {
+		return err
+	}
+	params := c.threadParams(cwd, "")
+	params["threadId"] = id
+	if err := c.call(ctx, "thread/resume", params, nil); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.threads[id] = cwd
+	c.mu.Unlock()
+	return nil
+}
 func (c *Client) Interrupt(ctx context.Context, id string) error {
 	c.mu.Lock()
 	running := c.cmd != nil
 	_, turning := c.turns[id]
+	if _, active := c.active[id]; active {
+		turning = true
+	}
 	c.mu.Unlock()
 	if !running || !turning {
 		return nil
@@ -430,6 +486,20 @@ func (c *Client) Has(id string) bool {
 	defer c.mu.Unlock()
 	_, ok := c.threads[id]
 	return ok
+}
+
+func (c *Client) Running() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cmd != nil
+}
+
+func (c *Client) Busy(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, turning := c.turns[id]
+	_, active := c.active[id]
+	return turning || active
 }
 func (c *Client) LiveSessions() []string {
 	c.mu.Lock()
