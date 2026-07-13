@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,6 +225,101 @@ func TestSendToSessionRelayedUnknownSession(t *testing.T) {
 	r := &Router{discovery: d, broker: broker.New()}
 	if err := r.SendToSessionRelayed("nope", "hi", func(string, string, error) {}); err == nil {
 		t.Error("expected error for unknown session")
+	}
+}
+
+// TestDeleteSubagentTranscripts: deleting a parent cascades to its read-only
+// subagents — their files, the <cwd>/<id>/ subtree, and their discovery entries
+// all go, leaving no orphans with a dangling parent.
+func TestDeleteSubagentTranscripts(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "-tmp-proj")
+	subDir := filepath.Join(cwd, "p1", "subagents")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootPath := filepath.Join(cwd, "p1.jsonl")
+	rootLine := `{"type":"user","sessionId":"p1","cwd":"/tmp/proj","timestamp":"2026-07-01T10:00:00.000Z","message":{"role":"user","content":"seed"},"uuid":"u1"}` + "\n"
+	if err := os.WriteFile(rootPath, []byte(rootLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	subLine := `{"type":"user","attributionAgent":"Explore","timestamp":"2026-07-01T10:00:01.000Z","message":{"role":"user","content":"task"},"uuid":"su"}` + "\n"
+	for _, name := range []string{"agent-aaa.jsonl", "agent-bbb.jsonl"} {
+		if err := os.WriteFile(filepath.Join(subDir, name), []byte(subLine), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	d, err := discovery.NewMulti(nil, discovery.NewClaudeSource(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(d.ListAll()); got != 3 {
+		t.Fatalf("ListAll = %d, want 3 (root + 2 subagents)", got)
+	}
+
+	r := &Router{discovery: d}
+	r.deleteSubagentTranscripts("p1", rootPath)
+
+	if _, err := os.Stat(filepath.Join(cwd, "p1")); !os.IsNotExist(err) {
+		t.Errorf("subagent subtree still on disk: err=%v", err)
+	}
+	for _, id := range []string{"p1::agent-aaa", "p1::agent-bbb"} {
+		if _, ok := d.Get(id); ok {
+			t.Errorf("subagent %q still in discovery", id)
+		}
+	}
+	if _, ok := d.Get("p1"); !ok {
+		t.Error("root should remain (the helper deletes children only)")
+	}
+}
+
+func TestDeleteSubagentTranscriptsRecursesCodexDescendants(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "2026", "07", "13")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootID := "019f5000-0000-7000-8000-000000000001"
+	childID := "019f5000-0000-7000-8000-000000000002"
+	grandchildID := "019f5000-0000-7000-8000-000000000003"
+	writeRollout := func(id, parent, source string) string {
+		path := filepath.Join(dir, "rollout-2026-07-13T00-00-00-"+id+".jsonl")
+		line := fmt.Sprintf(`{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":%q,"cwd":"/tmp/project","thread_source":%q,"parent_thread_id":%q}}`, id, source, parent) + "\n"
+		if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	rootPath := writeRollout(rootID, "", "user")
+	childPath := writeRollout(childID, rootID, "subagent")
+	grandchildPath := writeRollout(grandchildID, childID, "subagent")
+	d, err := discovery.NewMulti(nil, discovery.NewCodexSource(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := &Router{discovery: d}
+	r.deleteSubagentTranscripts(rootID, rootPath)
+	for _, tc := range []struct{ id, path string }{{childID, childPath}, {grandchildID, grandchildPath}} {
+		if _, err := os.Stat(tc.path); !os.IsNotExist(err) {
+			t.Errorf("descendant %s still on disk: err=%v", tc.id, err)
+		}
+		if _, ok := d.Get(tc.id); ok {
+			t.Errorf("descendant %s still in discovery", tc.id)
+		}
+	}
+	if _, err := os.Stat(rootPath); err != nil {
+		t.Fatalf("root transcript removed by child cleanup: %v", err)
 	}
 }
 

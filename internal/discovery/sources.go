@@ -19,9 +19,8 @@ type Source interface {
 	Backend() string
 	// Root is the directory to scan and recursively watch.
 	Root() string
-	// IsSessionFile reports whether path is a top-level session log, as opposed
-	// to a subagent transcript, tool-result blob, or other nested artifact that
-	// must not show up as a fake session.
+	// IsSessionFile reports whether path is a root or subagent session log, as
+	// opposed to a tool-result blob or unrelated nested artifact.
 	IsSessionFile(path string) bool
 	// SessionID extracts the session id from a session file path, or "" if none.
 	SessionID(path string) string
@@ -38,11 +37,8 @@ func NewClaudeSource(root string) ClaudeSource { return ClaudeSource{root: root}
 func (s ClaudeSource) Backend() string { return "claude" }
 func (s ClaudeSource) Root() string    { return s.root }
 
-// IsSessionFile accepts only top-level project files (<root>/<cwd>/<id>.jsonl,
-// i.e. exactly one separator below root). Subagent transcripts
-// (<cwd>/<id>/subagents/agent-*.jsonl), tool-result blobs, and Claude's
-// auto-memory .md files all live deeper and are filtered out — subagents in
-// particular carry non-UUID ids that `claude --resume` refuses.
+// IsSessionFile accepts top-level sessions and their nested subagent
+// transcripts. Other nested JSONL artifacts remain excluded.
 func (s ClaudeSource) IsSessionFile(path string) bool {
 	if !strings.HasSuffix(path, ".jsonl") {
 		return false
@@ -51,7 +47,25 @@ func (s ClaudeSource) IsSessionFile(path string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Count(rel, string(os.PathSeparator)) == 1
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if len(parts) == 2 {
+		return true
+	}
+	return len(parts) >= 4 && parts[2] == "subagents" && strings.HasPrefix(filepath.Base(path), "agent-")
+}
+
+// subagentParent returns the parent session id when path is a Claude subagent
+// transcript (<cwd>/<parent-id>/subagents/agent-*.jsonl), else "", false.
+func (s ClaudeSource) subagentParent(path string) (string, bool) {
+	rel, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if len(parts) >= 4 && parts[2] == "subagents" {
+		return parts[1], true
+	}
+	return "", false
 }
 
 func (s ClaudeSource) SessionID(path string) string {
@@ -59,11 +73,31 @@ func (s ClaudeSource) SessionID(path string) string {
 	if !strings.HasSuffix(name, ".jsonl") {
 		return ""
 	}
-	return strings.TrimSuffix(name, ".jsonl")
+	id := strings.TrimSuffix(name, ".jsonl")
+	if parent, ok := s.subagentParent(path); ok {
+		return parent + "::" + id
+	}
+	return id
 }
 
 func (s ClaudeSource) ReadMeta(path string) (jsonl.SessionMeta, error) {
-	return jsonl.ReadSessionMeta(path)
+	meta, err := jsonl.ReadSessionMeta(path)
+	if err != nil {
+		return meta, err
+	}
+	if parent, ok := s.subagentParent(path); ok {
+		meta.ParentID = parent
+		meta.IsSubagent = true
+		// The id must stay unique, so it's always the agent-<hash> filename;
+		// AgentName is the human label (attributionAgent, captured by
+		// ReadSessionMeta) and falls back to that same hash only when absent.
+		fileID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		meta.ID = meta.ParentID + "::" + fileID
+		if meta.AgentName == "" {
+			meta.AgentName = fileID
+		}
+	}
+	return meta, nil
 }
 
 // CodexSource scans Codex CLI's rollout tree:

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/core"
 )
 
 func newTestDiscovery(t *testing.T, root string) *Discovery {
@@ -258,6 +260,19 @@ func TestDiscovery_SkipsNestedJSONL(t *testing.T) {
 	if got[0].ID != "real" {
 		t.Errorf("got id %q, want %q", got[0].ID, "real")
 	}
+	all := d.ListAll()
+	if len(all) != 2 {
+		t.Fatalf("ListAll = %d sessions, want root + subagent: %v", len(all), all)
+	}
+	var sub core.Session
+	for _, s := range all {
+		if s.IsSubagent {
+			sub = s
+		}
+	}
+	if sub.ID != "real::agent-deadbeef" || sub.ParentID != "real" || sub.AgentName != "agent-deadbeef" {
+		t.Fatalf("subagent metadata = %+v", sub)
+	}
 }
 
 func TestDiscovery_RereadsMetaWhenInitiallyEmpty(t *testing.T) {
@@ -291,6 +306,36 @@ func TestDiscovery_RereadsMetaWhenInitiallyEmpty(t *testing.T) {
 	}
 	if s.Title == "" {
 		t.Error("Title still empty after re-read; want first-prompt fallback")
+	}
+}
+
+func TestDiscovery_RereadsLateCodexSubagentMeta(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "2026", "07", "13", "rollout-2026-07-13T00-00-00-019f5723-e850-7c71-b2e5-7735abe145fb.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)), NewCodexSource(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+	d.upsert(path)
+	id := "019f5723-e850-7c71-b2e5-7735abe145fb"
+	if got, ok := d.Get(id); !ok || got.IsSubagent {
+		t.Fatalf("initial empty session = %+v, found=%v", got, ok)
+	}
+	raw := `{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"019f5723-e850-7c71-b2e5-7735abe145fb","cwd":"/tmp/project","thread_source":"subagent","parent_thread_id":"parent-1","agent_nickname":"Archimedes"}}` + "\n"
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.upsert(path)
+	got, ok := d.Get(id)
+	if !ok || !got.IsSubagent || got.ParentID != "parent-1" || got.AgentName != "Archimedes" || got.Title != "Archimedes" {
+		t.Fatalf("late subagent metadata not applied: %+v, found=%v", got, ok)
 	}
 }
 

@@ -1,6 +1,8 @@
 package codexrollout
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +46,22 @@ func TestReadSessionMeta(t *testing.T) {
 	}
 	if meta.LastEventAt.Before(meta.StartedAt) {
 		t.Errorf("LastEventAt %v before StartedAt %v", meta.LastEventAt, meta.StartedAt)
+	}
+}
+
+func TestReadSessionMetaSubagent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout-2026-07-13T00-00-00-019f5723-e850-7c71-b2e5-7735abe145fb.jsonl")
+	raw := `{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"019f5723-e850-7c71-b2e5-7735abe145fb","cwd":"/tmp/project","thread_source":"subagent","parent_thread_id":"019f5228-434c-76d1-8459-4279b2d87ba3","agent_nickname":"Archimedes","agent_path":"/root/review"}}`
+	if err := os.WriteFile(path, []byte(raw+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadSessionMeta(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsSubagent || meta.ParentID != "019f5228-434c-76d1-8459-4279b2d87ba3" || meta.AgentName != "Archimedes" {
+		t.Fatalf("subagent meta = %+v", meta)
 	}
 }
 

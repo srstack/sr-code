@@ -56,9 +56,11 @@ func (r *Router) RunForeignWatch(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// scanForeignTurns runs one poll pass over every discovered session.
+// scanForeignTurns runs one poll pass over every discovered session. Subagent
+// transcripts participate so an open read-only detail view can refresh when a
+// child turn completes; they are still excluded from normal session listings.
 func (r *Router) scanForeignTurns() {
-	for _, sess := range r.discovery.List() {
+	for _, sess := range r.discovery.ListAll() {
 		r.checkForeignTurn(sess.ID)
 	}
 }
@@ -108,7 +110,10 @@ func (r *Router) checkForeignTurn(id string) {
 	r.sendMu.Unlock()
 
 	turns := foreignTurnsBetween(path, r.backendOf(id), base, size)
-	r.publishForeignTurnEvents(id, turns)
+	sess, _ := r.discovery.Get(id)
+	if !sess.IsSubagent {
+		r.publishForeignTurnEvents(id, turns)
+	}
 
 	// Wake any open session-detail view: its turn-end handler refetches the
 	// transcript on exit events, so the foreign turn appears without a
@@ -123,6 +128,13 @@ func (r *Router) checkForeignTurn(id string) {
 		exitRaw = json.RawMessage(`{}`)
 	}
 	r.broker.Publish(broker.Event{SessionID: id, Type: "subprocess.exit", Raw: exitRaw})
+
+	// Subagents are read-only transcript children, not independent foreign
+	// conversations. The exit above only wakes their open detail view; never
+	// replay their parts or relay their answer into the main chat.
+	if sess.IsSubagent {
+		return
+	}
 
 	if h := r.onForeignTurn; h != nil {
 		// Relay every turn completed in (base, size] — chained background

@@ -18,6 +18,7 @@ import { loadList } from './list.js';
 // from restarting (jumping back to its bright peak) on every poll.
 let lastSidebarHtml = '';
 let lastPinnedHtml = '';
+const subagentExpanded = new Set();
 
 // ---------- Sidebar ----------
 //
@@ -31,10 +32,14 @@ export async function loadSidebar() {
     // Always fetch include_archived=1 so the count and per-cwd disclosure
     // can show how many are archived even when collapsed. Payload size is
     // trivial at this scale.
-    const res = await fetch('/api/sessions?include_archived=1');
+    const res = await fetch('/api/sessions?include_archived=1&include_subagents=1');
     const sessions = res.ok ? (await res.json() || []) : [];
+    // Cache the FULL list (incl. subagents): markViewing() re-renders the
+    // sidebar from this cache on selection, and it must still see subagents
+    // or expanded child rows would blink out until the next poll. Unread
+    // bookkeeping stays root-only — subagents are read-only and never run.
     setLastSessions(sessions);
-    reconcileUnread(sessions);
+    reconcileUnread(sessions.filter(s => !s.is_subagent));
     renderSidebarSessions(sessions);
     updateSidebarActive();
     updateTabBadge();
@@ -44,11 +49,22 @@ export async function loadSidebar() {
 export function renderSidebarSessions(allSessions) {
   const wrap = document.getElementById('sidebar-sessions');
   const count = document.getElementById('sidebar-session-count');
-  const visible = allSessions.filter(s => !s.archived);
+  const roots = allSessions.filter(s => !s.is_subagent);
+  const children = new Map();
+  for (const s of allSessions) {
+    if (!s.is_subagent || !s.parent_id) continue;
+    if (!children.has(s.parent_id)) children.set(s.parent_id, []);
+    children.get(s.parent_id).push(s);
+  }
+  // Keep the parent expanded while its subagent is the one on screen, so the
+  // active child row stays visible across the 5s re-render.
+  const active = allSessions.find(s => s.id === currentDetailId);
+  if (active?.is_subagent && active.parent_id) subagentExpanded.add(active.parent_id);
+  const visible = roots.filter(s => !s.archived);
   if (count) {
-    count.textContent = visible.length === allSessions.length
-      ? '(' + allSessions.length + ')'
-      : '(' + visible.length + '/' + allSessions.length + ')';
+    count.textContent = visible.length === roots.length
+      ? '(' + roots.length + ')'
+      : '(' + visible.length + '/' + roots.length + ')';
   }
   if (!wrap) return;
   if (!allSessions.length) {
@@ -59,7 +75,7 @@ export function renderSidebarSessions(allSessions) {
   // Group ALL sessions by cwd (incl. archived) so each group's tail can
   // offer a "└[ N archived ]" disclosure without a separate count lookup.
   const groups = new Map();
-  for (const s of allSessions) {
+  for (const s of roots) {
     const cwd = s.cwd || '(unknown)';
     if (!groups.has(cwd)) groups.set(cwd, []);
     groups.get(cwd).push(s);
@@ -88,7 +104,10 @@ export function renderSidebarSessions(allSessions) {
     return recencyOf(bv) - recencyOf(av);
   });
 
-  const renderItem = s => {
+  // A single row. Subagent rows (child=true) are read-only: indented link,
+  // no kebab. A root row carries the kebab, which offers "Show subagents"
+  // when the session has any — the only way to reveal its children.
+  const renderRow = (s, child = false) => {
     const href = '#/s/' + encodeURIComponent(s.id);
     const dot = isUnread(s)
       ? '<span class="running-dot unread" title="new response">●</span>'
@@ -97,20 +116,37 @@ export function renderSidebarSessions(allSessions) {
       ? '<span class="auto-dot" title="auto-approve enabled">ϟ</span>'
       : '';
     const title = s.title || '(untitled)';
+    if (child) {
+      return `<li class="sidebar-item subagent-row">
+        <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
+      </li>`;
+    }
     const liClass = s.archived ? 'sidebar-item archived-row' : 'sidebar-item';
+    const subs = children.get(s.id) || [];
     return `<li class="${liClass}">
       <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
       <button class="kebab-btn" type="button"
         data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}"
         data-pinned="${s.pinned ? '1' : '0'}"
         data-status="${esc(s.status || '')}"
+        data-subagents="${subs.length}"
         aria-label="session actions" title="more">⋮</button>
     </li>`;
   };
 
+  // A root row, plus its subagent rows when the user has toggled them on.
+  const renderItem = s => {
+    let html = renderRow(s);
+    if (subagentExpanded.has(s.id)) {
+      const subs = (children.get(s.id) || []).slice().sort(byRecent);
+      html += subs.map(sub => renderRow(sub, true)).join('');
+    }
+    return html;
+  };
+
   // Pinned sessions: fixed group above the scroll container.
   const pinnedEl = document.getElementById('sidebar-pinned');
-  const pinnedItems = allSessions.filter(s => s.pinned && !s.archived).sort(byRecent);
+  const pinnedItems = roots.filter(s => s.pinned && !s.archived).sort(byRecent);
   const pinnedHtml = pinnedItems.length
     ? `<div class="cwd-label"><span class="cwd-label-text pinned-label">Pinned</span></div>
        <ul class="sidebar-list">${pinnedItems.map(renderItem).join('')}</ul>` : '';
@@ -253,8 +289,16 @@ function openKebabPopover(btn) {
     ? `<a class="kebab-item" data-action="editor" target="usher-editor"
          href="${esc(editorUrl.split('{cwd}').join(cwd))}">Open in editor</a>`
     : '';
+  // Subagents are hidden by default; the kebab is the per-session opt-in to
+  // reveal (or re-hide) this session's read-only child transcripts.
+  const subCount = parseInt(btn.dataset.subagents || '0', 10);
+  const subItem = subCount > 0
+    ? `<button type="button" class="kebab-item" data-action="subagents" data-id="${esc(id)}">${
+        subagentExpanded.has(id) ? 'Hide' : 'Show'} subagents</button>`
+    : '';
   kebabPopover.innerHTML =
     editorItem +
+    subItem +
     `<button type="button" class="kebab-item" data-action="rename" data-id="${esc(id)}">Rename</button>` +
     `<button type="button" class="kebab-item" data-action="${pinAction}" data-id="${esc(id)}">${pinLabel}</button>` +
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
@@ -393,9 +437,12 @@ if (sidebarEl) {
   // no touch path so right-click also opens the popover; Android's timer already did.
   sidebarEl.addEventListener('contextmenu', (e) => {
     const li = e.target.closest('.sidebar-item');
-    const kebab = li && li.querySelector('.kebab-btn');
-    if (!kebab) return;
+    if (!li) return;
     e.preventDefault();
+    const kebab = li.querySelector('.kebab-btn');
+    // Read-only subagent rows intentionally have no actions. Suppress the
+    // browser's native link/text menu without substituting an empty popover.
+    if (!kebab) return;
     if (recentTouch) return;
     openKebabPopover(kebab);
   });
@@ -430,6 +477,12 @@ if (settingsBtn && settingsMenu) {
 
 async function handleKebabAction(action, id) {
   closeKebabPopover();
+  if (action === 'subagents') {
+    if (subagentExpanded.has(id)) subagentExpanded.delete(id);
+    else subagentExpanded.add(id);
+    loadSidebar();
+    return;
+  }
   if (action === 'rename') {
     renameSession(id);
     return;

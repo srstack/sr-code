@@ -220,18 +220,39 @@ func backendForModel(model string) string {
 // ListSessions returns sessions decorated with their current run state: a
 // turn in flight is "running"; otherwise a warm pooled process is "live".
 func (r *Router) ListSessions() []core.Session {
+	return r.listSessions(false)
+}
+
+// ListSessionsWithSubagents includes read-only child transcripts for the web
+// sidebar's per-parent disclosure. Normal callers intentionally see roots only.
+func (r *Router) ListSessionsWithSubagents() []core.Session {
+	return r.listSessions(true)
+}
+
+func (r *Router) listSessions(includeSubagents bool) []core.Session {
 	sessions := r.discovery.List()
+	if includeSubagents {
+		sessions = r.discovery.ListAll()
+	}
 	live := r.liveSet()
 	r.sendMu.Lock()
 	known := make(map[string]bool, len(sessions))
+	out := sessions[:0]
 	for i := range sessions {
-		known[sessions[i].ID] = true
-		if _, running := r.activeSend[sessions[i].ID]; running {
-			sessions[i].Status = core.StatusRunning
-		} else if live[sessions[i].ID] {
-			sessions[i].Status = core.StatusLive
+		sess := &sessions[i]
+		known[sess.ID] = true
+		if sess.IsSubagent && !includeSubagents {
+			continue
 		}
-		r.applyCustomTitle(&sessions[i])
+		if _, running := r.activeSend[sess.ID]; running {
+			sess.Status = core.StatusRunning
+		} else if live[sess.ID] {
+			sess.Status = core.StatusLive
+		}
+		if !sess.IsSubagent {
+			r.applyCustomTitle(sess)
+		}
+		out = append(out, *sess)
 	}
 	var pending []core.Session
 	for id, s := range r.creating {
@@ -241,7 +262,7 @@ func (r *Router) ListSessions() []core.Session {
 		}
 	}
 	r.sendMu.Unlock()
-	return append(pending, sessions...)
+	return append(pending, out...)
 }
 
 func (r *Router) GetSession(id string) (core.Session, bool) {
@@ -279,6 +300,9 @@ func (r *Router) SessionPath(id string) (string, bool) {
 // operation — no process is spawned; the fork is resumed lazily by the pool
 // on its first send, like any idle session. Returns the new session id.
 func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
+	if sess, ok := r.discovery.Get(srcID); ok && sess.IsSubagent {
+		return "", errors.New("subagent transcripts are read-only")
+	}
 	path, ok := r.discovery.Path(srcID)
 	if !ok {
 		return "", ErrSessionNotFound
@@ -349,6 +373,9 @@ func (r *Router) Unarchive(sessionID string) {
 // live-process teardown is best-effort. Unlike Archive (a reversible sidebar
 // hide), this is destructive.
 func (r *Router) DeleteSession(id string) error {
+	if sess, ok := r.discovery.Get(id); ok && sess.IsSubagent {
+		return errors.New("subagent transcripts are read-only")
+	}
 	path, ok := r.discovery.Path(id)
 	if !ok {
 		return errors.New("session not found")
@@ -359,6 +386,9 @@ func (r *Router) DeleteSession(id string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete session file: %w", err)
 	}
+	// Cascade to this session's read-only subagent transcripts so they don't
+	// orphan on disk (and in discovery) with a now-dangling parent.
+	r.deleteSubagentTranscripts(id, path)
 	// Forget it synchronously so the id stops resolving immediately instead of
 	// racing the fsnotify Remove event (mirror of fork's Upsert).
 	r.discovery.Remove(id)
@@ -368,12 +398,53 @@ func (r *Router) DeleteSession(id string) error {
 	return nil
 }
 
+// deleteSubagentTranscripts removes a parent's read-only subagent transcripts —
+// their files and their discovery entries — when the parent is deleted. Walking
+// discovery covers both layouts: Claude nests them under <cwd>/<id>/, Codex
+// scatters them by parent_thread_id. It then drops Claude's now-empty <cwd>/<id>/
+// subtree beside rootPath (a no-op for Codex, whose derived path isn't a dir).
+// All disk removal is best-effort; the goal is not to leave orphans behind.
+func (r *Router) deleteSubagentTranscripts(parentID, rootPath string) {
+	parent, _ := r.discovery.Get(parentID)
+	children := make(map[string][]core.Session)
+	for _, sub := range r.discovery.ListAll() {
+		if sub.IsSubagent && (parent.Backend == "" || sub.Backend == parent.Backend) {
+			children[sub.ParentID] = append(children[sub.ParentID], sub)
+		}
+	}
+	var descendants []core.Session
+	seen := map[string]bool{}
+	var collect func(string)
+	collect = func(id string) {
+		for _, child := range children[id] {
+			if seen[child.ID] {
+				continue
+			}
+			seen[child.ID] = true
+			collect(child.ID)
+			descendants = append(descendants, child)
+		}
+	}
+	collect(parentID)
+	for _, sub := range descendants {
+		if subPath, ok := r.discovery.Path(sub.ID); ok {
+			if err := os.Remove(subPath); err != nil && !os.IsNotExist(err) {
+				slog.Warn("delete subagent transcript", "session", parentID, "subagent", sub.ID, "err", err)
+			}
+		}
+		r.discovery.Remove(sub.ID)
+	}
+	_ = os.RemoveAll(strings.TrimSuffix(rootPath, ".jsonl"))
+}
+
 // PauseSession stops usher's live backend worker without touching its
 // transcript or metadata. The conversation cold-resumes on the next Send.
 // It is the manual equivalent of LRU eviction.
 func (r *Router) PauseSession(id string) error {
-	if _, ok := r.discovery.Path(id); !ok {
+	if sess, ok := r.discovery.Get(id); !ok {
 		return errors.New("session not found")
+	} else if sess.IsSubagent {
+		return errors.New("subagent transcripts are read-only")
 	}
 	r.stopLive(id)
 	return nil
@@ -416,6 +487,9 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 	sess, ok := r.discovery.Get(id)
 	if !ok {
 		return errors.New("session not found")
+	}
+	if sess.IsSubagent {
+		return errors.New("subagent transcripts are read-only")
 	}
 	// Reorder the sidebar the instant the user sends, without waiting for the
 	// prompt to land in the jsonl (see discovery.MarkInput).

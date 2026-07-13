@@ -36,6 +36,11 @@ type Event struct {
 
 	AITitle string `json:"aiTitle,omitempty"`
 
+	// AttributionAgent is the subagent type ("Explore", "general-purpose", …)
+	// Claude Code stamps on the lines of a subagent (sidechain) transcript. It
+	// makes a far better row label than the opaque agent-<hash> filename.
+	AttributionAgent string `json:"attributionAgent,omitempty"`
+
 	// IsMeta marks harness-injected context (e.g. skill content loaded after
 	// a Skill tool call). These are user-role messages but not real user input.
 	IsMeta          bool   `json:"isMeta,omitempty"`
@@ -57,6 +62,9 @@ func ParseLine(line []byte) (Event, error) {
 // SessionMeta is the lightweight descriptor of a session, suitable for listing.
 type SessionMeta struct {
 	ID          string
+	ParentID    string
+	IsSubagent  bool
+	AgentName   string
 	Cwd         string
 	Title       string // from ai-title events only
 	Prompt      string // truncated first user prompt (fallback when Title is empty)
@@ -104,6 +112,9 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		}
 		if ev.Type == "ai-title" && ev.AITitle != "" {
 			meta.Title = ev.AITitle
+		}
+		if meta.AgentName == "" && ev.AttributionAgent != "" {
+			meta.AgentName = ev.AttributionAgent
 		}
 		if ev.Type == "user" && len(ev.Message) > 0 {
 			content := extractUserContent(ev.Message)

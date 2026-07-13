@@ -167,14 +167,26 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 		switch l.Type {
 		case "session_meta":
 			var p struct {
-				ID  string `json:"id"`
-				Cwd string `json:"cwd"`
+				ID             string `json:"id"`
+				Cwd            string `json:"cwd"`
+				ParentThreadID string `json:"parent_thread_id"`
+				ThreadSource   string `json:"thread_source"`
+				AgentNickname  string `json:"agent_nickname"`
+				AgentPath      string `json:"agent_path"`
 			}
 			if err := json.Unmarshal(l.Payload, &p); err == nil {
 				if p.ID != "" {
 					meta.ID = p.ID
 				}
 				meta.Cwd = p.Cwd
+				meta.IsSubagent = p.ThreadSource == "subagent"
+				if meta.IsSubagent {
+					meta.ParentID = p.ParentThreadID
+				}
+				meta.AgentName = p.AgentNickname
+				if meta.AgentName == "" {
+					meta.AgentName = p.AgentPath
+				}
 			}
 		case "event_msg":
 			if msg, ok := userMessage(l.Payload); ok {

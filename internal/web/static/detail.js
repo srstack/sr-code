@@ -279,6 +279,13 @@ export async function showDetail(id) {
   // band, no fragile second-tier sticky element.
   renderSessionSubtitle(sess);
 
+  if (sess.is_subagent) {
+    root.innerHTML = `<div id="chat-scroll" class="chat-area"></div>`;
+    openSubagentEventStream(id);
+    await loadTranscript(id);
+    return;
+  }
+
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
@@ -521,6 +528,19 @@ export async function showDetail(id) {
   });
 
   promptEl.focus();
+}
+
+// Subagents are read-only and intentionally do not stream partial output.
+// Their lightweight server-side watcher emits subprocess.exit when a child
+// turn completes; refetch the transcript then. turn.idle is the server's
+// snapshot-on-connect event, so it also closes the subscribe/fetch race and
+// reconciles completions that happened while the SSE connection was down.
+function openSubagentEventStream(id) {
+  const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
+  setCurrentES(es);
+  es.addEventListener('turn.idle', () => loadTranscript(id));
+  es.addEventListener('subprocess.exit', () => loadTranscript(id));
+  es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
 }
 
 // openEventStream attaches SSE handlers to /api/sessions/{id}/events. The
@@ -885,6 +905,16 @@ function renderSessionSubtitle(sess) {
   // here, so the datasets track every action applied to the on-screen
   // session. The chevron sits OUTSIDE the truncating title span so a long
   // title can't ellipsize it away.
+  if (sess.is_subagent) {
+    subtitle.innerHTML =
+      backendMark(sess.backend) +
+      `<span class="subtitle-left">` +
+        `<strong class="session-title">${esc(sess.title || sess.agent_name || '(subagent)')}</strong>` +
+        `<span class="session-id">${esc(sess.id.slice(0, 8))}</span>` +
+        `<span class="session-cwd">${esc(sess.cwd || '')}</span>` +
+      `</span>`;
+    return;
+  }
   subtitle.innerHTML =
     backendMark(sess.backend) +
     `<span class="subtitle-left">` +

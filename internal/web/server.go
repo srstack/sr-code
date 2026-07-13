@@ -488,14 +488,21 @@ type sessionDTO struct {
 	Pinned      bool `json:"pinned"`
 }
 
-// handleListSessions returns sessions visible by default, or the full
-// set when ?include_archived=1 is passed (used by the sidebar's per-cwd
-// "show archived" disclosure).
+// handleListSessions returns root sessions by default. The sidebar opts into
+// archived roots and read-only subagents for its disclosure controls.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	includeArchived := r.URL.Query().Get("include_archived") == "1"
+	includeSubagents := r.URL.Query().Get("include_subagents") == "1"
 	sessions := s.router.ListSessions()
+	if includeSubagents {
+		sessions = s.router.ListSessionsWithSubagents()
+	}
 	out := make([]sessionDTO, 0, len(sessions))
 	for _, sess := range sessions {
+		if sess.IsSubagent {
+			out = append(out, sessionDTO{Session: sess})
+			continue
+		}
 		archived := s.router.IsArchived(sess.ID)
 		if archived && !includeArchived {
 			continue

@@ -3,6 +3,7 @@ package router
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -94,6 +95,48 @@ func TestForeignTurnDetectedAndRelayedOnce(t *testing.T) {
 	r.scanForeignTurns() // baseline advanced: no re-relay
 	if len(got) != 1 {
 		t.Errorf("double relay: %v", got)
+	}
+}
+
+func TestSubagentCompletionOnlyWakesDetailView(t *testing.T) {
+	r := newQueueTestRouter(t)
+	var relayed []string
+	r.SetForeignTurnHandler(func(id, text string) { relayed = append(relayed, id+"|"+text) })
+
+	rootPath, _ := r.discovery.Path("abc12345")
+	childPath := filepath.Join(filepath.Dir(rootPath), "abc12345", "subagents", "agent-child.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childPath, []byte(`{"type":"user","message":{"role":"user","content":"child task"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r.discovery.Upsert(childPath)
+	r.scanForeignTurns() // baseline the in-progress child transcript
+
+	const childID = "abc12345::agent-child"
+	ch, unsub := r.broker.Subscribe(childID)
+	defer unsub()
+	appendFile(t, childPath, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"child result"}]}}
+{"type":"system","subtype":"turn_duration"}
+`)
+	r.scanForeignTurns()
+
+	select {
+	case ev := <-ch:
+		if ev.Type != "subprocess.exit" {
+			t.Fatalf("subagent event = %q, want only subprocess.exit", ev.Type)
+		}
+	default:
+		t.Fatal("subagent completion did not wake detail view")
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("unexpected extra subagent event: %q", ev.Type)
+	default:
+	}
+	if len(relayed) != 0 {
+		t.Fatalf("subagent result relayed as foreign turn: %v", relayed)
 	}
 }
 

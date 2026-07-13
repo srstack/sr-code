@@ -19,6 +19,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/jsonl"
 )
 
 type Discovery struct {
@@ -161,6 +162,7 @@ func (d *Discovery) upsert(path string) {
 		needTitle := existing.Title == "" && existing.Backend != "codex"
 		if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 			if meta, err := src.ReadMeta(path); err == nil {
+				applySubagentMeta(&existing, meta)
 				if existing.Cwd == "" {
 					existing.Cwd = meta.Cwd
 				}
@@ -191,6 +193,9 @@ func (d *Discovery) upsert(path string) {
 	}
 	sess := core.Session{
 		ID:          id,
+		ParentID:    meta.ParentID,
+		IsSubagent:  meta.IsSubagent,
+		AgentName:   meta.AgentName,
 		Cwd:         meta.Cwd,
 		Title:       meta.Title,
 		Prompt:      meta.Prompt,
@@ -203,11 +208,32 @@ func (d *Discovery) upsert(path string) {
 	if sess.StartedAt.IsZero() {
 		sess.StartedAt = info.ModTime()
 	}
+	applySubagentMeta(&sess, meta)
 
 	d.mu.Lock()
 	d.sessions[id] = sess
 	d.paths[id] = path
 	d.mu.Unlock()
+}
+
+// applySubagentMeta fills structural metadata that may arrive after the file's
+// Create event. Never clear an already-known relationship on a partial read.
+func applySubagentMeta(sess *core.Session, meta jsonl.SessionMeta) {
+	if !meta.IsSubagent {
+		return
+	}
+	sess.IsSubagent = true
+	if meta.ParentID != "" {
+		sess.ParentID = meta.ParentID
+	}
+	if meta.AgentName != "" {
+		sess.AgentName = meta.AgentName
+	}
+	// Human names (Codex nicknames, Claude attributionAgent) beat the task
+	// prompt. Opaque agent-<hash> ids deliberately fall through to Prompt.
+	if sess.AgentName != "" && !strings.HasPrefix(sess.AgentName, "agent-") {
+		sess.Title = sess.AgentName
+	}
 }
 
 func (d *Discovery) remove(path string) {
@@ -298,8 +324,21 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 	}
 }
 
-// List returns sessions sorted by most recent user input first (see sortKey).
+// List returns root sessions sorted by most recent user input. Subagents are
+// discoverable by id but hidden from default listings.
 func (d *Discovery) List() []core.Session {
+	all := d.ListAll()
+	out := all[:0]
+	for _, s := range all {
+		if !s.IsSubagent {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ListAll includes read-only subagent transcripts.
+func (d *Discovery) ListAll() []core.Session {
 	d.mu.RLock()
 	out := make([]core.Session, 0, len(d.sessions))
 	for _, s := range d.sessions {

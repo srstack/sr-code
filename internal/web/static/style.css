@@ -199,6 +199,17 @@ body {
   margin-right: 0.25rem;
   font-size: 0.7rem;
 }
+/* Subagent (child) rows: minimalist — an indent, a leading "- " marker, a
+ * fainter colour, and a slightly smaller type size signal nesting. */
+.sidebar-list li.subagent-row a {
+  padding-left: 1.2rem;
+  color: var(--text-disabled);
+  font-size: 0.82rem;
+}
+.sidebar-list li.subagent-row a::before {
+  content: "- ";
+  color: var(--text-disabled);
+}
 .kebab-btn {
   position: absolute;
   right: 0.15rem;
@@ -243,7 +254,6 @@ body {
  * never reveals and the native selection cue is suppressed. */
 .sidebar-list li.sidebar-item.kebab-active {
   background: var(--bg-hover);
-  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 /* Archived sessions revealed via the per-cwd disclosure: dim the row so

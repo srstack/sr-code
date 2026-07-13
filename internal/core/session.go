@@ -16,11 +16,13 @@ const (
 	StatusAwaitingPermission Status = "awaiting_permission"
 )
 
-// Session is the projection of a Claude Code session that usher manages.
-// In v0.1 it is a derived view of a jsonl file at
-// ~/.claude/projects/<sanitized-cwd>/<id>.jsonl.
+// Session is the backend-neutral projection of a discovered conversation
+// transcript. Subagent sessions are read-only children of a root session.
 type Session struct {
 	ID          string    `json:"id"`
+	ParentID    string    `json:"parent_id,omitempty"`
+	IsSubagent  bool      `json:"is_subagent,omitempty"`
+	AgentName   string    `json:"agent_name,omitempty"`
 	Cwd         string    `json:"cwd"`
 	Title       string    `json:"title"`
 	Prompt      string    `json:"-"`
