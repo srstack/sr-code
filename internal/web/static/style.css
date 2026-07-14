@@ -766,7 +766,45 @@ td.cwd { font-size: 0.82rem; }
   padding: 0.3rem 0.4rem 0.4rem;
 }
 .composer-tools { display: flex; align-items: center; gap: 0.5rem; }
-.composer-send { margin-left: auto; display: flex; gap: 0.35rem; }
+.composer-send { margin-left: auto; display: flex; align-items: center; gap: 0.35rem; }
+.session-usage-wrap { position: relative; display: flex; align-items: center; }
+.composer-send button.session-usage {
+  --usage-pct: 0%;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) var(--usage-pct), var(--border-strong) 0);
+  position: relative;
+}
+.composer-send button.session-usage::after {
+  content: "";
+  position: absolute;
+  inset: 0.16rem;
+  border-radius: 50%;
+  background: var(--bg-chrome);
+}
+.composer-send button.session-usage.unknown {
+  background: var(--border-strong);
+}
+.session-usage-detail {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.5rem);
+  z-index: 20;
+  min-width: 13rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-chrome);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+  color: var(--text);
+  font-size: 0.78rem;
+}
+.session-usage-detail > div { display: flex; justify-content: space-between; gap: 1rem; }
+.session-usage-detail strong { font-weight: 500; color: var(--text-faint); }
+.session-usage-detail span { white-space: nowrap; }
 .composer-send button {
   padding: 0.32rem 0.8rem;
   border: 1px solid var(--accent);

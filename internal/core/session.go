@@ -40,7 +40,8 @@ type Session struct {
 	// Backend names the agent CLI this session belongs to ("claude" or "codex").
 	// usher manages both at once; a session belongs to one for its life. Set by
 	// discovery from the Source that found the session's log.
-	Backend string `json:"backend"`
+	Backend string       `json:"backend"`
+	Usage   SessionUsage `json:"usage"`
 }
 
 // TranscriptTurn is a single user/assistant turn extracted from a session
@@ -50,6 +51,12 @@ type TranscriptTurn struct {
 	Role    string    `json:"role"`
 	Content string    `json:"content"`
 	Time    time.Time `json:"ts"`
+}
+
+// SessionUsage is the latest active context usage recorded in a session log.
+type SessionUsage struct {
+	ContextTokens int64 `json:"context_tokens,omitempty"`
+	ContextWindow int64 `json:"context_window,omitempty"`
 }
 
 // TranscriptSearchHit is one matching turn from a transcript substring search.

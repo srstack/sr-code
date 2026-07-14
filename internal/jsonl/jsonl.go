@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/nexustar/usher/internal/core"
 )
 
 // Event is one line of a session jsonl. Common fields are extracted; the full
@@ -73,6 +75,7 @@ type SessionMeta struct {
 	// LastInputAt is the time of the last genuine user prompt (see
 	// core.Session.LastInputAt); skips tool_result lines and interrupt markers.
 	LastInputAt time.Time
+	Usage       core.SessionUsage
 }
 
 // ReadSessionMeta scans the file at path and produces a SessionMeta. It walks
@@ -116,6 +119,9 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		if meta.AgentName == "" && ev.AttributionAgent != "" {
 			meta.AgentName = ev.AttributionAgent
 		}
+		if ev.Type == "assistant" && len(ev.Message) > 0 {
+			updateClaudeContext(&meta.Usage, ev.Message)
+		}
 		if ev.Type == "user" && len(ev.Message) > 0 {
 			content := extractUserContent(ev.Message)
 			if firstUserPrompt == "" {
@@ -135,6 +141,25 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 		meta.Prompt = truncate(firstUserPrompt, 60)
 	}
 	return meta, sc.Err()
+}
+
+func updateClaudeContext(usage *core.SessionUsage, raw json.RawMessage) {
+	var msg struct {
+		Usage struct {
+			Input         int64 `json:"input_tokens"`
+			CacheCreation int64 `json:"cache_creation_input_tokens"`
+			CacheRead     int64 `json:"cache_read_input_tokens"`
+			Output        int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &msg) != nil {
+		return
+	}
+	cached := msg.Usage.CacheCreation + msg.Usage.CacheRead
+	context := msg.Usage.Input + cached + msg.Usage.Output
+	if context > 0 {
+		usage.ContextTokens = context
+	}
 }
 
 // messageModel extracts the model id from a message body (assistant events).

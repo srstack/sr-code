@@ -379,3 +379,22 @@ func TestAssemblerCustomWrapperDeduplicatesCanonicalPatch(t *testing.T) {
 		t.Fatalf("canonical patch dedup failed: part=%+v turn=%+v", part, turn)
 	}
 }
+
+func TestReadSessionMetaUsesLatestCodexUsageSnapshot(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":3,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12}}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":5,"reasoning_output_tokens":2,"total_tokens":25},"last_token_usage":{"total_tokens":14},"model_context_window":100}}}`,
+	}, "\n")
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadSessionMeta(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := meta.Usage
+	if u.ContextTokens != 14 || u.ContextWindow != 100 {
+		t.Fatalf("usage = %+v", u)
+	}
+}

@@ -189,6 +189,19 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 				}
 			}
 		case "event_msg":
+			var usage struct {
+				Type string `json:"type"`
+				Info *struct {
+					Last struct {
+						Total int64 `json:"total_tokens"`
+					} `json:"last_token_usage"`
+					ContextWindow int64 `json:"model_context_window"`
+				} `json:"info"`
+			}
+			if json.Unmarshal(l.Payload, &usage) == nil && usage.Type == "token_count" && usage.Info != nil {
+				meta.Usage.ContextTokens = usage.Info.Last.Total
+				meta.Usage.ContextWindow = usage.Info.ContextWindow
+			}
 			if msg, ok := userMessage(l.Payload); ok {
 				if firstPrompt == "" {
 					firstPrompt = msg

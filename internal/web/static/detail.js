@@ -331,6 +331,11 @@ export async function showDetail(id) {
               </button>
             </div>
             <div class="composer-send">
+              <div class="session-usage-wrap">
+                <button id="session-usage" class="session-usage" type="button" hidden
+                  aria-expanded="false" aria-controls="session-usage-detail"></button>
+                <div id="session-usage-detail" class="session-usage-detail" hidden></div>
+              </div>
               <button id="send">send</button>
               <button id="cancel" class="cancel" hidden>cancel</button>
             </div>
@@ -347,6 +352,19 @@ export async function showDetail(id) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cancelBtn = document.getElementById('cancel');
+  const usageBtn = document.getElementById('session-usage');
+  const usageDetail = document.getElementById('session-usage-detail');
+  if (usageBtn && usageDetail) {
+    usageBtn.addEventListener('click', () => {
+      usageDetail.hidden = !usageDetail.hidden;
+      usageBtn.setAttribute('aria-expanded', usageDetail.hidden ? 'false' : 'true');
+    });
+    usageBtn.addEventListener('blur', () => {
+      usageDetail.hidden = true;
+      usageBtn.setAttribute('aria-expanded', 'false');
+    });
+  }
+  renderSessionUsage(sess.usage);
   restoreDraft(promptEl);
 
   const autoBtn = document.getElementById('auto-approve-toggle');
@@ -706,6 +724,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
       liveTurnDirty = false; // the full fetch below reconciles everything
       onIdle();
       loadTranscript(id);
+      refreshSubtitle(id); // recover metadata when subprocess.exit was missed
     },
     'subprocess.started': () => beginTurn(),
     // One server-grouped TurnPart (assistant text or a rendered tool result)
@@ -983,6 +1002,7 @@ async function refreshSubtitle(id) {
     const sess = await res.json();
     if (id !== currentDetailId) return;
     renderSessionSubtitle(sess);
+    renderSessionUsage(sess.usage);
   } catch {/* ignore */}
 }
 registerRefreshSubtitle(refreshSubtitle);
@@ -1154,6 +1174,32 @@ async function loadTranscript(id, opts) {
     lastTranscriptSig = sig;
     updateLoadEarlier(id);
   } catch {/* ignore — lastTranscriptSig stays put, so the next call retries */}
+}
+
+function renderSessionUsage(u) {
+  const el = document.getElementById('session-usage');
+  const detail = document.getElementById('session-usage-detail');
+  if (!el || !detail) return;
+  const context = Number(u && u.context_tokens) || 0;
+  el.hidden = context <= 0;
+  if (context <= 0) return;
+  const max = Number(u.context_window) || 0;
+  const pct = max > 0 ? Math.min(100, Math.max(0, context / max * 100)) : 0;
+  el.classList.toggle('unknown', max <= 0);
+  el.style.setProperty('--usage-pct', pct.toFixed(1) + '%');
+  el.setAttribute('aria-label', max > 0
+    ? 'Context ' + Math.round(pct) + '% used; show usage details'
+    : 'Context limit unavailable; show usage details');
+  el.title = max > 0 ? 'Context ' + Math.round(pct) + '% used' : 'Context limit unavailable';
+
+  detail.innerHTML = `<div><strong>context</strong><span>${max > 0 ? esc(formatTokenCount(context) + ' / ' + formatTokenCount(max) + ' · ' + Math.round(pct) + '%') : esc(formatTokenCount(context) + ' / unavailable')}</span></div>`;
+}
+
+function formatTokenCount(n) {
+  n = Number(n) || 0;
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, '') + 'k';
+  return (n / 1000000).toFixed(n < 10000000 ? 1 : 0).replace(/\.0$/, '') + 'm';
 }
 
 // updateLoadEarlier shows a "load earlier" control at the top of the transcript

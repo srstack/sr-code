@@ -132,10 +132,8 @@ func (d *Discovery) addWatches() error {
 // this so the id resolves immediately instead of racing the watcher.
 func (d *Discovery) Upsert(path string) { d.upsert(path) }
 
-// upsert reads a jsonl file's metadata if unknown, or just bumps the
-// last-event timestamp from file mtime if already known. The full jsonl is
-// scanned once at first sight; subsequent writes during streaming only touch
-// mtime, avoiding repeated full-file reads.
+// upsert reads and caches a jsonl file's metadata. Known sessions are re-read
+// when the file changes so cumulative usage stays current in the projection.
 func (d *Discovery) upsert(path string) {
 	src := d.sourceFor(path)
 	if src == nil {
@@ -160,8 +158,9 @@ func (d *Discovery) upsert(path string) {
 		// while any is empty. Title is set once and never cleared, so this
 		// self-limits. Codex has no ai-title, so exclude it from the title re-read.
 		needTitle := existing.Title == "" && existing.Backend != "codex"
-		if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
-			if meta, err := src.ReadMeta(path); err == nil {
+		if meta, err := src.ReadMeta(path); err == nil {
+			existing.Usage = meta.Usage
+			if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 				applySubagentMeta(&existing, meta)
 				if existing.Cwd == "" {
 					existing.Cwd = meta.Cwd
@@ -204,6 +203,7 @@ func (d *Discovery) upsert(path string) {
 		LastEventAt: info.ModTime(),
 		LastInputAt: meta.LastInputAt,
 		Backend:     src.Backend(),
+		Usage:       meta.Usage,
 	}
 	if sess.StartedAt.IsZero() {
 		sess.StartedAt = info.ModTime()

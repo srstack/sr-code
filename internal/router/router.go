@@ -609,6 +609,12 @@ func lineTimestamp(raw json.RawMessage) time.Time {
 
 func (r *Router) publishStream(sessionID string, asm streamAssembler, ev sender.StreamEvent, started time.Time) *jsonl.TurnPart {
 	if ev.Type == "subprocess.exit" {
+		// The web refreshes cached session metadata as soon as it receives this
+		// event. Ingest the final jsonl state synchronously first instead of
+		// racing the asynchronous fsnotify Write event.
+		if path, ok := r.discovery.Path(sessionID); ok {
+			r.discovery.Upsert(path)
+		}
 		ev.Raw = r.enrichExitWithTurnTimestamps(sessionID, ev.Raw, started)
 	}
 	r.broker.Publish(broker.Event{SessionID: sessionID, Type: ev.Type, Raw: ev.Raw})
