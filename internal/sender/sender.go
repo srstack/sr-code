@@ -339,7 +339,7 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 			offset = fi.Size()
 		}
 	}
-	done, fresh, queuedAhead, err := s.claude.Send(ctx, id, prompt, cwd, model, resume)
+	done, deltas, fresh, queuedAhead, err := s.claude.Send(ctx, id, prompt, cwd, model, resume)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +364,14 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 		events := tailTurn(tailCtx, path, offset, s.logger, cfg)
 		for {
 			select {
+			case delta, ok := <-deltas:
+				if !ok {
+					deltas = nil
+					continue
+				}
+				if !emitLiveDelta(ctx, out, "text", delta.Text) {
+					return
+				}
 			case ev, ok := <-events:
 				if !ok {
 					select {
@@ -408,7 +416,7 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 			offset = fi.Size()
 		}
 	}
-	done, err := s.app.StartTurn(ctx, id, prompt, cwd)
+	done, deltas, err := s.app.StartTurn(ctx, id, prompt, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -429,8 +437,21 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 		tailCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		events := tailTurn(tailCtx, path, offset, s.logger, s.tail)
+		lastKind := ""
 		for {
 			select {
+			case delta, ok := <-deltas:
+				if !ok {
+					deltas = nil
+					continue
+				}
+				if delta.Kind == "reasoning" && lastKind == "reasoning" {
+					continue // emit "thinking" once per reasoning stretch
+				}
+				lastKind = delta.Kind
+				if !emitLiveDelta(ctx, out, delta.Kind, delta.Text) {
+					return
+				}
 			case ev, ok := <-events:
 				if !ok {
 					// File completion is only a straggler backstop. Give the
@@ -462,6 +483,21 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 		}
 	}()
 	return out, nil
+}
+
+func emitLiveDelta(ctx context.Context, out chan<- StreamEvent, kind, delta string) bool {
+	if delta == "" {
+		return true
+	}
+	typ, payload := "part.delta", map[string]string{"delta": delta}
+	if kind == "reasoning" {
+		typ, payload = "turn.status", map[string]string{"status": "thinking"}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return true
+	}
+	return sendEvent(ctx, out, StreamEvent{Type: typ, Raw: raw})
 }
 
 // drainTail lets a completed backend protocol flush the final log records into

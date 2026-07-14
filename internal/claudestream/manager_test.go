@@ -38,7 +38,7 @@ func TestLongRunningProcessServesMultipleTurns(t *testing.T) {
 	os.Setenv("FAKE_CLAUDE_LOG", log)
 	t.Cleanup(func() { os.Unsetenv("FAKE_CLAUDE_LOG"); m.Shutdown() })
 	for i := 0; i < 2; i++ {
-		ch, fresh, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", false)
+		ch, _, fresh, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -61,7 +61,7 @@ func TestLongRunningProcessServesMultipleTurns(t *testing.T) {
 	if lines := strings.Count(strings.TrimSpace(string(b)), "\n") + 1; lines != 1 {
 		t.Fatalf("spawn count=%d args=%s", lines, b)
 	}
-	if !strings.Contains(string(b), "--session-id sid") || !strings.Contains(string(b), "--input-format stream-json") {
+	if !strings.Contains(string(b), "--session-id sid") || !strings.Contains(string(b), "--input-format stream-json") || !strings.Contains(string(b), "--include-partial-messages") {
 		t.Fatalf("args=%s", b)
 	}
 	in, _ := os.ReadFile(log + ".input")
@@ -76,7 +76,7 @@ func TestResumeUsesResumeFlag(t *testing.T) {
 	defer os.Unsetenv("FAKE_CLAUDE_LOG")
 	m := New(bin, "", "", nil, 4, nil)
 	defer m.Shutdown()
-	ch, _, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", true)
+	ch, _, _, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,19 +108,19 @@ func TestSpontaneousTurnTailEventsDoNotStickOrStealNextResult(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	user := make(chan Result, 1)
+	user := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
 	p.mu.Lock()
 	p.turns = append(p.turns, user)
 	p.mu.Unlock()
 	_, _ = io.WriteString(w, "{\"type\":\"result\",\"subtype\":\"success\"}\n{\"type\":\"command_lifecycle\"}\n{\"type\":\"rate_limit_event\"}\n")
 	select {
-	case <-user:
+	case <-user.done:
 		t.Fatal("spontaneous result was delivered to user turn")
 	case <-time.After(20 * time.Millisecond):
 	}
 	_, _ = io.WriteString(w, "{\"type\":\"result\",\"subtype\":\"success\"}\n")
 	select {
-	case <-user:
+	case <-user.done:
 	case <-time.After(time.Second):
 		t.Fatal("user result not delivered")
 	}
@@ -133,9 +133,80 @@ func TestSpontaneousTurnTailEventsDoNotStickOrStealNextResult(t *testing.T) {
 	}
 }
 
+func TestMessageStartMarksSpontaneousTurnButDeltasDoNot(t *testing.T) {
+	m := New("", "", "", nil, 2, nil)
+	p := &process{id: "s", lastUsed: time.Now()}
+	m.processes["s"] = p
+	r, w := io.Pipe()
+	done := make(chan struct{})
+	go func() { m.readLoop(p, r); close(done) }()
+	_, _ = io.WriteString(w, `{"type":"stream_event","event":{"type":"message_start"}}`+"\n")
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.mu.Lock()
+		n := len(p.turns)
+		p.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("message_start did not mark a spontaneous turn")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	user := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
+	p.mu.Lock()
+	if p.turns[0] != nil {
+		p.mu.Unlock()
+		t.Fatal("spontaneous marker is not nil")
+	}
+	p.turns = append(p.turns, user)
+	p.mu.Unlock()
+	// The spontaneous turn's deltas must not leak into the queued user turn.
+	_, _ = io.WriteString(w, `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"spontaneous"}}}`+"\n")
+	_, _ = io.WriteString(w, `{"type":"result","subtype":"success"}`+"\n")
+	select {
+	case <-user.done:
+		t.Fatal("spontaneous result was delivered to user turn")
+	case d := <-user.deltas:
+		t.Fatalf("spontaneous delta leaked to user turn: %+v", d)
+	case <-time.After(20 * time.Millisecond):
+	}
+	_, _ = io.WriteString(w, `{"type":"result","subtype":"success"}`+"\n")
+	select {
+	case <-user.done:
+	case <-time.After(time.Second):
+		t.Fatal("user result not delivered")
+	}
+	_ = w.Close()
+	<-done
+}
+
+func TestPartialTextDeltaRoutesToCurrentTurn(t *testing.T) {
+	m := New("", "", "", nil, 2, nil)
+	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 2)}
+	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
+	r, w := io.Pipe()
+	done := make(chan struct{})
+	go func() { m.readLoop(p, r); close(done) }()
+	_, _ = io.WriteString(w, `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}}`+"\n")
+	select {
+	case d := <-req.deltas:
+		if d.Text != "hello" {
+			t.Fatalf("delta = %+v", d)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delta timeout")
+	}
+	_, _ = io.WriteString(w, `{"type":"result","subtype":"success"}`+"\n")
+	<-req.done
+	_ = w.Close()
+	<-done
+}
+
 func TestMaxLiveDoesNotGrowWhenAllProcessesBusy(t *testing.T) {
 	m := New("missing", "", "", nil, 1, nil)
-	m.processes["busy"] = &process{id: "busy", turns: []chan Result{nil}}
+	m.processes["busy"] = &process{id: "busy", turns: []*turnRequest{nil}}
 	if _, _, err := m.ensure(context.Background(), "new", "/tmp", "", true); err == nil {
 		t.Fatal("expected max-live busy error")
 	}

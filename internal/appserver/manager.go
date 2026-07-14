@@ -166,24 +166,24 @@ func (m *Manager) getOrResume(ctx context.Context, id, cwd string) (*worker, err
 	}
 }
 
-func (m *Manager) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, error) {
+func (m *Manager) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, <-chan Delta, error) {
 	w, err := m.getOrResume(ctx, id, cwd)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	m.mu.Lock()
 	if w.busy || w.client.Busy(id) {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("Codex session %s is busy", id)
+		return nil, nil, fmt.Errorf("Codex session %s is busy", id)
 	}
 	w.busy, w.lastUsed = true, time.Now()
 	m.mu.Unlock()
-	inner, err := w.client.StartTurn(ctx, id, prompt, cwd)
+	inner, deltas, err := w.client.StartTurn(ctx, id, prompt, cwd)
 	if err != nil {
 		m.mu.Lock()
 		w.busy = false
 		m.mu.Unlock()
-		return nil, err
+		return nil, nil, err
 	}
 	out := make(chan TurnResult, 1)
 	go func() {
@@ -198,7 +198,7 @@ func (m *Manager) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan
 		}
 		close(out)
 	}()
-	return out, nil
+	return out, deltas, nil
 }
 
 func (m *Manager) Interrupt(ctx context.Context, id string) error {

@@ -939,6 +939,8 @@ var sseForward = map[string]bool{
 	"subprocess.exit":    true,
 	"error":              true,
 	"part":               true,
+	"part.delta":         true,
+	"turn.status":        true,
 	"turn.user":          true,
 	"session.runtime":    true,
 }

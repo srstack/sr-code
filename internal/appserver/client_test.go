@@ -38,6 +38,21 @@ func TestThreadParamsCarryPolicySandboxAndNativeMCP(t *testing.T) {
 	}
 }
 
+func TestAgentMessageDeltaRoutesByThread(t *testing.T) {
+	c := New("codex", nil, nil, nil, nil, nil)
+	stream := &turnStream{done: make(chan TurnResult, 1), deltas: make(chan Delta, 2)}
+	c.turns["thread-1"] = stream
+	c.dispatch(rpcMessage{Method: "item/agentMessage/delta", Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"hello"}`)})
+	select {
+	case d := <-stream.deltas:
+		if d.Kind != "text" || d.Text != "hello" {
+			t.Fatalf("delta = %+v", d)
+		}
+	default:
+		t.Fatal("agent message delta not routed")
+	}
+}
+
 func TestInterruptStoppedClientIsNoop(t *testing.T) {
 	c := New("definitely-not-a-command", hook.New(""), nil, nil, nil, nil)
 	if err := c.Interrupt(context.Background(), "missing"); err != nil {

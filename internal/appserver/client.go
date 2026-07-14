@@ -41,6 +41,26 @@ type response struct {
 // TurnResult is delivered when app-server announces a terminal turn state.
 type TurnResult struct{ Status string }
 
+// Delta is ephemeral protocol output used for live preview. The rollout file
+// remains the canonical transcript.
+type Delta struct {
+	Kind string
+	Text string
+}
+
+type turnStream struct {
+	done   chan TurnResult
+	deltas chan Delta
+}
+
+// finish closes deltas before done, so a receiver of done may safely abandon
+// deltas. Unread tail deltas are superseded by the canonical transcript.
+func (s *turnStream) finish(r TurnResult) {
+	close(s.deltas)
+	s.done <- r
+	close(s.done)
+}
+
 type initState struct {
 	done     chan struct{}
 	err      error
@@ -58,7 +78,7 @@ type Client struct {
 	cmd      *exec.Cmd
 	in       io.WriteCloser
 	pending  map[string]chan response
-	turns    map[string]chan TurnResult
+	turns    map[string]*turnStream
 	active   map[string]struct{}
 	threads  map[string]string // thread id -> cwd
 	next     atomic.Uint64
@@ -73,7 +93,7 @@ func New(bin string, hooks *hook.Manager, sandbox, config map[string]any, env []
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Client{bin: bin, hooks: hooks, sandbox: cloneMap(sandbox), config: cloneMap(config), env: append([]string(nil), env...), logger: logger, pending: map[string]chan response{}, turns: map[string]chan TurnResult{}, active: map[string]struct{}{}, threads: map[string]string{}}
+	return &Client{bin: bin, hooks: hooks, sandbox: cloneMap(sandbox), config: cloneMap(config), env: append([]string(nil), env...), logger: logger, pending: map[string]chan response{}, turns: map[string]*turnStream{}, active: map[string]struct{}{}, threads: map[string]string{}}
 }
 
 func scrubEnv() []string {
@@ -251,6 +271,27 @@ func (c *Client) dispatch(m rpcMessage) {
 		}
 		return
 	}
+	if m.Method == "item/agentMessage/delta" || m.Method == "item/reasoning/summaryTextDelta" || m.Method == "item/reasoning/textDelta" {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Delta    string `json:"delta"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		kind := "text"
+		if m.Method != "item/agentMessage/delta" {
+			kind = "reasoning"
+		}
+		c.mu.Lock()
+		stream := c.turns[p.ThreadID]
+		if stream != nil && p.Delta != "" {
+			select {
+			case stream.deltas <- Delta{Kind: kind, Text: p.Delta}:
+			default: // preview may drop under backpressure; rollout truth-up repairs it
+			}
+		}
+		c.mu.Unlock()
+		return
+	}
 	if m.Method == "turn/completed" {
 		var p struct {
 			ThreadID string `json:"threadId"`
@@ -260,13 +301,12 @@ func (c *Client) dispatch(m rpcMessage) {
 		}
 		_ = json.Unmarshal(m.Params, &p)
 		c.mu.Lock()
-		ch := c.turns[p.ThreadID]
+		stream := c.turns[p.ThreadID]
 		delete(c.turns, p.ThreadID)
 		delete(c.active, p.ThreadID)
 		c.mu.Unlock()
-		if ch != nil {
-			ch <- TurnResult{Status: p.Turn.Status}
-			close(ch)
+		if stream != nil {
+			stream.finish(TurnResult{Status: p.Turn.Status})
 		}
 	}
 }
@@ -336,16 +376,15 @@ func (c *Client) failProcess(cmd *exec.Cmd, err error) {
 	pending := c.pending
 	turns := c.turns
 	c.pending = map[string]chan response{}
-	c.turns = map[string]chan TurnResult{}
+	c.turns = map[string]*turnStream{}
 	c.active = map[string]struct{}{}
 	c.threads = map[string]string{}
 	c.mu.Unlock()
 	for _, ch := range pending {
 		ch <- response{err: err}
 	}
-	for _, ch := range turns {
-		ch <- TurnResult{Status: "failed"}
-		close(ch)
+	for _, stream := range turns {
+		stream.finish(TurnResult{Status: "failed"})
 	}
 }
 func (c *Client) stopProcess(cmd *exec.Cmd, reason error) {
@@ -424,9 +463,9 @@ func (c *Client) StartThread(ctx context.Context, cwd, model string) (string, er
 	c.mu.Unlock()
 	return out.Thread.ID, nil
 }
-func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, error) {
+func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, <-chan Delta, error) {
 	if err := c.ensure(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c.mu.Lock()
 	_, ok := c.threads[id]
@@ -435,23 +474,23 @@ func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan 
 		params := c.threadParams(cwd, "")
 		params["threadId"] = id
 		if err := c.call(ctx, "thread/resume", params, nil); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		c.mu.Lock()
 		c.threads[id] = cwd
 		c.mu.Unlock()
 	}
-	ch := make(chan TurnResult, 1)
+	stream := &turnStream{done: make(chan TurnResult, 1), deltas: make(chan Delta, 256)}
 	c.mu.Lock()
-	c.turns[id] = ch
+	c.turns[id] = stream
 	c.mu.Unlock()
 	if err := c.call(ctx, "turn/start", map[string]any{"threadId": id, "input": []map[string]string{{"type": "text", "text": prompt}}}, nil); err != nil {
 		c.mu.Lock()
 		delete(c.turns, id)
 		c.mu.Unlock()
-		return nil, err
+		return nil, nil, err
 	}
-	return ch, nil
+	return stream.done, stream.deltas, nil
 }
 
 func (c *Client) ResumeThread(ctx context.Context, id, cwd string) error {
@@ -513,13 +552,12 @@ func (c *Client) LiveSessions() []string {
 func (c *Client) Kill(ctx context.Context, id string) error {
 	_ = c.Interrupt(ctx, id)
 	c.mu.Lock()
-	ch := c.turns[id]
+	stream := c.turns[id]
 	delete(c.threads, id)
 	delete(c.turns, id)
 	c.mu.Unlock()
-	if ch != nil {
-		ch <- TurnResult{Status: "interrupted"}
-		close(ch)
+	if stream != nil {
+		stream.finish(TurnResult{Status: "interrupted"})
 	}
 	return nil
 }

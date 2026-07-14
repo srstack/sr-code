@@ -51,12 +51,12 @@ func TestManagerLRUEvictsIdleWorkerAndColdResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turn, err := m.StartTurn(ctx, id, "one", "/tmp")
+	turn, _, err := m.StartTurn(ctx, id, "one", "/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-turn
-	turn, err = m.StartTurn(ctx, "resumed-thread", "two", "/tmp")
+	turn, _, err = m.StartTurn(ctx, "resumed-thread", "two", "/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}

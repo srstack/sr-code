@@ -691,7 +691,8 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
   // session flipping to running and subprocess.started being published).
   const beginTurn = () => {
     if (liveTurn) return; // already tracking a turn
-    ensureLiveTurn();
+    const lt = ensureLiveTurn();
+    if (lt) setRoleText(lt.node, 'thinking…');
     onRunning();
   };
 
@@ -734,6 +735,14 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
     'part': (d) => {
       if (!liveTurn) beginTurn();
       appendLivePart(d);
+    },
+    'part.delta': (d) => {
+      if (!liveTurn) beginTurn();
+      appendLiveDelta(d);
+    },
+    'turn.status': (d) => {
+      if (!liveTurn) beginTurn();
+      if (liveTurn && d && d.status === 'thinking') setRoleText(liveTurn.node, 'thinking…');
     },
     // The canonical user prompt hit the jsonl. Adopt our optimistic echo
     // (stamp the persisted ts, commit it). No echo means the prompt came
@@ -1018,8 +1027,35 @@ function ensureLiveTurn() {
   const node = appendChatMessage({ role: 'assistant', parts: [] });
   if (!node) return null;
   node.classList.add('optimistic');
-  liveTurn = { node, parts: [], ts: '' };
+  liveTurn = { node, parts: [], ts: '', preview: null, previewText: '', previewRAF: 0, acceptDeltas: true };
   return liveTurn;
+}
+
+// appendLiveDelta grows one ephemeral text block from protocol deltas. It is
+// deliberately not added to lt.parts: the complete JSONL-derived part remains
+// canonical and replaces this preview when it arrives.
+function appendLiveDelta(d) {
+  if (!d || !d.delta) return;
+  const lt = ensureLiveTurn();
+  if (!lt) return;
+  if (!lt.acceptDeltas) return;
+  const roleEl = lt.node.querySelector('.role');
+  if (roleEl && roleEl.firstChild) roleEl.firstChild.textContent = 'assistant';
+  if (!lt.preview) {
+    lt.preview = document.createElement('div');
+    lt.preview.className = 'content stream-preview';
+    lt.node.appendChild(lt.preview);
+  }
+  lt.previewText += d.delta;
+  if (lt.previewRAF) return;
+  lt.previewRAF = requestAnimationFrame(() => {
+    lt.previewRAF = 0;
+    if (!lt.preview) return;
+    lt.preview.dataset.raw = lt.previewText;
+    lt.preview.innerHTML = renderMarkdown(lt.previewText);
+    const chat = document.getElementById('chat-scroll');
+    if (chat && isNearBottom(chat)) chat.scrollTop = chat.scrollHeight;
+  });
 }
 
 // appendLivePart renders one streamed "part" SSE event into the live bubble,
@@ -1039,6 +1075,25 @@ function appendLivePart(d) {
   if (d.model) {
     const roleEl = lt.node.querySelector('.role');
     if (roleEl) roleEl.title = d.model;
+  }
+  const roleEl = lt.node.querySelector('.role');
+  if (roleEl && roleEl.firstChild) roleEl.firstChild.textContent = 'assistant';
+  if (p.type !== 'tool' && lt.preview) {
+    if (lt.previewRAF) cancelAnimationFrame(lt.previewRAF);
+    lt.previewRAF = 0;
+    lt.preview.classList.remove('stream-preview');
+    lt.preview.dataset.raw = p.content || '';
+    lt.preview.innerHTML = renderMarkdown(p.content || '');
+    lt.preview = null;
+    lt.previewText = '';
+    lt.acceptDeltas = false; // discard this item's protocol tail after JSONL lands
+    return;
+  }
+  if (p.type === 'tool') {
+    if (lt.preview) liveTurnDirty = true;
+    lt.acceptDeltas = true; // a later assistant item starts a new preview phase
+  } else {
+    lt.acceptDeltas = false;
   }
   const tmpl = document.createElement('template');
   tmpl.innerHTML = p.type === 'tool'
@@ -1060,6 +1115,7 @@ function appendLivePart(d) {
 // turn's timestamp), the next full fetch's reconcile replaces that one node
 // — promotion only has to be good enough to self-heal, not perfect.
 function finalizeTurn(id, d) {
+  if (liveTurn && liveTurn.preview) liveTurnDirty = true;
   if (liveTurnDirty) {
     liveTurnDirty = false;
     liveTurn = null; // loadTranscript removes the optimistic node

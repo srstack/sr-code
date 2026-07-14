@@ -614,7 +614,8 @@ func newStreamAssembler(backend string) streamAssembler {
 // isControlEvent reports whether a StreamEvent is a synthesized control signal
 // (not a backend log line) and so must not be fed to the assembler.
 func isControlEvent(t string) bool {
-	return t == "subprocess.started" || t == "subprocess.exit" || t == "error"
+	return t == "subprocess.started" || t == "subprocess.exit" || t == "error" ||
+		t == "part.delta" || t == "turn.status"
 }
 
 // lineTimestamp pulls the top-level "timestamp" from a log line (present on both

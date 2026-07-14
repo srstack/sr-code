@@ -22,13 +22,30 @@ type Result struct {
 	Subtype string
 }
 
+// Delta is ephemeral protocol output used for live preview. Session JSONL
+// remains the canonical transcript.
+type Delta struct{ Text string }
+
+type turnRequest struct {
+	done   chan Result
+	deltas chan Delta
+}
+
+// finish closes deltas before done, so a receiver of done may safely abandon
+// deltas. Unread tail deltas are superseded by the canonical transcript.
+func (r *turnRequest) finish(res Result) {
+	close(r.deltas)
+	r.done <- res
+	close(r.done)
+}
+
 type process struct {
 	id       string
 	cmd      *exec.Cmd
 	in       io.WriteCloser
 	cwd      string
 	mu       sync.Mutex
-	turns    []chan Result // nil entry represents a spontaneous turn
+	turns    []*turnRequest // nil entry represents a spontaneous turn
 	lastUsed time.Time
 	stopping bool
 	done     chan struct{}
@@ -80,7 +97,7 @@ func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool
 			return nil, false, fmt.Errorf("maximum live Claude sessions (%d) are all busy", m.maxLive)
 		}
 	}
-	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"}
+	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose"}
 	if resume {
 		args = append(args, "--resume", id)
 	} else {
@@ -141,15 +158,15 @@ func scrubEnv(hookSock string) []string {
 	return out
 }
 
-func (m *Manager) Send(ctx context.Context, id, prompt, cwd, model string, resume bool) (<-chan Result, bool, int, error) {
+func (m *Manager) Send(ctx context.Context, id, prompt, cwd, model string, resume bool) (<-chan Result, <-chan Delta, bool, int, error) {
 	p, fresh, err := m.ensure(ctx, id, cwd, model, resume)
 	if err != nil {
-		return nil, false, 0, err
+		return nil, nil, false, 0, err
 	}
-	ch := make(chan Result, 1)
+	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 256)}
 	p.mu.Lock()
 	queuedAhead := len(p.turns)
-	p.turns = append(p.turns, ch)
+	p.turns = append(p.turns, req)
 	p.lastUsed = time.Now()
 	p.mu.Unlock()
 	msg := map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": prompt}}}}
@@ -157,9 +174,9 @@ func (m *Manager) Send(ctx context.Context, id, prompt, cwd, model string, resum
 		p.mu.Lock()
 		p.turns = p.turns[:len(p.turns)-1]
 		p.mu.Unlock()
-		return nil, fresh, 0, err
+		return nil, nil, fresh, 0, err
 	}
-	return ch, fresh, queuedAhead, nil
+	return req.done, req.deltas, fresh, queuedAhead, nil
 }
 func write(p *process, v any) error {
 	b, err := json.Marshal(v)
@@ -183,29 +200,42 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 			Type    string `json:"type"`
 			Subtype string `json:"subtype"`
 			IsError bool   `json:"is_error"`
+			Event   struct {
+				Type  string `json:"type"`
+				Delta struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"delta"`
+			} `json:"event"`
 		}
 		if json.Unmarshal(s.Bytes(), &e) != nil {
 			continue
 		}
 		if e.Type != "result" {
 			p.mu.Lock()
-			if len(p.turns) == 0 && marksSpontaneousTurn(e.Type, e.Subtype) {
+			if len(p.turns) == 0 && marksSpontaneousTurn(e.Type, e.Subtype, e.Event.Type) {
 				p.turns = append(p.turns, nil)
+			}
+			if len(p.turns) > 0 && p.turns[0] != nil && e.Type == "stream_event" &&
+				e.Event.Type == "content_block_delta" && e.Event.Delta.Type == "text_delta" && e.Event.Delta.Text != "" {
+				select {
+				case p.turns[0].deltas <- Delta{Text: e.Event.Delta.Text}:
+				default: // preview may drop under backpressure; JSONL truth-up repairs it
+				}
 			}
 			p.mu.Unlock()
 			continue
 		}
 		p.mu.Lock()
-		var ch chan Result
+		var req *turnRequest
 		if len(p.turns) > 0 {
-			ch = p.turns[0]
+			req = p.turns[0]
 			p.turns = p.turns[1:]
 		}
 		p.lastUsed = time.Now()
 		p.mu.Unlock()
-		if ch != nil {
-			ch <- Result{IsError: e.IsError, Subtype: e.Subtype}
-			close(ch)
+		if req != nil {
+			req.finish(Result{IsError: e.IsError, Subtype: e.Subtype})
 		}
 	}
 	if err := s.Err(); err != nil {
@@ -216,12 +246,19 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 	}
 }
 
-func marksSpontaneousTurn(typ, subtype string) bool {
+func marksSpontaneousTurn(typ, subtype, eventType string) bool {
 	if typ == "control_response" || typ == "rate_limit_event" || typ == "command_lifecycle" {
 		return false
 	}
 	if typ == "system" {
 		return subtype == "task_started" || subtype == "turn_started"
+	}
+	if typ == "stream_event" {
+		// Under --include-partial-messages a spontaneous turn's first output
+		// is a stream_event, so mark on message_start (deltas alone must not
+		// create phantom turns). This only restores the pre-partial-messages
+		// window: a Send landing before the first output line still races.
+		return eventType == "message_start"
 	}
 	return typ == "assistant" || typ == "user"
 }
@@ -238,10 +275,9 @@ func (m *Manager) died(p *process, err error) {
 	wasStopping := p.stopping
 	p.stopping = true
 	p.mu.Unlock()
-	for _, ch := range turns {
-		if ch != nil {
-			ch <- Result{IsError: true, Subtype: "process_exited"}
-			close(ch)
+	for _, req := range turns {
+		if req != nil {
+			req.finish(Result{IsError: true, Subtype: "process_exited"})
 		}
 	}
 	if err != nil && !wasStopping {
