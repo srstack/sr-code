@@ -317,6 +317,18 @@ func TestAssemblerAppServerMCPToolCall(t *testing.T) {
 	}
 }
 
+func TestAssemblerProjectsContextCompacted(t *testing.T) {
+	a := NewAssembler()
+	a.Feed([]byte(`{"timestamp":"2026-07-14T14:51:25Z","type":"event_msg","payload":{"type":"agent_message","message":"before"}}`))
+	completed, _ := a.Feed([]byte(`{"timestamp":"2026-07-14T14:51:26Z","type":"event_msg","payload":{"type":"context_compacted"}}`))
+	if len(completed) != 2 || completed[0].Role != "assistant" || completed[1].Role != "system" {
+		t.Fatalf("context compacted completed = %+v", completed)
+	}
+	if completed[1].Content != "Context compacted" {
+		t.Fatalf("system content = %q", completed[1].Content)
+	}
+}
+
 func TestAssemblerCanonicalMCPItemAndLegacyDedup(t *testing.T) {
 	a := NewAssembler()
 	canonical := `{"timestamp":"2026-07-11T17:39:19Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"mcp_tool_call","id":"mcp-1","server":"usher","tool":"show_image","arguments":{"file_path":"/tmp/a.png"},"status":"completed","result":{"content":[{"type":"text","text":"{\"w\":10,\"h\":20}"}],"isError":false}}}}`

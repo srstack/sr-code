@@ -921,8 +921,7 @@ pre.raw-markdown {
   .session-cwd, .session-id { display: none; }
 }
 
-.chat-message { padding: 0.5rem 0.25rem; border-bottom: 1px dashed var(--border-muted); min-width: 0; }
-.chat-message:last-child { border-bottom: 0; }
+.chat-message { padding: 0.5rem 0.25rem; min-width: 0; }
 .chat-message .role {
   font-size: 0.72rem;
   text-transform: uppercase;
@@ -933,6 +932,25 @@ pre.raw-markdown {
 .chat-message.user .role { color: var(--accent); }
 .chat-message.agent .role { color: var(--purple); }
 .chat-message.error .role { color: var(--danger); }
+.chat-message.system.compaction {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.65rem 0.25rem;
+  border-bottom: 0;
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.chat-message.system.compaction::before,
+.chat-message.system.compaction::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border-muted);
+}
+.chat-message.system.compaction > span { white-space: nowrap; }
+.chat-message.system.compaction .ts { margin-left: 0.4rem; }
 /* Relay: a session's reply forwarded verbatim into the main chat. The role
    header links to the source session; the accent bar marks it as the
    session's voice rather than the router agent's. */

@@ -166,7 +166,10 @@ export function appendChatMessage(m) {
       : 'session';
   }
 
-  if (role === 'assistant' && m.parts) {
+  if (role === 'system' && m.content === 'Context compacted') {
+    div.classList.add('compaction');
+    div.innerHTML = `<span>${esc(m.content)}${ts}</span>`;
+  } else if (role === 'assistant' && m.parts) {
     // Grouped assistant turn: role header + structured parts. An EMPTY parts
     // array is the live-turn shell — header only; streamed parts append into
     // it (a flat .content div here would misrender the first tool part).

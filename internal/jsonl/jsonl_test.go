@@ -501,6 +501,22 @@ func TestAssemblerCompactsTaskNotification(t *testing.T) {
 	}
 }
 
+func TestAssemblerProjectsCompactBoundaryAndKeepsSummary(t *testing.T) {
+	a := NewAssembler()
+	a.FeedLine([]byte(`{"type":"assistant","timestamp":"2026-07-14T14:51:25Z","message":{"role":"assistant","content":[{"type":"text","text":"before"}]}}`))
+	completed, _ := a.FeedLine([]byte(`{"type":"system","subtype":"compact_boundary","timestamp":"2026-07-14T14:51:26Z","content":"Conversation compacted"}`))
+	if len(completed) != 2 || completed[0].Role != "assistant" || completed[1].Role != "system" {
+		t.Fatalf("compact boundary completed = %+v", completed)
+	}
+	if completed[1].Content != "Context compacted" {
+		t.Fatalf("system content = %q", completed[1].Content)
+	}
+	summary, _ := a.FeedLine([]byte(`{"type":"user","isCompactSummary":true,"timestamp":"2026-07-14T14:51:27Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}`))
+	if len(summary) != 1 || summary[0].Role != "user" || !strings.HasPrefix(summary[0].Content, "This session") {
+		t.Fatalf("compact summary = %+v", summary)
+	}
+}
+
 func TestReadSessionMetaUsesLatestClaudeContext(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "session.jsonl")
 	data := strings.Join([]string{

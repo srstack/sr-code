@@ -338,6 +338,15 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		return nil, nil
 	}
 	switch p.Type {
+	case "context_compacted":
+		if t := a.Flush(); t != nil {
+			completed = append(completed, *t)
+		}
+		return append(completed, jsonl.Turn{
+			Role:    "system",
+			Content: "Context compacted",
+			Time:    l.Timestamp,
+		}), nil
 	case "user_message":
 		// Real user prompt — flush any in-progress assistant turn, then commit.
 		if t := a.Flush(); t != nil {

@@ -229,11 +229,11 @@ type TurnPart struct {
 	toolUseID string // internal: matches isMeta follow-ups to their tool part
 }
 
-// Turn is a grouped, display-ready projection of one conversational exchange.
-// User turns carry Content; assistant turns carry Parts (text interleaved with
-// tool calls/results, in chronological order).
+// Turn is a grouped, display-ready timeline entry. User turns carry Content;
+// assistant turns carry Parts (text interleaved with tool calls/results), and
+// selected system lifecycle events are projected as lightweight system turns.
 type Turn struct {
-	Role    string     `json:"role"`              // "user" | "assistant"
+	Role    string     `json:"role"`              // "user" | "assistant" | "system"
 	Content string     `json:"content,omitempty"` // user turns only
 	Parts   []TurnPart `json:"parts,omitempty"`   // assistant turns only
 	Time    time.Time  `json:"ts"`
@@ -285,6 +285,16 @@ func NewAssembler() *Assembler {
 // publishes (it is a copy; later Feeds don't mutate it). Events that are not
 // user/assistant lines are ignored.
 func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
+	if ev.Type == "system" && ev.Subtype == "compact_boundary" {
+		if t := a.Flush(); t != nil {
+			completed = append(completed, *t)
+		}
+		return append(completed, Turn{
+			Role:    "system",
+			Content: "Context compacted",
+			Time:    ev.Timestamp,
+		}), nil
+	}
 	if ev.Type != "user" && ev.Type != "assistant" {
 		return nil, nil
 	}
