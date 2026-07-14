@@ -23,11 +23,12 @@ approve or deny tool-permission prompts — without being at the keyboard.
 - Route work from one main chat instead of switching tabs — quick slash commands
   by default, or plain language ("run the tests in the auth session and tell me
   what fails") once you enable the optional LLM agent ([Main chat](#main-chat)).
+- Open a lightweight tmux shell in a session's working directory.
 
 ## Install
 
 Needs at least one of the `claude` or `codex` CLIs you've already signed in
-to. On Windows, run usher inside
+to. The optional terminal requires `tmux`. On Windows, run usher inside
 [WSL](https://learn.microsoft.com/en-us/windows/wsl/install).
 
 ### One-line install (recommended)
@@ -95,7 +96,8 @@ most common:
 | `--projects-dir` | `~/.claude/projects` | Claude Code session dir; enables the Claude backend when present. |
 | `--codex-sessions-dir` | `~/.codex/sessions` | Codex session dir; enables the Codex backend when present. |
 | `--permission-mode` | `default` | Claude only. `default` uses the hook UI; `bypassPermissions` skips prompting. |
-| `--tmux-socket` | `usher` | Prefix for usher's tmux sockets: Claude on `<name>-claude`, Codex on `<name>-codex`. |
+| `--tmux-socket` | `usher` | Socket prefix for optional session terminals (`<name>-terminal`). |
+| `--terminal-shell` | `$SHELL` or `bash` | Shell executable used by session terminals. |
 | `--max-live-sessions` | `8` | Cap on live CLI processes; least-recently-used are evicted and re-spawned on the next send. |
 | `--agent-mode` | `rule` | Main-chat agent: `rule` or `llm` (see below). |
 
@@ -164,6 +166,9 @@ flowchart LR
 - **Permissions** flow through an inline Claude `PreToolUse` hook and Codex
   app-server approval requests. A request blocks until you decide in the UI;
   remembered rules and auto-approve work for both backends.
+- **Session terminals** provide one tmux shell per conversation, starting in its
+  cwd. Hiding the panel leaves the shell running; `exit` or session deletion
+  closes it.
 
 ## Roadmap
 

@@ -42,6 +42,7 @@ import (
 	"github.com/nexustar/usher/internal/pluginapi"
 	"github.com/nexustar/usher/internal/push"
 	"github.com/nexustar/usher/internal/router"
+	"github.com/nexustar/usher/internal/terminal"
 )
 
 //go:embed static
@@ -240,10 +241,13 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("DELETE /api/sessions/{id}/send", s.handleCancelSend)
 	webMux.HandleFunc("POST /api/sessions/{id}/pause", s.handlePauseSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
-	webMux.HandleFunc("GET /api/sessions/{id}/screen", s.handleScreen)
+	webMux.HandleFunc("POST /api/sessions/{id}/terminal", s.handleOpenTerminal)
+	webMux.HandleFunc("DELETE /api/sessions/{id}/terminal", s.handleCloseTerminal)
+	webMux.HandleFunc("POST /api/sessions/{id}/terminal/input", s.handleTerminalInput)
+	webMux.HandleFunc("GET /api/sessions/{id}/terminal/screen", s.handleTerminalScreen)
 	webMux.HandleFunc("GET /api/sessions/{id}/image", s.handleSessionImage)
 	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
-	webMux.HandleFunc("POST /api/sessions/{id}/keys", s.handleKeys)
+	webMux.HandleFunc("POST /api/sessions/{id}/terminal/control", s.handleTerminalControl)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
 	webMux.HandleFunc("POST /api/sessions/{id}/rename", s.handleRename)
 	webMux.HandleFunc("POST /api/sessions/{id}/archive", s.handleArchive)
@@ -483,9 +487,11 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // the state is process-local and shouldn't leak into the discovery model.
 type sessionDTO struct {
 	core.Session
-	AutoApprove bool `json:"auto_approve"`
-	Archived    bool `json:"archived"`
-	Pinned      bool `json:"pinned"`
+	AutoApprove       bool `json:"auto_approve"`
+	Archived          bool `json:"archived"`
+	Pinned            bool `json:"pinned"`
+	TerminalOpen      bool `json:"terminal_open,omitempty"`
+	TerminalAvailable bool `json:"terminal_available,omitempty"`
 }
 
 // handleListSessions returns root sessions by default. The sidebar opts into
@@ -587,10 +593,12 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sessionDTO{
-		Session:     sess,
-		AutoApprove: s.router.IsAutoApprove(id),
-		Archived:    s.router.IsArchived(id),
-		Pinned:      s.router.IsPinned(id),
+		Session:           sess,
+		AutoApprove:       s.router.IsAutoApprove(id),
+		Archived:          s.router.IsArchived(id),
+		Pinned:            s.router.IsPinned(id),
+		TerminalOpen:      s.router.HasTerminal(id),
+		TerminalAvailable: s.router.TerminalAvailable(),
 	})
 }
 
@@ -983,19 +991,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- terminal mirror -----------------------------------------------------
+// --- session terminal ----------------------------------------------------
 
 const (
-	screenPollInterval = 500 * time.Millisecond
-	screenHeartbeat    = 15 * time.Second
+	terminalPollInterval = 500 * time.Millisecond
+	terminalHeartbeat    = 15 * time.Second
 )
 
-// softKeys maps the terminal mirror's allow-listed key names to tmux send-keys
-// arguments. The mirror deliberately exposes only navigation/control keys, not
-// arbitrary typing — the chat send path already covers free text, and an
-// allow-list stops a client from injecting unexpected key sequences into the
-// pane. send-keys forwards what it's given verbatim, so the gate lives here.
-var softKeys = map[string]string{
+// terminalControls is the fixed set of keys accepted by the HTTP API.
+var terminalControls = map[string]string{
 	"up":     "Up",
 	"down":   "Down",
 	"left":   "Left",
@@ -1003,23 +1007,109 @@ var softKeys = map[string]string{
 	"enter":  "Enter",
 	"escape": "Escape",
 	"tab":    "Tab",
+	"ctrl-c": "C-c",
+	"ctrl-z": "C-z",
+	"ctrl-d": "C-d",
+	"ctrl-x": "C-x",
+	"ctrl-o": "C-o",
+	"ctrl-w": "C-w",
+	"ctrl-k": "C-k",
+	"ctrl-u": "C-u",
 }
 
-// handleScreen streams a session's live tmux pane as a periodically
-// re-captured snapshot — the raw TUI mirror behind the read-only terminal
-// view, distinct from /events (the jsonl-tailed message stream). Every
-// screenPollInterval we capture-pane and, when the frame changed, push it as a
-// `screen` event. When usher holds no live window we emit a single `nopane`
-// event (not repeated) so the client can prompt "start the session from chat"
-// without the stream spamming identical frames.
-func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
+func terminalErrStatus(err error) int {
+	switch {
+	case errors.Is(err, router.ErrSessionNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, terminal.ErrUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusConflict
+	}
+}
+
+type terminalOpenRequest struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
+}
+
+func (s *Server) handleOpenTerminal(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req terminalOpenRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+			return
+		}
+	}
+	if req.Cols == 0 {
+		req.Cols = 80
+	}
+	if req.Rows == 0 {
+		req.Rows = 24
+	}
+	req.Cols = clampInt(req.Cols, 60, 240)
+	req.Rows = clampInt(req.Rows, 4, 200)
+	if err := s.router.OpenTerminal(id, req.Cols, req.Rows); err != nil {
+		writeErr(w, terminalErrStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"open": true})
+}
+
+func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
+	if err := s.router.CloseTerminal(r.PathValue("id")); err != nil {
+		writeErr(w, terminalErrStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"open": false})
+}
+
+type terminalInputRequest struct {
+	Text      string `json:"text"`
+	RequestID string `json:"request_id"`
+}
+
+func (s *Server) handleTerminalInput(w http.ResponseWriter, r *http.Request) {
+	const maxTerminalInput = 64 << 10
+	r.Body = http.MaxBytesReader(w, r.Body, maxTerminalInput)
+	var req terminalInputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Text == "" {
+		writeErr(w, http.StatusBadRequest, "terminal input is empty")
+		return
+	}
+	if req.RequestID == "" || len(req.RequestID) > 128 {
+		writeErr(w, http.StatusBadRequest, "invalid terminal request_id")
+		return
+	}
+	if strings.IndexByte(req.Text, 0) >= 0 {
+		writeErr(w, http.StatusBadRequest, "terminal input contains NUL")
+		return
+	}
+	if err := s.router.SubmitTerminal(r.PathValue("id"), req.RequestID, req.Text); err != nil {
+		writeErr(w, terminalErrStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleTerminalScreen streams changed tmux snapshots over SSE.
+func (s *Server) handleTerminalScreen(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.router.GetSession(id); !ok {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	if s.router.IsHeadless(id) {
-		writeErr(w, http.StatusGone, router.ErrHeadless.Error())
+	if !s.router.TerminalAvailable() {
+		writeErr(w, http.StatusServiceUnavailable, "terminal unavailable: tmux is not installed")
+		return
+	}
+	if !s.router.HasTerminal(id) {
+		writeErr(w, http.StatusConflict, "terminal is not open")
 		return
 	}
 	flusher, ok := sseStart(w)
@@ -1028,11 +1118,8 @@ func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Size the pane to the viewer (cols + rows measured/derived client-side) so
-	// the mirror fills the panel without scroll; this also repairs any
-	// manual-attach drift. The client owns the policy (auto vs on, the fraction
-	// of the viewport); the server just clamps to wide defensive bounds so a bad
-	// client can't ask for an absurd size. Best-effort: an unowned session just
-	// errors and the first capture emits `nopane`.
+	// the screen fills the panel without wrapping. The server clamps to wide
+	// defensive bounds so a bad client cannot request an absurd canvas.
 	cols := 80
 	if v := r.URL.Query().Get("cols"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -1047,11 +1134,11 @@ func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
 	}
 	cols = clampInt(cols, 60, 240)
 	rows = clampInt(rows, 4, 200)
-	_ = s.router.ResizeCanvas(id, cols, rows)
+	_ = s.router.ResizeTerminal(id, cols, rows)
 
-	ticker := time.NewTicker(screenPollInterval)
+	ticker := time.NewTicker(terminalPollInterval)
 	defer ticker.Stop()
-	heartbeat := time.NewTicker(screenHeartbeat)
+	heartbeat := time.NewTicker(terminalHeartbeat)
 	defer heartbeat.Stop()
 
 	lastFrame := ""
@@ -1059,13 +1146,19 @@ func (s *Server) handleScreen(w http.ResponseWriter, r *http.Request) {
 	// emit captures one frame and writes it if it changed. Returns false only
 	// when the connection is gone (a write failed), to end the stream.
 	emit := func() bool {
-		screen, err := s.router.CaptureScreen(id)
+		screen, err := s.router.CaptureTerminal(id)
 		if err != nil {
+			// Only a confirmed-gone window means "closed"; a transient tmux
+			// failure just skips this frame so one hiccup doesn't flip the
+			// client's terminal off while the shell is still alive.
+			if !errors.Is(err, terminal.ErrNotOpen) {
+				return true
+			}
 			if lastErr {
 				return true // already told the client; don't repeat
 			}
 			lastErr, lastFrame = true, ""
-			if _, werr := fmt.Fprint(w, "event: nopane\ndata: {}\n\n"); werr != nil {
+			if _, werr := fmt.Fprint(w, "event: closed\ndata: {}\n\n"); werr != nil {
 				return false
 			}
 			flusher.Flush()
@@ -1114,30 +1207,24 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
-type keyRequest struct {
-	Key string `json:"key"`
+type terminalControlRequest struct {
+	Control string `json:"control"`
 }
 
-func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTerminalControl(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var req keyRequest
+	var req terminalControlRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	tmuxKey, ok := softKeys[req.Key]
+	tmuxKey, ok := terminalControls[req.Control]
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "unknown key")
+		writeErr(w, http.StatusBadRequest, "unknown terminal control")
 		return
 	}
-	if err := s.router.SendKeys(id, tmuxKey); err != nil {
-		if errors.Is(err, router.ErrHeadless) {
-			writeErr(w, http.StatusGone, err.Error())
-			return
-		}
-		// No live window to receive the key (or the session is the user's own,
-		// unowned). 409: the client shows the pane is not live.
-		writeErr(w, http.StatusConflict, err.Error())
+	if err := s.router.SendTerminalControl(id, tmuxKey); err != nil {
+		writeErr(w, terminalErrStatus(err), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

@@ -42,10 +42,12 @@ needed, vendor a popular, self-contained, minimal one.
 
 - **usher renders conversations; it does not browse the machine.** It may
   dereference references that appear in a transcript (e.g. images shown by a
-  tool), but it never offers filesystem navigation or interpretation. Decided
-  and out of scope — do not re-propose: file-read or directory-listing
-  endpoints, diff views, syntax highlighting, arbitrary send-keys or a
-  built-in shell, path linkification in prose, a native VSCode extension.
+  tool), but it never offers filesystem navigation or interpretation. The only
+  exception is one tmux shell per conversation, opened in its cwd and limited
+  to whole-text input plus fixed control keys. It is not a filesystem API or
+  security boundary. Still decided and out of scope:
+  file-read or directory-listing endpoints, diff views, syntax highlighting,
+  arbitrary send-keys, path linkification in prose, a native VSCode extension.
 - **The main-chat agent never answers substantive questions itself.** Its only
   local job is session management (list, route, focus, permission handling,
   create). Anything else — however trivial-looking — is forwarded to a

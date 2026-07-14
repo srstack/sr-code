@@ -1,10 +1,10 @@
 // usher SPA: detail view + main chat + new session.
 
 import {
-  esc, root, subtitle, closeES, closeScreenES, clearListInterval,
+  esc, root, subtitle, closeES, closeTerminalES, clearListInterval,
   currentDetailId, setCurrentDetailId, setCurrentDraftKey,
   setSuppressAppendScroll,
-  isNearBottom, markViewing, setCurrentES, currentScreenES,
+  isNearBottom, markViewing, setCurrentES,
   restoreDraft, clearDraft, growPrompt,
   registerRefreshSubtitle,
 } from './state.js';
@@ -13,7 +13,7 @@ import {
   forkBtnHTML, updateMessageTs,
   backendMark,
 } from './render.js';
-import { openScreenStream, openScreenInline, wireSoftKeys, measureCols } from './terminal.js';
+import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
 import { loadSidebar } from './sidebar.js';
 import { loadList } from './list.js';
 
@@ -235,12 +235,6 @@ export async function showNewSession(prefillCwd) {
 
 // ---------- Detail view ----------
 
-// termPrefMode reads the persisted screen-mirror mode (default auto), so the
-// toggle paints its real state on first render instead of flashing off→auto.
-function termPrefMode() {
-  try { return localStorage.getItem('usher.term.mode') || 'auto'; } catch { return 'auto'; }
-}
-
 export async function showDetail(id) {
   const epoch = ++detailEpoch;
   clearListInterval();
@@ -291,14 +285,30 @@ export async function showDetail(id) {
       <section class="send-anchor">
         <div id="term-panel" class="term-panel" hidden>
           <div class="term-screen"><pre id="term-grid" class="term-grid muted">connecting…</pre></div>
+          <div class="term-input-row">
+            <span class="term-prompt" aria-hidden="true">$</span>
+            <textarea id="term-input" rows="1" placeholder="command…" aria-label="terminal command"></textarea>
+            <button id="term-send" type="button">run</button>
+          </div>
           <div class="term-keys" id="term-keys">
-            <button type="button" data-key="escape">esc</button>
-            <button type="button" data-key="tab">tab</button>
-            <button type="button" data-key="up" aria-label="up">↑</button>
-            <button type="button" data-key="down" aria-label="down">↓</button>
-            <button type="button" data-key="left" aria-label="left">←</button>
-            <button type="button" data-key="right" aria-label="right">→</button>
-            <button type="button" data-key="enter">⏎</button>
+            <button type="button" id="term-ctrl-toggle" aria-expanded="false" title="show ctrl-key row">ctrl</button>
+            <button type="button" data-control="escape">esc</button>
+            <button type="button" data-control="tab">tab</button>
+            <button type="button" data-control="up" aria-label="up">↑</button>
+            <button type="button" data-control="down" aria-label="down">↓</button>
+            <button type="button" data-control="left" aria-label="left">←</button>
+            <button type="button" data-control="right" aria-label="right">→</button>
+            <button type="button" data-control="enter">⏎</button>
+          </div>
+          <div class="term-ctrl-menu" id="term-ctrl-menu" hidden>
+            <button type="button" data-control="ctrl-c">^C</button>
+            <button type="button" data-control="ctrl-z">^Z</button>
+            <button type="button" data-control="ctrl-d">^D</button>
+            <button type="button" data-control="ctrl-x">^X</button>
+            <button type="button" data-control="ctrl-o">^O</button>
+            <button type="button" data-control="ctrl-w">^W</button>
+            <button type="button" data-control="ctrl-k">^K</button>
+            <button type="button" data-control="ctrl-u">^U</button>
           </div>
         </div>
         <div class="composer">
@@ -314,9 +324,10 @@ export async function showDetail(id) {
                 title="ask: confirm each tool call · auto: run them automatically">
                 <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
               </button>
-              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${termPrefMode() === 'off' ? 'false' : 'true'}"
-                title="mirror of the live terminal — click to cycle off → auto → on">
-                <span class="t-icon">&gt;_</span><span class="t-full">screen:</span><span class="toggle-val">${termPrefMode()}</span>
+              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${sess.terminal_open ? 'mixed' : 'false'}"
+                ${sess.terminal_available ? '' : 'disabled'}
+                title="${sess.terminal_available ? 'show or hide this session’s shell — hiding keeps it running; type exit in the shell to end it' : 'terminal unavailable: tmux is not installed'}">
+                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">${sess.terminal_open ? 'bg' : 'off'}</span>
               </button>
             </div>
             <div class="composer-send">
@@ -361,81 +372,151 @@ export async function showDetail(id) {
     });
   }
 
-  // Terminal mirror: a collapsible live pane docked above the input, driven by
-  // a 3-state toggle that cycles off → auto → on (persisted in localStorage):
-  //   off  — hidden, no automatic behaviour
-  //   auto — (default) reveals on send (the un-flushed turn is starting) and hides
-  //          again after a deliberate scroll up into history; re-reveals next send
-  //   on   — pinned open, never auto-hidden
-  // The /screen stream runs only while actually shown, so background sessions
-  // don't poll capture-pane. Soft keys wire once (the grid node is permanent).
+  // Terminal states: off, on, or bg (shell alive with the panel hidden).
   const termToggle = document.getElementById('term-toggle');
   const termPanel = document.getElementById('term-panel');
-  let termMode = termPrefMode();
-  let termShown = false;        // whether the docked panel is currently streaming/visible
-  let termAppliedRows = 0;      // rows last applied — gates needless restreams
-  let softKeysWired = false;
+  const termInput = document.getElementById('term-input');
+  const termSend = document.getElementById('term-send');
+  let shellAlive = !!sess.terminal_open;
+  let panelShown = false;
+  let termStream = null;
+  let terminalControlsWired = false;
   const TERM_ROW_PX = 16.25; // .term-grid 13px × line-height 1.25 (keep in sync with CSS)
-  // on fills half the chat area, bounded so the input/controls below stay
-  // visible. The pane and the viewer box are both sized from this one number.
-  const onRows = () => {
-    const chatH = chatEl.clientHeight;
-    const roomRows = Math.floor((chatH - 6 * 16) / TERM_ROW_PX); // leave ~6rem for input
-    const halfRows = Math.floor((chatH / 2) / TERM_ROW_PX);
-    return Math.max(1, Math.min(halfRows, roomRows));
+  // The screen takes a little under half the chat viewport; the command and
+  // key rows bring the complete terminal panel to roughly half-height.
+  const onRows = () => Math.max(4, Math.floor(chatEl.clientHeight * 0.38 / TERM_ROW_PX));
+  const paintTermToggle = () => {
+    if (!termToggle) return;
+    const state = panelShown ? 'on' : (shellAlive ? 'bg' : 'off');
+    termToggle.setAttribute('aria-pressed', state === 'on' ? 'true' : (state === 'bg' ? 'mixed' : 'false'));
+    termToggle.querySelector('.toggle-val').textContent = state;
   };
-  // applyTermVisibility drives the docked panel, which now serves on only —
-  // auto's mirror is the inline preview piped into the live turn bubble during
-  // a turn, not this panel. The /screen restream re-applies pane size, so it's
-  // skipped when the row count hasn't changed.
-  const applyTermVisibility = () => {
-    if (termMode !== 'on') {
-      if (termShown) { termShown = false; if (termPanel) termPanel.hidden = true; closeScreenES(); }
+  const renderTerminal = () => {
+    paintTermToggle();
+    if (!panelShown) {
+      if (termPanel) termPanel.hidden = true;
+      termStream = null;
+      closeTerminalES();
       return;
     }
     const rows = onRows();
-    if (termShown && rows === termAppliedRows) return; // already shown at this size
-    termShown = true;
-    termAppliedRows = rows;
     if (termPanel) termPanel.hidden = false;
-    if (!softKeysWired) { wireSoftKeys(id); softKeysWired = true; }
+    if (!terminalControlsWired) {
+      wireTerminalControls(id);
+      // Close the ctrl-key menu after a selection or outside click.
+      const ctrlToggle = document.getElementById('term-ctrl-toggle');
+      const ctrlMenu = document.getElementById('term-ctrl-menu');
+      if (ctrlToggle && ctrlMenu) {
+        const closeMenu = () => {
+          ctrlMenu.hidden = true;
+          ctrlToggle.setAttribute('aria-expanded', 'false');
+          document.removeEventListener('click', onDocClick);
+        };
+        const onDocClick = (e) => {
+          if (!ctrlMenu.contains(e.target) && !ctrlToggle.contains(e.target)) closeMenu();
+        };
+        ctrlToggle.addEventListener('click', () => {
+          if (!ctrlMenu.hidden) { closeMenu(); return; }
+          ctrlMenu.hidden = false;
+          ctrlToggle.setAttribute('aria-expanded', 'true');
+          document.addEventListener('click', onDocClick);
+        });
+        ctrlMenu.addEventListener('click', (e) => {
+          if (e.target.closest('button[data-control]')) closeMenu();
+        });
+      }
+      terminalControlsWired = true;
+    }
     const gridEl = document.getElementById('term-grid');
     if (gridEl) {
       const box = gridEl.parentElement;
-      // content-box: max-height is the content area, so rows×ROW_PX shows exactly
-      // `rows` lines (+a few px slack to avoid a sub-pixel scrollbar).
-      box.style.maxHeight = Math.ceil(rows * TERM_ROW_PX) + 4 + 'px';
-      // on shows the whole pane (dropTail 0) plus the soft keys — it's the
-      // interactive view for debugging / driving /rewind.
-      openScreenStream(id, gridEl, measureCols(box), rows, 0);
+      // A few pixels of slack avoid a rounding scrollbar.
+      box.style.height = Math.ceil(rows * TERM_ROW_PX) + 4 + 'px';
+      const stream = openTerminalScreen(id, gridEl, measureCols(box), rows, () => {
+        // Leave the closed message visible until the panel is collapsed.
+        if (termStream !== stream) return;
+        shellAlive = false;
+        termStream = null;
+        paintTermToggle();
+        closeTerminalES();
+      });
+      termStream = stream;
     }
-    // The panel grows the sticky anchor; keep the chat pinned if it was.
     if (isNearBottom(chatEl)) chatEl.scrollTop = chatEl.scrollHeight;
   };
-  // evStream exposes syncInline so a mode toggle can start/stop auto's inline
-  // preview against the in-flight turn (assigned once openEventStream runs below).
-  let evStream = null;
-  // applyTermMode reflects termMode onto the button, resolves the docked panel,
-  // then reconciles auto's inline preview with the new mode.
-  const applyTermMode = () => {
-    if (termToggle) {
-      termToggle.setAttribute('data-mode', termMode);
-      termToggle.setAttribute('aria-pressed', termMode === 'off' ? 'false' : 'true');
-      termToggle.querySelector('.toggle-val').textContent = termMode;
-    }
-    applyTermVisibility();
-    if (evStream) evStream.syncInline();
-  };
   if (termToggle && termPanel) {
-    termToggle.addEventListener('click', () => {
-      // off → auto → on → off. off: no mirror. auto: live output streams into
-      // the live turn bubble during a turn (no docked panel). on: docked,
-      // interactive panel. The mode is a persisted preference.
-      termMode = termMode === 'off' ? 'auto' : termMode === 'auto' ? 'on' : 'off';
-      try { localStorage.setItem('usher.term.mode', termMode); } catch { /* private mode */ }
-      applyTermMode();
+    termToggle.addEventListener('click', async () => {
+      if (panelShown) {
+        // Hide only — the shell keeps running (label flips to bg).
+        panelShown = false;
+        renderTerminal();
+        return;
+      }
+      termToggle.disabled = true;
+      try {
+        // Reveal before measuring its width.
+        termPanel.hidden = false;
+        const box = document.getElementById('term-grid').parentElement;
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/terminal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cols: measureCols(box), rows: onRows() }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || ('HTTP ' + res.status));
+        }
+        shellAlive = true;
+        panelShown = true;
+      } catch (e) {
+        appendChatMessage({ role: 'error', content: 'terminal: ' + String(e.message || e), ts: new Date().toISOString() });
+      } finally {
+        termToggle.disabled = !sess.terminal_available;
+        renderTerminal();
+      }
     });
-    applyTermMode(); // honour the persisted mode on open ('on' reveals the panel)
+  }
+  if (termInput && termSend) {
+    let terminalRequestID = null;
+    const submitTerminal = async () => {
+      const text = termInput.value;
+      if (!text || termSend.disabled || !shellAlive) return;
+      termSend.disabled = true;
+      termInput.disabled = true;
+      try {
+        terminalRequestID = terminalRequestID || (globalThis.crypto && globalThis.crypto.randomUUID
+          ? globalThis.crypto.randomUUID()
+          : Date.now() + '-' + Math.random().toString(16).slice(2));
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/terminal/input', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            request_id: terminalRequestID,
+          }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || ('HTTP ' + res.status));
+        }
+        termInput.value = '';
+        terminalRequestID = null;
+      } catch (e) {
+        appendChatMessage({ role: 'error', content: 'terminal input: ' + String(e.message || e), ts: new Date().toISOString() });
+      } finally {
+        termSend.disabled = false;
+        termInput.disabled = false;
+        termInput.focus();
+      }
+    };
+    termSend.addEventListener('click', submitTerminal);
+    termInput.addEventListener('input', () => { terminalRequestID = null; });
+    termInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        submitTerminal();
+      }
+    });
   }
 
   cancelBtn.addEventListener('click', async () => {
@@ -483,7 +564,7 @@ export async function showDetail(id) {
     });
   }
 
-  evStream = openEventStream(id, chatEl, sendBtn, cancelBtn, () => termMode);
+  openEventStream(id, chatEl, sendBtn, cancelBtn);
 
   const submit = async () => {
     const text = promptEl.value;
@@ -551,45 +632,11 @@ function openSubagentEventStream(id) {
 // adopts our optimistic echo as the canonical user turn; subprocess.exit
 // promotes the live bubble in place (full fetch only when the turn is
 // dirty — see finalizeTurn). Turn errors surface via the 'error' event.
-function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
+function openEventStream(id, chatEl, sendBtn, cancelBtn) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   setCurrentES(es);
 
   let opened = false;
-  // auto mode: while a turn is live, mirror the pane into a dedicated node at
-  // the bottom of the live bubble, below the streamed parts. It runs the
-  // WHOLE turn — covering every gap incl. tool execution — and is removed at
-  // turn end. Streamed parts insert above it independently, so there's no
-  // handoff and no contention over one element. Tear down only our own feed:
-  // if the user switched to on mid-turn, the docked panel took over
-  // currentScreenES.
-  let inlineES = null;
-  let inlineNode = null;
-  const stopInlineMirror = () => {
-    if (inlineES) {
-      if (inlineES === currentScreenES) closeScreenES();
-      inlineES = null;
-    }
-    if (inlineNode) { inlineNode.remove(); inlineNode = null; }
-  };
-  // syncInline reconciles the mirror with mode + turn state: it runs in auto
-  // whenever a turn is live (live bubble present), torn down otherwise. Called
-  // on turn start AND on every mode toggle, so switching to auto mid-turn
-  // brings the live view back (e.g. on -> auto, where the docked panel just
-  // closed). The node docks at the bottom of the live bubble; appendLivePart
-  // inserts streamed parts above it.
-  const syncInline = () => {
-    if (getTermMode && getTermMode() === 'auto' && liveTurn) {
-      if (!inlineES) {
-        inlineNode = document.createElement('pre');
-        inlineNode.className = 'term-inline';
-        liveTurn.node.appendChild(inlineNode);
-        inlineES = openScreenInline(id, inlineNode, chatEl);
-      }
-    } else {
-      stopInlineMirror();
-    }
-  };
   // On reconnect (not the first connect) re-fetch to fill any gap. Mid-turn
   // the live stream owns the bubble, so just mark the turn dirty — events
   // during the outage are gone (the broker has no replay) and the turn-end
@@ -618,7 +665,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
     if (cancelBtn) cancelBtn.hidden = false;
     setLoadEarlierDisabled(true);
   };
-  // beginTurn stands up the live bubble + running-state UI + auto preview for
+  // beginTurn stands up the live bubble + running-state UI for
   // a turn. It's the single idempotent entry point for every way a turn
   // surfaces: subprocess.started (live), turn.active (server snapshot on a
   // mid-turn connect), and the lazy first-part fallback. The guard makes it
@@ -627,7 +674,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
   const beginTurn = () => {
     if (liveTurn) return; // already tracking a turn
     ensureLiveTurn();
-    syncInline();
     onRunning();
   };
 
@@ -656,7 +702,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
     // (detailStreaming already false).
     'turn.idle': () => {
       if (!detailStreaming) return;
-      stopInlineMirror();
       liveTurn = null;
       liveTurnDirty = false; // the full fetch below reconciles everything
       onIdle();
@@ -666,7 +711,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
     // One server-grouped TurnPart (assistant text or a rendered tool result)
     // appended to the in-progress turn. subprocess.started / turn.active
     // normally create the bubble, but if both were missed stand it up now —
-    // via beginTurn so the auto preview is wired too, not just a bubble.
+    // via beginTurn so running-state UI is wired too, not just a bubble.
     'part': (d) => {
       if (!liveTurn) beginTurn();
       appendLivePart(d);
@@ -698,7 +743,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
       liveTurnDirty = true;
     },
     'subprocess.exit': (d) => {
-      stopInlineMirror();
       // Failed/unconfirmed exits follow an explicit error event. Keep that
       // error bubble visible instead of reconciling it away as a successful turn.
       if (d && d.reason && d.reason !== 'local_command') {
@@ -715,7 +759,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
       refreshSubtitle(id);
     },
     'error': (d) => {
-      stopInlineMirror();
       const msg = d.message || JSON.stringify(d);
       if (liveTurn) {
         updateMessageTs(liveTurn.node, new Date().toISOString());
@@ -756,7 +799,6 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn, getTermMode) {
   });
 
   es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
-  return { syncInline };
 }
 
 // ---------- Main chat view ----------
@@ -981,9 +1023,7 @@ function appendLivePart(d) {
   tmpl.innerHTML = p.type === 'tool'
     ? renderToolPart(p)
     : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
-  // The auto-mode inline mirror docks at the bottom of the bubble; parts stay
-  // above it. insertBefore(_, null) is plain append when there's no mirror.
-  lt.node.insertBefore(tmpl.content, lt.node.querySelector(':scope > .term-inline'));
+  lt.node.appendChild(tmpl.content);
   if (stick && chat) chat.scrollTop = chat.scrollHeight;
 }
 

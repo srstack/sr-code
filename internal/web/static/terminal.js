@@ -1,14 +1,7 @@
-// usher SPA: terminal mirror (read-only).
-//
-// A1 escape hatch: an inline, collapsible panel above the chat input that
-// mirrors the session's live tmux pane (claude's TUI) as a periodically
-// re-captured frame over SSE, plus a row of soft keys so the user can drive
-// menus the curated send path can't reach (arrow navigation, esc, ctrl-c).
-// Read-only otherwise — no arbitrary typing; that's what chat is for.
+// usher SPA: session terminal.
 
 import {
-  closeScreenES, setCurrentScreenES,
-  TERM_FURNITURE_ROWS, TERM_AUTO_ROWS, isNearBottom,
+  closeTerminalES, setCurrentTerminalES,
 } from './state.js';
 
 // Base 16-colour ANSI palette (30-37 normal, 90-97 bright), toned to read on
@@ -29,18 +22,15 @@ function color256(n) {
   return `rgb(${c(r)},${c(g)},${c(b)})`;
 }
 
-// openScreenFeed is the shared /screen subscription: it invokes onFrame(text)
-// for each changed (deduped) capture and onNopane when usher holds no live
-// window. Tracked in currentScreenES so a new open or closeScreenES() tears it
-// down. Both the docked mirror (on) and the inline auto preview build on it.
-export function openScreenFeed(id, cols, rows, onFrame, onNopane) {
-  closeScreenES();
+// Subscribe to changed screen snapshots and shell closure.
+export function openTerminalFeed(id, cols, rows, onFrame, onClosed) {
+  closeTerminalES();
   const params = [];
   if (cols) params.push('cols=' + cols);
   if (rows) params.push('rows=' + rows);
   const q = params.length ? ('?' + params.join('&')) : '';
-  const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/screen' + q);
-  setCurrentScreenES(es);
+  const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/terminal/screen' + q);
+  setCurrentTerminalES(es);
   let lastRaw = null;
   es.addEventListener('screen', (ev) => {
     if (ev.data == null) return;
@@ -50,51 +40,35 @@ export function openScreenFeed(id, cols, rows, onFrame, onNopane) {
     lastRaw = s;
     onFrame(s);
   });
-  if (onNopane) es.addEventListener('nopane', () => { lastRaw = null; onNopane(); });
+  if (onClosed) es.addEventListener('closed', () => { lastRaw = null; onClosed(); });
   es.onerror = () => {/* SSE auto-reconnects; no user-visible noise */};
   return es;
 }
 
-// openScreenStream drives the docked on-mode panel: it mirrors the whole pane
-// (keys + furniture) into screenEl, pinning to the bottom unless the reader has
-// scrolled up.
-export function openScreenStream(id, screenEl, cols, rows, dropTail) {
-  openScreenFeed(id, cols, rows, (s) => {
+// Render the shell pane, following output while already near the bottom.
+export function openTerminalScreen(id, screenEl, cols, rows, onClosed) {
+  return openTerminalFeed(id, cols, rows, (s) => {
     const wrap = screenEl.parentElement;
     const atBottom = wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40) : true;
     screenEl.classList.remove('muted');
-    screenEl.innerHTML = ansiToHtml(trimMirrorFrame(s, dropTail));
+    screenEl.innerHTML = ansiToHtml(trimTerminalFrame(s));
     if (atBottom && wrap) wrap.scrollTop = wrap.scrollHeight;
   }, () => {
     screenEl.classList.add('muted');
-    screenEl.textContent =
-      'no live process for this session — open chat and send a message to start one.';
+    screenEl.textContent = 'terminal closed.';
+    if (onClosed) onClosed();
   });
 }
 
-// openScreenInline (auto mode) streams the live pane into a dedicated <pre> node
-// sitting below the assistant message text for the duration of the turn — a live
-// peek at the terminal alongside the (possibly still-empty) jsonl text. Read-only
-// — furniture rows trimmed, no keys.
-export function openScreenInline(id, node, chatEl) {
-  return openScreenFeed(id, measureCols(node), TERM_AUTO_ROWS, (s) => {
-    const stick = isNearBottom(chatEl);
-    node.innerHTML = ansiToHtml(trimMirrorFrame(s, TERM_FURNITURE_ROWS));
-    if (stick && chatEl) chatEl.scrollTop = chatEl.scrollHeight;
-  });
-}
-
-// wireSoftKeys POSTs the tapped key to /keys. The server allow-lists key names;
-// the screen stream reflects the result, so we don't render an ack — only a
-// brief red flash if the key was rejected (e.g. the pane went away).
-export function wireSoftKeys(id) {
-  document.querySelectorAll('.term-keys button[data-key]').forEach((btn) => {
+// Post the fixed control keys exposed by the panel.
+export function wireTerminalControls(id) {
+  document.querySelectorAll('#term-panel button[data-control]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       try {
-        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/keys', {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/terminal/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key: btn.dataset.key }),
+          body: JSON.stringify({ control: btn.dataset.control }),
         });
         if (!res.ok) {
           btn.classList.add('term-key-err');
@@ -105,10 +79,7 @@ export function wireSoftKeys(id) {
   });
 }
 
-// measureCols turns the screen box's available width into terminal columns, so
-// the tmux pane can be sized to fit the viewer (measured once, on expand). A
-// hidden ruler in the grid's font gives an accurate per-char width; the server
-// clamps the result to a sane range.
+// Measure terminal columns with a hidden monospace ruler.
 export function measureCols(boxEl) {
   const ruler = document.createElement('span');
   ruler.textContent = '0'.repeat(100);
@@ -125,18 +96,14 @@ export function measureCols(boxEl) {
   return cols > 0 ? cols : 80;
 }
 
-// trimMirrorFrame cleans a capture-pane frame for the read-only mirror: it drops
-// the trailing blank pad, then the bottom `dropTail` rows — the input box + hint
-// line, which are furniture, not output (auto hides them; on passes 0 to keep
-// them for debugging / rewind). Blankness is tested after stripping SGR escapes
-// so a colour-only-but-empty line still counts.
-export function trimMirrorFrame(s, dropTail) {
+// trimTerminalFrame drops tmux's trailing blank pad.
+export function trimTerminalFrame(s) {
   const lines = String(s).split('\n');
   while (lines.length &&
          lines[lines.length - 1].replace(/\x1b\[[0-9;]*m/g, '').trim() === '') {
     lines.pop();
   }
-  return (dropTail ? lines.slice(0, -dropTail) : lines).join('\n');
+  return lines.join('\n');
 }
 
 // ansiToHtml converts a `capture-pane -e` frame (plain text + SGR colour

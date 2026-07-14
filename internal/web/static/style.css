@@ -1084,7 +1084,7 @@ pre.raw-markdown {
 }
 /* Secondary controls — ghost style (no border/fill) so they recede beside the
  * accent send button. State shows via text color: muted off, amber when
- * auto-approve is armed, accent for the terminal mirror. */
+ * auto-approve is armed, accent for an open terminal. */
 .auto-approve-toggle,
 .term-toggle,
 .upload-btn {
@@ -1104,34 +1104,36 @@ pre.raw-markdown {
 .term-toggle:hover,
 .upload-btn:hover { background: var(--bg-subtle); }
 .auto-approve-toggle:disabled,
+.term-toggle:disabled,
 .upload-btn:disabled { opacity: 0.6; cursor: progress; }
 .upload-btn { color: var(--text); }
 .auto-approve-toggle[aria-pressed="true"] { color: var(--warning-text); }
-.term-toggle[aria-pressed="true"] { color: var(--accent); }
+/* Accent while the shell is open, including background state. */
+.term-toggle[aria-pressed="true"],
+.term-toggle[aria-pressed="mixed"] { color: var(--accent); }
 /* Glyph shows at every width; the full word (.t-full) is a desktop bonus,
  * dropped on phones. Always-on glyph = no breakpoint toggle, no cascade trap. */
 @media (max-width: 720px) { .t-full { display: none; } }
 
-/* ----- Terminal mirror (read-only, inline above the input) ------------- */
+/* ----- Session shell terminal ------------------------------------------ */
 .term-panel {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
   margin-bottom: 0.5rem;
+  position: relative;  /* anchor for the ctrl-chord popover */
 }
 /* The class's display:flex outranks the UA's [hidden]{display:none}, so the
  * panel won't collapse without this — restore hiding when toggled off. */
 .term-panel[hidden] { display: none; }
-/* Scroll box (the dark terminal surface): a plain block with overflow so the
- * grid scrolls both ways; JS pins to bottom. max-height here is only a fallback
- * — app.js sets it from the mode's row count (see applyTermVisibility). */
+/* detail.js replaces this fallback height with the measured row count. */
 .term-screen {
-  max-height: 11rem;
+  height: 11rem;
   overflow: auto;
   padding: 0.4rem 0.6rem;
   background: #0d1117;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
 }
 .term-grid {
   /* The pane is sized to the viewer's width on expand, so normal lines fill
@@ -1146,33 +1148,48 @@ pre.raw-markdown {
   line-height: 1.25;
   color: #c9d1d9;
 }
-/* Status messages ("connecting…", "no live process…") wrap within the box and
+/* Status messages ("connecting…", "terminal closed") wrap within the box and
  * use the page's muted colour instead of the terminal palette. */
 .term-grid.muted { color: var(--text-faint); white-space: pre-wrap; width: auto; max-width: 100%; }
-/* auto inline preview: a live peek at the terminal, rendered in its own node
- * below the assistant message text for the duration of the turn (removed at
- * turn end). Dark terminal ground sets it off from the prose above.
- * overflow-y is pinned hidden: the node auto-heights to its lines, so the only
- * vertical "overflow" is sub-pixel line-height rounding — without this, the
- * overflow-x:auto coupling turns that into a spurious scrollbar (a ~half-row). */
-.term-inline {
-  margin: 0.4rem 0 0;
-  padding: 0.4rem 0.5rem;
-  border-radius: 6px;
-  background: #0d1117;
-  overflow-x: auto;
-  overflow-y: hidden;
-  white-space: pre;
-  font-family: var(--term-font);
-  font-size: 13px;
-  line-height: 1.25;
-  color: #c9d1d9;
-}
 .term-keys {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);  /* one row; columns shrink to fit narrow phones */
+  grid-template-columns: repeat(8, 1fr);  /* one row; columns shrink to fit narrow phones */
   gap: 0.4rem;
+  margin-top: 0.4rem;
 }
+#term-ctrl-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* Overlay the ctrl-key menu so it does not reflow the terminal. */
+.term-ctrl-menu {
+  position: absolute;
+  left: 0;
+  bottom: 2.6rem;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  max-height: 60vh;   /* short viewports (landscape phone): scroll, don't clip */
+  overflow-y: auto;
+  padding: 0.25rem;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px var(--shadow-modal);
+}
+.term-ctrl-menu[hidden] { display: none; }
+.term-ctrl-menu button {
+  padding: 0.35rem 0.9rem;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font-family: var(--term-font);
+  font-size: 16px;
+  text-align: left;
+  cursor: pointer;
+}
+.term-ctrl-menu button:hover { background: var(--bg-subtle); }
 .term-keys button {
   min-width: 0;          /* let the grid column shrink below content width */
   min-height: 2rem;      /* finger-friendly tap target */
@@ -1186,7 +1203,54 @@ pre.raw-markdown {
 }
 .term-keys button:hover { background: var(--bg-subtle); }
 .term-keys button:active { background: var(--bg-hover); }
-.term-keys button.term-key-err { background: var(--danger); border-color: var(--danger); color: #fff; }
+.term-keys button.term-key-err,
+.term-ctrl-menu button.term-key-err { background: var(--danger); border-color: var(--danger); color: #fff; }
+/* Command line joined to the terminal screen. */
+.term-input-row {
+  box-sizing: border-box;
+  width: 100%;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.25rem 0.4rem 0.25rem 0.6rem;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-top: 1px solid #21262d;  /* faint internal seam below the screen */
+  border-radius: 0 0 6px 6px;
+}
+.term-prompt {
+  font-family: var(--term-font);
+  font-size: 16px;
+  color: #7ee787;
+  user-select: none;
+}
+.term-input-row textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  font-family: var(--term-font);
+  font-size: 16px;
+  line-height: 1.35;
+  padding: 0.3rem 0;
+  border: none;
+  background: transparent;
+  color: #c9d1d9;
+}
+.term-input-row textarea:focus { outline: none; }
+.term-input-row textarea::placeholder { color: #6e7681; }
+.term-input-row button {
+  align-self: center;
+  padding: 0.2rem 0.6rem;
+  min-width: 3.5rem;
+  font-size: 16px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: transparent;
+  color: #c9d1d9;
+  cursor: pointer;
+}
+.term-input-row button:hover { background: #161b22; }
+.term-input-row button:disabled { opacity: 0.6; cursor: progress; }
 
 .composer-send button.cancel {
   border-color: var(--danger);

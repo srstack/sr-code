@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"compress/gzip"
 	"io"
 	"net/http"
@@ -10,6 +11,44 @@ import (
 	"testing"
 	"time"
 )
+
+func TestTerminalControlsAreAllowListed(t *testing.T) {
+	want := map[string]string{
+		"up": "Up", "down": "Down", "left": "Left", "right": "Right",
+		"enter": "Enter", "escape": "Escape", "tab": "Tab",
+		"ctrl-c": "C-c", "ctrl-z": "C-z", "ctrl-d": "C-d", "ctrl-x": "C-x",
+		"ctrl-o": "C-o", "ctrl-w": "C-w", "ctrl-k": "C-k", "ctrl-u": "C-u",
+	}
+	if len(terminalControls) != len(want) {
+		t.Fatalf("terminalControls has %d entries, want %d", len(terminalControls), len(want))
+	}
+	for name, key := range want {
+		if terminalControls[name] != key {
+			t.Errorf("terminalControls[%q] = %q, want %q", name, terminalControls[name], key)
+		}
+	}
+}
+
+func TestTerminalInputValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty text", `{"request_id":"r1"}`},
+		{"missing request id", `{"text":"pwd"}`},
+		{"nul", `{"text":"a\u0000b","request_id":"r1"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/terminal/input", bytes.NewBufferString(tt.body))
+			(&Server{}).handleTerminalInput(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
 
 func TestFocusSwitchBanner(t *testing.T) {
 	full := "0af0c1d2-3e4f-5678-9abc-def012345678"

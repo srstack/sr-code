@@ -13,7 +13,7 @@ import (
 //
 // SSE is unaffected by construction: text/event-stream is not in the
 // compressible set, and the wrapper forwards Flush, so the /events and
-// /screen handlers behave exactly as they do unwrapped. Range requests
+// terminal screen handlers behave as they do unwrapped. Range requests
 // bypass compression entirely (a gzipped 206 would corrupt the byte math).
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -28,12 +28,12 @@ import (
 	"github.com/nexustar/usher/internal/jsonl"
 	"github.com/nexustar/usher/internal/sender"
 	"github.com/nexustar/usher/internal/sessionmeta"
+	"github.com/nexustar/usher/internal/terminal"
 )
 
 // ErrSessionNotFound is returned when an operation targets a session with no
 // log on disk (so its path/backend can't be resolved).
 var ErrSessionNotFound = errors.New("session not found")
-var ErrHeadless = sender.ErrHeadless
 
 type Router struct {
 	discovery *discovery.Discovery
@@ -46,6 +46,7 @@ type Router struct {
 	broker         *broker.Broker
 	hooks          *hook.Manager
 	meta           *sessionmeta.Store
+	terminal       *terminal.Manager
 
 	sendMu     sync.Mutex
 	activeSend map[string]*sendToken    // sessionID -> in-flight turn's cancel handle
@@ -99,7 +100,7 @@ const maxQueuedSends = 32
 // backend name ("claude"/"codex") to its Sender; defaultBackend names the one to
 // fall back to for unknown/empty backends and is the new-session default — it
 // must be a key in senders.
-func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBackend string, b *broker.Broker, h *hook.Manager, meta *sessionmeta.Store) *Router {
+func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBackend string, b *broker.Broker, h *hook.Manager, meta *sessionmeta.Store, term *terminal.Manager) *Router {
 	return &Router{
 		discovery:      d,
 		senders:        senders,
@@ -107,6 +108,7 @@ func New(d *discovery.Discovery, senders map[string]*sender.Sender, defaultBacke
 		broker:         b,
 		hooks:          h,
 		meta:           meta,
+		terminal:       term,
 		activeSend:     map[string]*sendToken{},
 		sendQueue:      map[string][]pendingSend{},
 		creating:       map[string]core.Session{},
@@ -123,9 +125,6 @@ func (r *Router) Backends() []string {
 	sort.Strings(out)
 	return out
 }
-
-// IsHeadless reports whether the session's backend has no terminal pane.
-func (r *Router) IsHeadless(id string) bool { return true }
 
 // senderForBackend returns the Sender for a backend, falling back to the
 // default when the backend is empty or unregistered.
@@ -383,6 +382,9 @@ func (r *Router) DeleteSession(id string) error {
 	// Release any in-flight turn first so its tail goroutine stops before the
 	// file is pulled out from under it.
 	r.stopLive(id)
+	if r.terminal != nil {
+		_ = r.terminal.Close(id)
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete session file: %w", err)
 	}
@@ -836,70 +838,77 @@ func (r *Router) SubscribePendingInteractions() (<-chan hook.Pending, func()) {
 	return r.hooks.SubscribePending()
 }
 
-// --- terminal mirror -----------------------------------------------------
+// --- session terminal ----------------------------------------------------
 
-// CaptureScreen returns the current rendered pane contents (with colour
-// escapes) for a session usher holds a live process for — the read-only
-// terminal mirror's frame source. Ownership is required: there's no pane to
-// mirror unless usher has a live window (sender.Has), and we must not reach
-// into the user's own terminal/IDE claude on a shared socket.
-func (r *Router) CaptureScreen(id string) (string, error) {
-	if r.IsHeadless(id) {
-		return "", ErrHeadless
-	}
-	snd := r.senderFor(id)
-	if !snd.Has(id) {
-		return "", errors.New("session not live")
-	}
-	return snd.CapturePane(id)
+func (r *Router) TerminalAvailable() bool {
+	return r.terminal != nil && r.terminal.Available()
 }
 
-// SendKeys forwards navigation keys to a live session's pane, powering the
-// terminal mirror's soft keys. Same ownership gate as CaptureScreen. The web
-// layer restricts which key names reach here; this only enforces ownership.
-func (r *Router) SendKeys(id string, keys ...string) error {
-	if r.IsHeadless(id) {
-		return ErrHeadless
-	}
-	snd := r.senderFor(id)
-	if !snd.Has(id) {
-		return errors.New("session not live")
-	}
-	if err := snd.SendKeys(id, keys...); err != nil {
-		return err
-	}
-	// Esc while a turn is running interrupts claude in the pane, but an
-	// interrupted turn never logs the turn_duration our tailer waits on — so the
-	// turn would stick as "running" forever. Release it the same way the cancel
-	// button does (cancel the tail ctx); the tailer then emits subprocess.exit
-	// and clients recover live. No-op when no turn is in flight.
-	for _, k := range keys {
-		if k == "Escape" {
-			r.sendMu.Lock()
-			tok := r.activeSend[id]
-			r.sendMu.Unlock()
-			if tok != nil {
-				tok.cancel()
-			}
-			break
-		}
-	}
-	return nil
+func (r *Router) HasTerminal(id string) bool {
+	return r.terminal != nil && r.terminal.Has(id)
 }
 
-// ResizeCanvas sets the mirror's pane to cols×rows (and repairs any
-// manual-attach drift). Called when a /screen stream opens, with cols and rows
-// derived client-side from the viewer. Same ownership gate; a no-op error for
-// unowned sessions is ignored by the caller.
-func (r *Router) ResizeCanvas(id string, cols, rows int) error {
-	if r.IsHeadless(id) {
-		return ErrHeadless
+// OpenTerminal starts or reuses the session's shell window.
+func (r *Router) OpenTerminal(id string, cols, rows int) error {
+	sess, ok := r.discovery.Get(id)
+	if !ok {
+		return ErrSessionNotFound
 	}
-	snd := r.senderFor(id)
-	if !snd.Has(id) {
-		return errors.New("session not live")
+	if sess.IsSubagent {
+		return errors.New("subagent transcripts are read-only")
 	}
-	return snd.ResizeCanvas(id, cols, rows)
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.Open(id, sess.Cwd, cols, rows)
+}
+
+func (r *Router) CloseTerminal(id string) error {
+	if _, ok := r.discovery.Get(id); !ok {
+		return ErrSessionNotFound
+	}
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.Close(id)
+}
+
+func (r *Router) CaptureTerminal(id string) (string, error) {
+	if r.terminal == nil {
+		return "", terminal.ErrUnavailable
+	}
+	return r.terminal.Capture(id)
+}
+
+func (r *Router) SubmitTerminal(id, requestID, text string) error {
+	sess, ok := r.discovery.Get(id)
+	if !ok {
+		return ErrSessionNotFound
+	}
+	if sess.IsSubagent {
+		return errors.New("subagent transcripts are read-only")
+	}
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.Submit(id, requestID, text)
+}
+
+func (r *Router) SendTerminalControl(id string, keys ...string) error {
+	if _, ok := r.discovery.Get(id); !ok {
+		return ErrSessionNotFound
+	}
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.SendControl(id, keys...)
+}
+
+func (r *Router) ResizeTerminal(id string, cols, rows int) error {
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.Resize(id, cols, rows)
 }
 
 // --- hook / interactions -------------------------------------------------

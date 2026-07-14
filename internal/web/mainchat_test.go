@@ -70,7 +70,7 @@ func newChatTestServer(t *testing.T, agent usheragent.Agent) *Server {
 		t.Fatal(err)
 	}
 	r := router.New(d, map[string]*sender.Sender{}, "claude", broker.New(),
-		hook.New(filepath.Join(dir, "auto.json")), sessionmeta.New(filepath.Join(dir, "sessions.json"), 0))
+		hook.New(filepath.Join(dir, "auto.json")), sessionmeta.New(filepath.Join(dir, "sessions.json"), 0), nil)
 	return NewServer("", "", nil, r, store, agent, nil, "", "", "", slog.Default())
 }
 

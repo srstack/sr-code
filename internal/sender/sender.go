@@ -29,8 +29,6 @@ type StreamEvent struct {
 	Raw  json.RawMessage
 }
 
-var ErrHeadless = errors.New("terminal mirror is unavailable for headless sessions")
-
 // timing groups the tunable delays for driving the TUI. Defaults are set in
 // New; tests override them for speed.
 type timing struct{ confirm, poll time.Duration }
@@ -314,24 +312,6 @@ func (s *Sender) Kill(sessionID string) error {
 		return s.claude.Kill(sessionID)
 	}
 	return nil
-}
-
-// CapturePane returns the current rendered contents (with colour escapes) of
-// the session's interactive pane, for the read-only terminal mirror. Errors
-// if usher holds no live window for sessionID.
-func (s *Sender) CapturePane(sessionID string) (string, error) {
-	return "", ErrHeadless
-}
-
-// SendKeys is retained for the terminal-cast API surface.
-func (s *Sender) SendKeys(sessionID string, keys ...string) error {
-	return ErrHeadless
-}
-
-// ResizeCanvas sets the session pane to cols×rows for the terminal mirror (also
-// repairs any manual-attach drift). Called when the mirror opens.
-func (s *Sender) ResizeCanvas(sessionID string, cols, rows int) error {
-	return ErrHeadless
 }
 
 // Shutdown tears down all backend workers.

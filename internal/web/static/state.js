@@ -33,11 +33,9 @@ export function setListInterval(v) { listInterval = v; }
 export let currentES = null;
 export function setCurrentES(v) { currentES = v; }
 
-// The terminal-mirror SSE (the inline pane panel), tracked separately from
-// currentES so the detail view's /events stream and the mirror's /screen
-// stream can be open at once and both get torn down on navigation.
-export let currentScreenES = null;
-export function setCurrentScreenES(v) { currentScreenES = v; }
+// Conversation and terminal streams can be open together.
+export let currentTerminalES = null;
+export function setCurrentTerminalES(v) { currentTerminalES = v; }
 
 // detail.js owns all transcript/live-turn state but needs to expose
 // currentDetailId for the fork delegate and refreshSubtitle guard, and
@@ -54,12 +52,6 @@ export let editorUrl = '';
 export function setEditorUrl(v) { editorUrl = v; }
 
 // --- constants used by multiple modules ---
-
-// claude's bottom UI is a fixed 4-row block: input-box top border, input line,
-// bottom border, hint line (verified by capture). The auto preview hides it as
-// furniture; if claude's chrome ever changes, this is the number to revisit.
-export const TERM_FURNITURE_ROWS = 4;
-export const TERM_AUTO_ROWS = 14; // pane height captured for the auto inline preview
 
 // Auto-scroll to the bottom on new content only when the user is already near
 // it, so scrolling up to read history isn't yanked back down.
@@ -190,11 +182,11 @@ export function fmt(iso) {
 
 export function closeES() {
   if (currentES) { currentES.close(); currentES = null; }
-  closeScreenES();
+  closeTerminalES();
   clearViewing();
 }
-export function closeScreenES() {
-  if (currentScreenES) { currentScreenES.close(); currentScreenES = null; }
+export function closeTerminalES() {
+  if (currentTerminalES) { currentTerminalES.close(); currentTerminalES = null; }
 }
 export function clearListInterval() {
   if (listInterval) { clearInterval(listInterval); listInterval = null; }

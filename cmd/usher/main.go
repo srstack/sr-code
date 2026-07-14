@@ -27,6 +27,7 @@ import (
 	"github.com/nexustar/usher/internal/sender"
 	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/telegram"
+	"github.com/nexustar/usher/internal/terminal"
 	"github.com/nexustar/usher/internal/web"
 )
 
@@ -102,7 +103,9 @@ func serve(args []string) error {
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
-		"deprecated; retained for command-line compatibility")
+		"tmux socket prefix for session terminals")
+	terminalShell := fs.String("terminal-shell", defaultTerminalShell(),
+		"shell executable for session terminals")
 	maxLiveSessions := fs.Int("max-live-sessions", 8,
 		"max concurrent live Claude stream-json processes; least-recently-used sessions are evicted beyond this")
 	agentMode := fs.String("agent-mode", "rule",
@@ -161,9 +164,8 @@ func serve(args []string) error {
 	}
 
 	// Each backend is enabled only when its session dir exists (created once that
-	// CLI has run). usher works with either or both; at least one is required. A
-	// separate tmux socket per backend keeps their process pools from adopting
-	// each other's windows. defaultBackend (new-session/fallback) prefers Claude.
+	// CLI has run). usher works with either or both; at least one is required.
+	// defaultBackend (new-session/fallback) prefers Claude.
 	sources := []discovery.Source{}
 	senders := map[string]*sender.Sender{}
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
@@ -202,7 +204,8 @@ func serve(args []string) error {
 		filepath.Join(*dataDir, "sessions.json"),
 		time.Duration(*autoArchiveDays)*24*time.Hour,
 	)
-	r := router.New(d, senders, defaultBackend, b, h, meta)
+	term := terminal.New("tmux", *tmuxSocket+"-terminal", *terminalShell, logger)
+	r := router.New(d, senders, defaultBackend, b, h, meta, term)
 
 	mainStore, err := mainchat.NewStore(filepath.Join(*dataDir, "mainchats"))
 	if err != nil {
@@ -410,3 +413,10 @@ func isDir(path string) bool {
 }
 
 func defaultDataDir() string { return pluginapi.DefaultDataDir() }
+
+func defaultTerminalShell() string {
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "bash"
+}
