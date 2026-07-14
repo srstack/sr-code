@@ -202,13 +202,20 @@ func TestCodexModels(t *testing.T) {
 	// a real catalog → list-visible only, sorted by priority
 	p := filepath.Join(t.TempDir(), "models_cache.json")
 	os.WriteFile(p, []byte(`{"models":[
-		{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","priority":2},
-		{"slug":"auto-review","display_name":"x","visibility":"hide","priority":1},
+		{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","priority":2,"default_reasoning_level":"low"},
+		{"slug":"auto-review","display_name":"x","visibility":"hide","priority":1,"default_reasoning_level":"high"},
 		{"slug":"gpt-5.4-mini","display_name":"GPT-5.4 Mini","visibility":"list","priority":1}
 	]}`), 0o644)
 	got = (&Server{codexModelsPath: p}).codexModels()
 	if len(got) != 2 || got[0].Value != "gpt-5.4-mini" || got[1].Value != "gpt-5.5" {
 		t.Fatalf("catalog parse/sort = %v (want mini then 5.5, hide excluded)", got)
+	}
+	s := &Server{codexModelsPath: p}
+	if effort := s.codexDefaultEffort("gpt-5.5"); effort != "low" {
+		t.Errorf("default effort = %q, want low", effort)
+	}
+	if effort := s.codexDefaultEffort("auto-review"); effort != "high" {
+		t.Errorf("hidden model default effort = %q, want high", effort)
 	}
 }
 

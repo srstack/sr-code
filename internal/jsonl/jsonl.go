@@ -75,7 +75,7 @@ type SessionMeta struct {
 	// LastInputAt is the time of the last genuine user prompt (see
 	// core.Session.LastInputAt); skips tool_result lines and interrupt markers.
 	LastInputAt time.Time
-	Usage       core.SessionUsage
+	Runtime     core.SessionRuntime
 }
 
 // ReadSessionMeta scans the file at path and produces a SessionMeta. It walks
@@ -120,7 +120,7 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 			meta.AgentName = ev.AttributionAgent
 		}
 		if ev.Type == "assistant" && len(ev.Message) > 0 {
-			updateClaudeContext(&meta.Usage, ev.Message)
+			updateClaudeRuntime(&meta.Runtime, ev.Message)
 		}
 		if ev.Type == "user" && len(ev.Message) > 0 {
 			content := extractUserContent(ev.Message)
@@ -143,8 +143,9 @@ func ReadSessionMeta(path string) (SessionMeta, error) {
 	return meta, sc.Err()
 }
 
-func updateClaudeContext(usage *core.SessionUsage, raw json.RawMessage) {
+func updateClaudeRuntime(runtime *core.SessionRuntime, raw json.RawMessage) {
 	var msg struct {
+		Model string `json:"model"`
 		Usage struct {
 			Input         int64 `json:"input_tokens"`
 			CacheCreation int64 `json:"cache_creation_input_tokens"`
@@ -155,10 +156,13 @@ func updateClaudeContext(usage *core.SessionUsage, raw json.RawMessage) {
 	if json.Unmarshal(raw, &msg) != nil {
 		return
 	}
+	if msg.Model != "" {
+		runtime.Model = msg.Model
+	}
 	cached := msg.Usage.CacheCreation + msg.Usage.CacheRead
 	context := msg.Usage.Input + cached + msg.Usage.Output
 	if context > 0 {
-		usage.ContextTokens = context
+		runtime.ContextTokens = context
 	}
 }
 

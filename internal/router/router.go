@@ -194,6 +194,26 @@ func (r *Router) ReadTurns(id string, limit int) ([]jsonl.Turn, int, error) {
 	return readTurnsForBackend(path, r.backendOf(id), limit)
 }
 
+// UpdateClaudeRuntime accepts Claude Code's status-line snapshot. The
+// transcript path lets a callback that races initial discovery register the
+// session before updating it. Subscribers receive the same snapshot live.
+func (r *Router) UpdateClaudeRuntime(id, transcriptPath string, runtime core.SessionRuntime) bool {
+	if id == "" {
+		return false
+	}
+	if !r.discovery.UpdateRuntime(id, runtime) && transcriptPath != "" {
+		r.discovery.Upsert(transcriptPath)
+		if !r.discovery.UpdateRuntime(id, runtime) {
+			return false
+		}
+	}
+	raw, err := json.Marshal(runtime)
+	if err == nil {
+		r.broker.Publish(broker.Event{SessionID: id, Type: "session.runtime", Raw: raw})
+	}
+	return true
+}
+
 // BackendForModel exposes backendForModel to other packages (the web layer's
 // model gate) — which backend a chosen model routes to.
 func BackendForModel(model string) string { return backendForModel(model) }

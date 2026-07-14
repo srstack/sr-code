@@ -506,7 +506,7 @@ func TestReadSessionMetaUsesLatestClaudeContext(t *testing.T) {
 	data := strings.Join([]string{
 		`{"type":"assistant","uuid":"u1","message":{"id":"m1","usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":11}}}`,
 		`{"type":"assistant","uuid":"u2","message":{"id":"m1","usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":11}}}`,
-		`{"type":"assistant","uuid":"u3","message":{"id":"m2","usage":{"input_tokens":13,"output_tokens":17}}}`,
+		`{"type":"assistant","uuid":"u3","message":{"id":"m2","model":"claude-opus-4-6","usage":{"input_tokens":13,"output_tokens":17}}}`,
 		`{"type":"assistant","uuid":"u4","message":{"id":"synthetic","content":[]}}`,
 	}, "\n")
 	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
@@ -516,8 +516,8 @@ func TestReadSessionMetaUsesLatestClaudeContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := meta.Usage
-	if u.ContextTokens != 30 {
+	u := meta.Runtime
+	if u.ContextTokens != 30 || u.Model != "claude-opus-4-6" {
 		t.Fatalf("usage = %+v", u)
 	}
 }

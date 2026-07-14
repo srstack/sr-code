@@ -383,6 +383,7 @@ func TestAssemblerCustomWrapperDeduplicatesCanonicalPatch(t *testing.T) {
 func TestReadSessionMetaUsesLatestCodexUsageSnapshot(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout.jsonl")
 	data := strings.Join([]string{
+		`{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"high"}}`,
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":3,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12}}}}`,
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":5,"reasoning_output_tokens":2,"total_tokens":25},"last_token_usage":{"total_tokens":14},"model_context_window":100}}}`,
 	}, "\n")
@@ -393,8 +394,8 @@ func TestReadSessionMetaUsesLatestCodexUsageSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := meta.Usage
-	if u.ContextTokens != 14 || u.ContextWindow != 100 {
+	u := meta.Runtime
+	if u.ContextTokens != 14 || u.ContextWindow != 100 || u.Model != "gpt-5.5" || u.Effort != "high" {
 		t.Fatalf("usage = %+v", u)
 	}
 }

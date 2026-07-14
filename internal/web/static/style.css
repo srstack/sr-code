@@ -615,7 +615,7 @@ tbody tr:hover { background: var(--bg-subtle); }
 td.title { font-weight: 500; }
 td.id, td.cwd {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 0.78rem;
+  font-size: 0.875rem;
 }
 td.id { color: var(--text-disabled); }
 td.cwd { font-size: 0.82rem; }
@@ -793,7 +793,7 @@ td.cwd { font-size: 0.82rem; }
   right: 0;
   bottom: calc(100% + 0.5rem);
   z-index: 20;
-  min-width: 13rem;
+  min-width: 0;
   padding: 0.55rem 0.65rem;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -802,8 +802,8 @@ td.cwd { font-size: 0.82rem; }
   color: var(--text);
   font-size: 0.78rem;
 }
-.session-usage-detail > div { display: flex; justify-content: space-between; gap: 1rem; }
-.session-usage-detail strong { font-weight: 500; color: var(--text-faint); }
+.session-usage-detail > div { display: flex; align-items: baseline; gap: 0.55rem; }
+.session-usage-detail strong { width: 3.6rem; flex: none; font-weight: 500; color: var(--text-faint); }
 .session-usage-detail span { white-space: nowrap; }
 .composer-send button {
   padding: 0.32rem 0.8rem;

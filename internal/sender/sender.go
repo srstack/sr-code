@@ -118,14 +118,19 @@ func claudeHookSettings(hookSock string, logger *slog.Logger) string {
 		return ""
 	}
 	cmd := exe + " hook PreToolUse"
+	statusCmd := exe + " hook claude-status-line"
 	if hookSock != "" {
 		cmd = "USHER_HOOK_SOCK=" + hookSock + " " + cmd
+		statusCmd = "USHER_HOOK_SOCK=" + hookSock + " " + statusCmd
 	}
-	settings := map[string]any{"hooks": map[string]any{"PreToolUse": []any{
-		map[string]any{"matcher": "", "hooks": []any{
-			map[string]any{"type": "command", "command": cmd, "timeout": 604800},
+	settings := map[string]any{
+		"hooks": map[string]any{"PreToolUse": []any{
+			map[string]any{"matcher": "", "hooks": []any{
+				map[string]any{"type": "command", "command": cmd, "timeout": 604800},
+			}},
 		}},
-	}}}
+		"statusLine": map[string]any{"type": "command", "command": statusCmd},
+	}
 	b, _ := json.Marshal(settings)
 	return string(b)
 }

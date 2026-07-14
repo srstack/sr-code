@@ -364,7 +364,7 @@ export async function showDetail(id) {
       usageBtn.setAttribute('aria-expanded', 'false');
     });
   }
-  renderSessionUsage(sess.usage);
+  renderSessionRuntime(sess.runtime);
   restoreDraft(promptEl);
 
   const autoBtn = document.getElementById('auto-approve-toggle');
@@ -761,6 +761,7 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
       }
       liveTurnDirty = true;
     },
+    'session.runtime': (d) => renderSessionRuntime(d),
     'subprocess.exit': (d) => {
       // Failed/unconfirmed exits follow an explicit error event. Keep that
       // error bubble visible instead of reconciling it away as a successful turn.
@@ -1002,7 +1003,7 @@ async function refreshSubtitle(id) {
     const sess = await res.json();
     if (id !== currentDetailId) return;
     renderSessionSubtitle(sess);
-    renderSessionUsage(sess.usage);
+    renderSessionRuntime(sess.runtime);
   } catch {/* ignore */}
 }
 registerRefreshSubtitle(refreshSubtitle);
@@ -1176,7 +1177,7 @@ async function loadTranscript(id, opts) {
   } catch {/* ignore — lastTranscriptSig stays put, so the next call retries */}
 }
 
-function renderSessionUsage(u) {
+function renderSessionRuntime(u) {
   const el = document.getElementById('session-usage');
   const detail = document.getElementById('session-usage-detail');
   if (!el || !detail) return;
@@ -1192,7 +1193,11 @@ function renderSessionUsage(u) {
     : 'Context limit unavailable; show usage details');
   el.title = max > 0 ? 'Context ' + Math.round(pct) + '% used' : 'Context limit unavailable';
 
-  detail.innerHTML = `<div><strong>context</strong><span>${max > 0 ? esc(formatTokenCount(context) + ' / ' + formatTokenCount(max) + ' · ' + Math.round(pct) + '%') : esc(formatTokenCount(context) + ' / unavailable')}</span></div>`;
+  const rows = [];
+  if (u.model) rows.push(`<div><strong>Model</strong><span>${esc(u.model)}</span></div>`);
+  if (u.effort) rows.push(`<div><strong>Effort</strong><span>${esc(u.effort)}</span></div>`);
+  rows.push(`<div><strong>Context</strong><span>${max > 0 ? esc(formatTokenCount(context) + ' / ' + formatTokenCount(max) + ' · ' + Math.round(pct) + '%') : esc(formatTokenCount(context) + ' / unavailable')}</span></div>`);
+  detail.innerHTML = rows.join('');
 }
 
 function formatTokenCount(n) {

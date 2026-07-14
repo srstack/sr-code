@@ -199,8 +199,8 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 				} `json:"info"`
 			}
 			if json.Unmarshal(l.Payload, &usage) == nil && usage.Type == "token_count" && usage.Info != nil {
-				meta.Usage.ContextTokens = usage.Info.Last.Total
-				meta.Usage.ContextWindow = usage.Info.ContextWindow
+				meta.Runtime.ContextTokens = usage.Info.Last.Total
+				meta.Runtime.ContextWindow = usage.Info.ContextWindow
 			}
 			if msg, ok := userMessage(l.Payload); ok {
 				if firstPrompt == "" {
@@ -210,6 +210,19 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 				// (jsonl.SessionMeta.LastInputAt).
 				if !l.Timestamp.IsZero() {
 					meta.LastInputAt = l.Timestamp
+				}
+			}
+		case "turn_context":
+			var p struct {
+				Model  string `json:"model"`
+				Effort string `json:"effort"`
+			}
+			if json.Unmarshal(l.Payload, &p) == nil {
+				if p.Model != "" {
+					meta.Runtime.Model = p.Model
+				}
+				if p.Effort != "" {
+					meta.Runtime.Effort = p.Effort
 				}
 			}
 		}

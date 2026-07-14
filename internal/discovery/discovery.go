@@ -159,7 +159,12 @@ func (d *Discovery) upsert(path string) {
 		// self-limits. Codex has no ai-title, so exclude it from the title re-read.
 		needTitle := existing.Title == "" && existing.Backend != "codex"
 		if meta, err := src.ReadMeta(path); err == nil {
-			existing.Usage = meta.Usage
+			// Claude's status-line callback is the authoritative source because
+			// it includes the effective max window. Transcript usage is only a
+			// fallback; never let a later fsnotify scan erase a captured window.
+			if existing.Backend != "claude" || existing.Runtime.ContextWindow == 0 {
+				existing.Runtime = meta.Runtime
+			}
 			if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 				applySubagentMeta(&existing, meta)
 				if existing.Cwd == "" {
@@ -203,7 +208,7 @@ func (d *Discovery) upsert(path string) {
 		LastEventAt: info.ModTime(),
 		LastInputAt: meta.LastInputAt,
 		Backend:     src.Backend(),
-		Usage:       meta.Usage,
+		Runtime:     meta.Runtime,
 	}
 	if sess.StartedAt.IsZero() {
 		sess.StartedAt = info.ModTime()
@@ -268,6 +273,21 @@ func (d *Discovery) MarkInput(id string, t time.Time) {
 		d.sessions[id] = s
 	}
 	d.mu.Unlock()
+}
+
+// UpdateRuntime replaces the cached model/context snapshot for a session.
+// Claude's status-line callback supplies this directly, without rereading the
+// transcript. It returns false when discovery has not seen the session yet.
+func (d *Discovery) UpdateRuntime(id string, runtime core.SessionRuntime) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s, ok := d.sessions[id]
+	if !ok {
+		return false
+	}
+	s.Runtime = runtime
+	d.sessions[id] = s
+	return true
 }
 
 func (d *Discovery) run(ctx context.Context) {

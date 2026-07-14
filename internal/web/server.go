@@ -195,6 +195,35 @@ func (s *Server) codexCatalog() []modelOption {
 	return out
 }
 
+// codexDefaultEffort resolves an omitted turn_context.effort the same way
+// Codex core does: fall back to the selected model's default_reasoning_level.
+// Search every catalog entry, including hidden models that may own an existing
+// session even though they are absent from the new-session picker.
+func (s *Server) codexDefaultEffort(slug string) string {
+	if slug == "" || s.codexModelsPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(s.codexModelsPath)
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		Models []struct {
+			Slug                  string `json:"slug"`
+			DefaultReasoningLevel string `json:"default_reasoning_level"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return ""
+	}
+	for _, m := range doc.Models {
+		if m.Slug == slug {
+			return m.DefaultReasoningLevel
+		}
+	}
+	return ""
+}
+
 // handleModels feeds the new-session model picker: which backends are installed
 // (so it drops an unavailable one) and Codex's per-account model catalog (Claude's
 // list is static in the page markup).
@@ -592,6 +621,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if sess.Backend == "codex" && sess.Runtime.Effort == "" {
+		sess.Runtime.Effort = s.codexDefaultEffort(sess.Runtime.Model)
+	}
 	writeJSON(w, http.StatusOK, sessionDTO{
 		Session:           sess,
 		AutoApprove:       s.router.IsAutoApprove(id),
@@ -908,6 +940,7 @@ var sseForward = map[string]bool{
 	"error":              true,
 	"part":               true,
 	"turn.user":          true,
+	"session.runtime":    true,
 }
 
 // sseStart asserts streaming support and writes the SSE preamble (headers +
@@ -1240,6 +1273,18 @@ type hookPayload struct {
 	ToolInput      json.RawMessage `json:"tool_input"`
 	Cwd            string          `json:"cwd"`
 	TranscriptPath string          `json:"transcript_path"`
+	ContextWindow  struct {
+		TotalInputTokens  int64   `json:"total_input_tokens"`
+		TotalOutputTokens int64   `json:"total_output_tokens"`
+		ContextWindowSize int64   `json:"context_window_size"`
+		UsedPercentage    float64 `json:"used_percentage"`
+	} `json:"context_window"`
+	Model struct {
+		ID string `json:"id"`
+	} `json:"model"`
+	Effort struct {
+		Level string `json:"level"`
+	} `json:"effort"`
 }
 
 // codexPermissionDecision builds Codex's PermissionRequest hook reply:
@@ -1273,6 +1318,21 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	}
 	if ev.HookEventName == "" {
 		ev.HookEventName = eventName
+	}
+	if eventName == "claude-status-line" {
+		contextTokens := ev.ContextWindow.TotalInputTokens + ev.ContextWindow.TotalOutputTokens
+		if ev.SessionID == "" || contextTokens <= 0 {
+			writeErr(w, http.StatusBadRequest, "status line payload missing session/context usage")
+			return
+		}
+		s.router.UpdateClaudeRuntime(ev.SessionID, ev.TranscriptPath, core.SessionRuntime{
+			Model:         ev.Model.ID,
+			Effort:        ev.Effort.Level,
+			ContextTokens: contextTokens,
+			ContextWindow: ev.ContextWindow.ContextWindowSize,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
 	}
 
 	// PreToolUse is Claude Code's tool-approval hook; PermissionRequest is
