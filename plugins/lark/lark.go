@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -36,6 +37,7 @@ type larkAPI interface {
 	ReplyImage(ctx context.Context, rootID, imageKey string) (string, error)
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, messageID, emojiType string) error
+	DownloadResource(ctx context.Context, messageID, key, kind string) (io.Reader, string, error)
 	ThreadMessages(ctx context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error)
 	MergedMessages(ctx context.Context, messageID string) ([]pulledMsg, error)
 	ChatMemberNames(ctx context.Context, chatID string) (map[string]string, error)
@@ -175,6 +177,21 @@ func (l *larkClient) React(ctx context.Context, messageID, emojiType string) err
 		return apiErr("react", resp.Code, resp.Msg)
 	}
 	return nil
+}
+
+func (l *larkClient) DownloadResource(ctx context.Context, messageID, key, kind string) (io.Reader, string, error) {
+	resp, err := l.c.Im.V1.MessageResource.Get(ctx, larkim.NewGetMessageResourceReqBuilder().
+		MessageId(messageID).
+		FileKey(key).
+		Type(kind).
+		Build())
+	if err != nil {
+		return nil, "", err
+	}
+	if !resp.Success() {
+		return nil, "", apiErr("get message resource", resp.Code, resp.Msg)
+	}
+	return resp.File, resp.FileName, nil
 }
 
 func (l *larkClient) ThreadMessages(ctx context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error) {

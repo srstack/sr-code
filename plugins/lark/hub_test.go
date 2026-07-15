@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -32,20 +33,22 @@ type sentMsg struct {
 }
 
 type fakeLark struct {
-	mu          sync.Mutex
-	sent        []sentMsg
-	reacted     []string
-	nextRoot    int
-	failSend    bool
-	failCards   bool
-	failPosts   bool
-	pulled      []pulledMsg
-	merged      map[string][]pulledMsg
-	names       map[string]map[string]string
-	appNames    map[string]string
-	memberCalls int
-	appCalls    int
-	botOpenID   string
+	mu            sync.Mutex
+	sent          []sentMsg
+	reacted       []string
+	nextRoot      int
+	failSend      bool
+	failCards     bool
+	failPosts     bool
+	pulled        []pulledMsg
+	merged        map[string][]pulledMsg
+	names         map[string]map[string]string
+	appNames      map[string]string
+	memberCalls   int
+	appCalls      int
+	botOpenID     string
+	resources     map[string]string
+	resourceCalls map[string]int
 }
 
 func (f *fakeLark) SendCard(_ context.Context, chatID, cardJSON string) (string, error) {
@@ -109,6 +112,20 @@ func (f *fakeLark) React(_ context.Context, messageID, emojiType string) error {
 	defer f.mu.Unlock()
 	f.reacted = append(f.reacted, messageID)
 	return nil
+}
+
+func (f *fakeLark) DownloadResource(_ context.Context, messageID, key, kind string) (io.Reader, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resourceCalls == nil {
+		f.resourceCalls = map[string]int{}
+	}
+	f.resourceCalls[kind+"/"+key]++
+	data, ok := f.resources[messageID+"/"+key]
+	if !ok {
+		return nil, "", errors.New("resource not found")
+	}
+	return strings.NewReader(data), key + ".png", nil
 }
 
 func (f *fakeLark) ThreadMessages(_ context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error) {
@@ -181,6 +198,7 @@ type fakeRouter struct {
 	respondErr error // forced RespondInteraction failure (transport-style)
 	started    []startCall
 	startErr   error
+	uploaded   map[string]string
 }
 
 type startCall struct {
@@ -196,6 +214,7 @@ func newFakeRouter() *fakeRouter {
 		sent:      map[string][]string{},
 		pendingCh: make(chan hook.Pending, 8),
 		responses: map[string]hook.Response{},
+		uploaded:  map[string]string{},
 	}
 }
 
@@ -218,6 +237,21 @@ func (f *fakeRouter) SendToSession(id, text string) error {
 	}
 	f.sent[id] = append(f.sent[id], text)
 	return nil
+}
+
+func (f *fakeRouter) UploadAttachment(id, filename string, src io.Reader) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.sessions[id]; !ok {
+		return "", errors.New("no such session")
+	}
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return "", err
+	}
+	path := "/attachments/" + id + "/" + filename
+	f.uploaded[path] = string(data)
+	return path, nil
 }
 
 func (f *fakeRouter) StartSession(cwd, initialMsg, model string) (string, error) {
@@ -364,6 +398,18 @@ func TestRenderPostContentLocaleWrappedAndMalformed(t *testing.T) {
 	if got := renderMessageContent(larkim.MsgTypePost, `{`, nil, ""); got != "" {
 		t.Fatalf("malformed post = %q", got)
 	}
+	if got := renderMessageContent(larkim.MsgTypePost, `{"title":"Title only"}`, nil, ""); got != "Title only" {
+		t.Fatalf("title-only post = %q", got)
+	}
+}
+
+func TestPostFileResourceWhitespace(t *testing.T) {
+	raw := `{"content":[[{"tag":"file","file_key":" key ","file_name":"   "}]]}`
+	text := renderMessageContent(larkim.MsgTypePost, raw, nil, "")
+	refs := messageResources(larkim.MsgTypePost, raw)
+	if text != "[file: key]" || len(refs) != 1 || refs[0].Placeholder != text || refs[0].Key != "key" {
+		t.Fatalf("text = %q, refs = %+v", text, refs)
+	}
 }
 
 func TestRenderPostContentResolvedOpenIDMentions(t *testing.T) {
@@ -381,6 +427,25 @@ func TestRenderPulledPostContent(t *testing.T) {
 	m := pulledMsg{MsgType: larkim.MsgTypePost, Content: `{"content":[[{"tag":"text","text":"history"},{"tag":"img","image_key":"img_old"}]]}`}
 	if got := renderPulledText(m); got != "history[image: img_old]" {
 		t.Fatalf("pulled post = %q", got)
+	}
+}
+
+func TestMaterializeMessageResources(t *testing.T) {
+	f, r := &fakeLark{resources: map[string]string{
+		"om_post/img_1":  "png data",
+		"om_post/file_1": "video data",
+	}}, newFakeRouter()
+	r.sessions["s1"] = core.Session{ID: "s1"}
+	h := newTestHub(t, f, r)
+	raw := `{"content":[[{"tag":"text","text":"see "},{"tag":"img","image_key":"img_1"},{"tag":"media","file_key":"file_1"}]]}`
+	text := renderMessageContent(larkim.MsgTypePost, raw, nil, "")
+	got := h.materializeResources(context.Background(), "s1", "om_post", larkim.MsgTypePost, raw, text)
+	want := "see [file: /attachments/s1/img_1.png][file: /attachments/s1/file_1.png]"
+	if got != want {
+		t.Fatalf("materialized = %q, want %q", got, want)
+	}
+	if r.uploaded["/attachments/s1/img_1.png"] != "png data" || r.uploaded["/attachments/s1/file_1.png"] != "video data" {
+		t.Fatalf("uploads = %+v", r.uploaded)
 	}
 }
 
@@ -564,6 +629,9 @@ func TestGuestPostMessageCreate(t *testing.T) {
 	if len(r.started) != 1 || r.started[0].initial != "review this[image: img_review]" {
 		t.Fatalf("post start call = %+v", r.started)
 	}
+	if len(r.uploaded) != 0 {
+		t.Fatalf("creation mention must not upload resources: %+v", r.uploaded)
+	}
 }
 
 func TestGuestInThreadCreateBuildsTranscript(t *testing.T) {
@@ -735,6 +803,46 @@ func TestInboundRoutingAndAuth(t *testing.T) {
 	last := msgs[len(msgs)-1]
 	if !strings.Contains(last.body, "from the web") || !strings.Contains(last.body, promptCaption) {
 		t.Fatalf("web prompt should echo, got %+v", last)
+	}
+}
+
+func TestInboundImageRoutesAndDownloads(t *testing.T) {
+	f, r := &fakeLark{resources: map[string]string{}}, newFakeRouter()
+	r.sessions["s1"] = core.Session{ID: "s1"}
+	h := newTestHub(t, f, r, testUser)
+	if err := h.store.put("s1", "om_root_1"); err != nil {
+		t.Fatal(err)
+	}
+	ev := inboundMessage(testChat, testUser, "", "om_root_1", "")
+	msgType := larkim.MsgTypeImage
+	content := `{"image_key":"img_live"}`
+	ev.Event.Message.MessageType = &msgType
+	ev.Event.Message.Content = &content
+	messageID := deref(ev.Event.Message.MessageId)
+	f.resources[messageID+"/img_live"] = "image data"
+
+	h.HandleMessage(context.Background(), ev)
+
+	want := "[file: /attachments/s1/img_live.png]"
+	if got := r.sent["s1"]; len(got) != 1 || got[0] != want {
+		t.Fatalf("image prompt = %v, want %q", got, want)
+	}
+	if r.uploaded["/attachments/s1/img_live.png"] != "image data" {
+		t.Fatalf("uploads = %+v", r.uploaded)
+	}
+}
+
+func TestTranscriptResourcesReuseDownloadedPath(t *testing.T) {
+	f, r := &fakeLark{resources: map[string]string{"m1/img_same": "image data"}}, newFakeRouter()
+	r.sessions["s1"] = core.Session{ID: "s1"}
+	h := newTestHub(t, f, r)
+	content := `{"image_key":"img_same"}`
+	lines, _ := h.transcriptLines(context.Background(), "oc_foreign", "s1", []pulledMsg{
+		{ID: "m1", SenderOpen: "ou_a", MsgType: larkim.MsgTypeImage, Content: content},
+		{ID: "m2", SenderOpen: "ou_b", MsgType: larkim.MsgTypeImage, Content: content},
+	}, "", binding{})
+	if len(lines) != 2 || lines[0].Text != lines[1].Text || f.resourceCalls["image/img_same"] != 1 {
+		t.Fatalf("lines = %+v, calls = %+v", lines, f.resourceCalls)
 	}
 }
 

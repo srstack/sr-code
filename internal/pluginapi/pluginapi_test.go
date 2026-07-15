@@ -7,6 +7,7 @@ import (
 
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,7 +114,7 @@ func startServer(t *testing.T, f *fakeRouter) *Client {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := NewServer(f, nil).Run(ctx, sock); err != nil {
+		if err := NewServer(f, t.TempDir(), nil).Run(ctx, sock); err != nil {
 			t.Errorf("server: %v", err)
 		}
 	}()
@@ -159,6 +160,18 @@ func TestSessionRoundTrip(t *testing.T) {
 	f.mu.Unlock()
 	if len(got) != 1 || got[0] != "do it" {
 		t.Fatalf("routed sends = %v", got)
+	}
+
+	path, err := c.UploadAttachment("s1", "note.txt", strings.NewReader("attachment"))
+	if err != nil {
+		t.Fatalf("UploadAttachment: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "attachment" {
+		t.Fatalf("uploaded attachment = %q, %v", data, err)
+	}
+	if _, err := c.UploadAttachment("nope", "note.txt", strings.NewReader("x")); err == nil {
+		t.Fatal("upload to missing session succeeded")
 	}
 }
 
@@ -270,7 +283,7 @@ func TestReconnect(t *testing.T) {
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan struct{})
-	go func() { defer close(done1); _ = NewServer(f, nil).Run(ctx1, sock) }()
+	go func() { defer close(done1); _ = NewServer(f, t.TempDir(), nil).Run(ctx1, sock) }()
 
 	c := NewClient(sock, nil)
 	waitPing(t, c)
@@ -285,7 +298,7 @@ func TestReconnect(t *testing.T) {
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
-	go func() { defer close(done2); _ = NewServer(f, nil).Run(ctx2, sock) }()
+	go func() { defer close(done2); _ = NewServer(f, t.TempDir(), nil).Run(ctx2, sock) }()
 	t.Cleanup(func() { cancel2(); <-done2 })
 	waitPing(t, c)
 

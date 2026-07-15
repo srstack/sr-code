@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nexustar/usher/internal/attachment"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/hook"
@@ -43,15 +44,16 @@ type RouterAPI interface {
 
 // Server serves the plugin API on a Unix socket.
 type Server struct {
-	router RouterAPI
-	logger *slog.Logger
+	router         RouterAPI
+	attachmentsDir string
+	logger         *slog.Logger
 }
 
-func NewServer(router RouterAPI, logger *slog.Logger) *Server {
+func NewServer(router RouterAPI, attachmentsDir string, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{router: router, logger: logger}
+	return &Server{router: router, attachmentsDir: attachmentsDir, logger: logger}
 }
 
 // Run listens on the Unix socket at path and serves until ctx is cancelled.
@@ -96,10 +98,37 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/sessions", s.handleStartSession)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/send", s.handleSend)
+	mux.HandleFunc("POST /v1/sessions/{id}/attachments", s.handleAttachment)
 	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.HandleFunc("GET /v1/interactions", s.handleInteractions)
 	mux.HandleFunc("POST /v1/interactions/{id}/respond", s.handleRespond)
 	return mux
+}
+
+const maxAttachmentBytes = 100 << 20
+
+func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.router.GetSession(id); !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAttachmentBytes)
+	path, err := attachment.Save(s.attachmentsDir, id, r.URL.Query().Get("filename"), r.Body, maxAttachmentBytes)
+	if errors.Is(err, attachment.ErrInvalidName) {
+		writeError(w, http.StatusBadRequest, "invalid filename")
+		return
+	}
+	var maxErr *http.MaxBytesError
+	if errors.Is(err, attachment.ErrTooLarge) || errors.As(err, &maxErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment too large")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "save attachment: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": path})
 }
 
 type startSessionReq struct {

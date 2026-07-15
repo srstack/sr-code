@@ -277,7 +277,7 @@ func serve(args []string) error {
 	// same Router seam the Telegram hub uses, over a 0600 Unix socket. Always
 	// on — it is inert until a plugin connects.
 	go func() {
-		if err := pluginapi.NewServer(r, logger).Run(ctx, pluginapi.SocketPath(*dataDir)); err != nil && ctx.Err() == nil {
+		if err := pluginapi.NewServer(r, attachmentsDir, logger).Run(ctx, pluginapi.SocketPath(*dataDir)); err != nil && ctx.Err() == nil {
 			logger.Warn("plugin api stopped", "err", err)
 		}
 	}()

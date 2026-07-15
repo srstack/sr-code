@@ -69,7 +69,11 @@ trigger a turn.
 Attachments on the first mention are not transferred into the new session.
 The session ID—and therefore its managed attachment directory—does not exist
 until the initial prompt has already been sent. Rich-text resource elements in
-that creation prompt remain textual placeholders.
+that creation prompt remain textual placeholders. On later turns, ordinary
+image/file/media messages and resources embedded in posts are downloaded into
+the session attachment directory and passed to the agent by absolute path.
+Feishu does not allow downloading resources inside cards or merged-forward
+child messages, so those remain textual placeholders.
 
 `--cwd` and `--model` are accepted only on the creation mention. The default
 cwd is `--default-cwd` (default `/tmp`). An empty allowlist disables guest

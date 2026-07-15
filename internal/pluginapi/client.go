@@ -37,6 +37,7 @@ type Client struct {
 // subscriptions use their own untimed client.
 const callTimeout = 30 * time.Second
 const startTimeout = 60 * time.Second
+const attachmentTimeout = 2 * time.Minute
 
 // NewClient returns a Client for the plugin API socket at path.
 func NewClient(path string, logger *slog.Logger) *Client {
@@ -112,6 +113,34 @@ func (c *Client) StartSession(cwd, initialMsg, model string) (string, error) {
 		return "", err
 	}
 	return out.ID, nil
+}
+
+// UploadAttachment streams a file into an existing session's managed
+// attachment directory and returns the absolute path agents can read.
+func (c *Client) UploadAttachment(id, filename string, src io.Reader) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), attachmentTimeout)
+	defer cancel()
+	path := "/v1/sessions/" + id + "/attachments?filename=" + neturl.QueryEscape(filename)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url(path), src)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", apiError(resp)
+	}
+	var out struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Path, nil
 }
 
 // RespondInteraction resolves a pending permission interaction.

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
+	"github.com/nexustar/usher/internal/attachment"
 	"github.com/nexustar/usher/internal/auth"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/hook"
@@ -909,37 +910,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	name := filepath.Base(header.Filename)
-	if name == "." || name == ".." || name == string(filepath.Separator) || name == "" {
+	dst, err := attachment.Save(s.attachmentsDir, id, header.Filename, file, maxUploadSize)
+	if errors.Is(err, attachment.ErrInvalidName) {
 		writeErr(w, http.StatusBadRequest, "invalid filename")
 		return
 	}
-	ext := filepath.Ext(name)
-	base := strings.TrimSuffix(name, ext)
-	dir := filepath.Join(s.attachmentsDir, id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		writeErr(w, http.StatusInternalServerError, "failed to create attachment directory")
+	if errors.Is(err, attachment.ErrTooLarge) {
+		writeErr(w, http.StatusBadRequest, "file too large")
 		return
 	}
-
-	dst := filepath.Join(dir, name)
-	var out *os.File
-	for i := 1; ; i++ {
-		out, err = os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrExist) {
-			writeErr(w, http.StatusInternalServerError, "failed to create file")
-			return
-		}
-		name = fmt.Sprintf("%s_%d%s", base, i, ext)
-		dst = filepath.Join(dir, name)
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, file); err != nil {
-		_ = os.Remove(dst)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to write file")
 		return
 	}

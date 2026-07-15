@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -37,6 +38,7 @@ type RouterAPI interface {
 	StartSession(cwd, initialMsg, model string) (string, error)
 	SubscribeAllSessions() (<-chan broker.Event, func())
 	SendToSession(id, text string) error
+	UploadAttachment(id, filename string, src io.Reader) (string, error)
 	SubscribePendingInteractions() (<-chan hook.Pending, func())
 	RespondInteraction(id string, resp hook.Response) error
 }
@@ -651,8 +653,8 @@ var mentionPlaceholder = regexp.MustCompile(`@_user_\d+\s*`)
 
 // HandleMessage routes a message typed in a session's thread straight to
 // that session (Mode A passthrough). Messages outside the configured chat,
-// from unauthorized users, outside any bound thread, or without text are
-// ignored — session lifecycle control stays in the web UI.
+// from unauthorized users, outside any bound thread, or with unsupported
+// content are ignored — session lifecycle control stays in the web UI.
 func (h *Hub) HandleMessage(_ context.Context, event *larkim.P2MessageReceiveV1) {
 	if event == nil || event.Event == nil || event.Event.Message == nil {
 		return
@@ -669,7 +671,7 @@ func (h *Hub) HandleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 		h.logger.Info("lark: duplicate inbound push ignored", "message", id)
 		return
 	}
-	text := inboundText(msg)
+	text := inboundContent(msg)
 	if text == "" {
 		return
 	}
@@ -686,6 +688,7 @@ func (h *Hub) HandleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 	h.spawn(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
+		text = h.materializeResources(ctx, sessionID, messageID, deref(msg.MessageType), deref(msg.Content), text)
 		h.routeInbound(ctx, sessionID, messageID, text)
 	})
 }
@@ -742,6 +745,7 @@ func (h *Hub) handleGuest(event *larkim.P2MessageReceiveV1) {
 			if !gok {
 				return
 			}
+			text = h.materializeResources(ctx, sessionID, id, deref(msg.MessageType), deref(msg.Content), text)
 			h.guestTurn(ctx, sessionID, b, meta, text)
 			return
 		}
@@ -767,7 +771,7 @@ func (h *Hub) guestCreate(ctx context.Context, chat string, msg guestMeta, text 
 		if err != nil {
 			h.logger.Warn("lark: pull guest create context", "thread", msg.threadID, "err", err)
 		} else {
-			transcript, truncated = h.transcriptLines(ctx, chat, pulled, msg.id, binding{})
+			transcript, truncated = h.transcriptLines(ctx, chat, "", pulled, msg.id, binding{})
 			truncated = truncated || trunc
 		}
 	}
@@ -818,7 +822,7 @@ func (h *Hub) guestTurn(ctx context.Context, sessionID string, b binding, msg gu
 		if err != nil {
 			h.logger.Warn("lark: pull guest turn context", "session", sessionID, "thread", threadID, "err", err)
 		} else {
-			transcript, truncated = h.transcriptLines(ctx, b.Chat, pulled, msg.id, b)
+			transcript, truncated = h.transcriptLines(ctx, b.Chat, sessionID, pulled, msg.id, b)
 			truncated = truncated || trunc
 		}
 	}
@@ -864,10 +868,18 @@ func (h *Hub) ack(ctx context.Context, messageID string) {
 	}
 }
 
-// inboundText extracts the user-visible text of an inbound text or post
-// message. Other message types remain ignored as turn boundaries.
-func inboundText(msg *larkim.EventMessage) string {
-	return renderMessageContent(deref(msg.MessageType), deref(msg.Content), eventMentions(msg.Mentions), "")
+// inboundContent extracts a live prompt from the canonical mirror chat.
+func inboundContent(msg *larkim.EventMessage) string {
+	msgType, raw := deref(msg.MessageType), deref(msg.Content)
+	if text := renderMessageContent(msgType, raw, eventMentions(msg.Mentions), ""); text != "" {
+		return text
+	}
+	switch msgType {
+	case larkim.MsgTypeImage, larkim.MsgTypeFile, "media", "audio":
+		return renderStandaloneResource(msgType, raw)
+	default:
+		return ""
+	}
 }
 
 func guestText(msg *larkim.EventMessage, botOpenID string) string {
@@ -932,29 +944,9 @@ type postElement struct {
 }
 
 func renderPostContent(raw string, mentions []mentionRef, dropOpenID string) string {
-	var post postContent
-	if err := json.Unmarshal([]byte(raw), &post); err != nil {
+	post, ok := decodePostContent(raw)
+	if !ok {
 		return ""
-	}
-	// Events and history currently return title/content directly. Accept the
-	// locale-wrapped shape too, since it is also used by Lark's post APIs.
-	if post.Content == nil {
-		var locales map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(raw), &locales); err != nil {
-			return ""
-		}
-		keys := make([]string, 0, len(locales))
-		for key := range locales {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		for _, key := range keys {
-			var candidate postContent
-			if json.Unmarshal(locales[key], &candidate) == nil && candidate.Content != nil {
-				post = candidate
-				break
-			}
-		}
 	}
 
 	lines := make([]string, 0, len(post.Content)+1)
@@ -971,6 +963,34 @@ func renderPostContent(raw string, mentions []mentionRef, dropOpenID string) str
 		}
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func decodePostContent(raw string) (postContent, bool) {
+	var post postContent
+	if err := json.Unmarshal([]byte(raw), &post); err != nil {
+		return postContent{}, false
+	}
+	if post.Content != nil || strings.TrimSpace(post.Title) != "" {
+		return post, true
+	}
+	// Events and history currently return title/content directly. Accept the
+	// locale-wrapped shape too, since it is also used by Lark's post APIs.
+	var locales map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &locales); err != nil {
+		return postContent{}, false
+	}
+	keys := make([]string, 0, len(locales))
+	for key := range locales {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		var candidate postContent
+		if json.Unmarshal(locales[key], &candidate) == nil && (candidate.Content != nil || strings.TrimSpace(candidate.Title) != "") {
+			return candidate, true
+		}
+	}
+	return postContent{}, false
 }
 
 func renderPostElement(el postElement, mentions []mentionRef, dropOpenID string) string {
@@ -1211,8 +1231,9 @@ type guestLine struct {
 	Text    string
 }
 
-func (h *Hub) transcriptLines(ctx context.Context, chat string, msgs []pulledMsg, excludeID string, b binding) ([]guestLine, bool) {
+func (h *Hub) transcriptLines(ctx context.Context, chat, sessionID string, msgs []pulledMsg, excludeID string, b binding) ([]guestLine, bool) {
 	var lines []guestLine
+	resourcePaths := map[string]string{}
 	for _, m := range msgs {
 		if m.ID == "" || m.ID == excludeID || (h.appID != "" && m.SenderAppID == h.appID) {
 			continue
@@ -1226,6 +1247,9 @@ func (h *Hub) transcriptLines(ctx context.Context, chat string, msgs []pulledMsg
 			text = h.renderMergedMessage(ctx, chat, m)
 		} else {
 			text = renderPulledText(m)
+		}
+		if sessionID != "" {
+			text = h.materializeResourcesCached(ctx, sessionID, m.ID, m.MsgType, m.Content, text, resourcePaths)
 		}
 		if text == "" {
 			continue
@@ -1280,14 +1304,117 @@ func renderPulledText(m pulledMsg) string {
 	case larkim.MsgTypeText, larkim.MsgTypePost, larkim.MsgTypeInteractive:
 		return renderMessageContent(m.MsgType, m.Content, m.Mentions, "")
 	case larkim.MsgTypeImage:
-		return "[image]"
+		return renderStandaloneResource(m.MsgType, m.Content)
 	case larkim.MsgTypeFile:
-		return "[file]"
+		return renderStandaloneResource(m.MsgType, m.Content)
+	case "media", "audio":
+		return renderStandaloneResource(m.MsgType, m.Content)
 	case "":
 		return ""
 	default:
 		return "[" + m.MsgType + "]"
 	}
+}
+
+type inboundResource struct {
+	Kind        string
+	Key         string
+	Filename    string
+	Placeholder string
+}
+
+func messageResources(msgType, raw string) []inboundResource {
+	switch msgType {
+	case larkim.MsgTypePost:
+		post, ok := decodePostContent(raw)
+		if !ok {
+			return nil
+		}
+		var refs []inboundResource
+		for _, row := range post.Content {
+			for _, el := range row {
+				switch el.Tag {
+				case "img":
+					refs = appendResource(refs, "image", el.ImageKey, "", resourcePlaceholder("image", el.ImageKey))
+				case "media":
+					refs = appendResource(refs, "file", el.FileKey, el.FileName, resourcePlaceholder("video", el.FileKey))
+				case "file":
+					name, key := strings.TrimSpace(el.FileName), strings.TrimSpace(el.FileKey)
+					placeholder := resourcePlaceholder("file", cmp.Or(name, key))
+					if name != "" && key != "" {
+						placeholder = "[file: " + name + ", key: " + key + "]"
+					}
+					refs = appendResource(refs, "file", key, name, placeholder)
+				}
+			}
+		}
+		return refs
+	case larkim.MsgTypeImage, larkim.MsgTypeFile, "media", "audio":
+		var content struct {
+			ImageKey string `json:"image_key"`
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+		}
+		if json.Unmarshal([]byte(raw), &content) != nil {
+			return nil
+		}
+		if msgType == larkim.MsgTypeImage {
+			return appendResource(nil, "image", content.ImageKey, "", resourcePlaceholder("image", content.ImageKey))
+		}
+		return appendResource(nil, "file", content.FileKey, content.FileName, standaloneResourcePlaceholder(msgType, content.FileKey, content.FileName))
+	default:
+		return nil
+	}
+}
+
+func appendResource(refs []inboundResource, kind, key, filename, placeholder string) []inboundResource {
+	if key = strings.TrimSpace(key); key != "" {
+		refs = append(refs, inboundResource{Kind: kind, Key: key, Filename: strings.TrimSpace(filename), Placeholder: placeholder})
+	}
+	return refs
+}
+
+func renderStandaloneResource(msgType, raw string) string {
+	refs := messageResources(msgType, raw)
+	if len(refs) == 0 {
+		return "[" + msgType + "]"
+	}
+	return refs[0].Placeholder
+}
+
+func standaloneResourcePlaceholder(msgType, key, filename string) string {
+	if filename = strings.TrimSpace(filename); filename != "" {
+		return "[file: " + filename + ", key: " + strings.TrimSpace(key) + "]"
+	}
+	return resourcePlaceholder(msgType, key)
+}
+
+func (h *Hub) materializeResources(ctx context.Context, sessionID, messageID, msgType, raw, text string) string {
+	return h.materializeResourcesCached(ctx, sessionID, messageID, msgType, raw, text, map[string]string{})
+}
+
+func (h *Hub) materializeResourcesCached(ctx context.Context, sessionID, messageID, msgType, raw, text string, paths map[string]string) string {
+	for _, ref := range messageResources(msgType, raw) {
+		identity := ref.Kind + "\x00" + ref.Key
+		if path := paths[identity]; path != "" {
+			text = strings.ReplaceAll(text, ref.Placeholder, "[file: "+path+"]")
+			continue
+		}
+		reader, filename, err := h.lark.DownloadResource(ctx, messageID, ref.Key, ref.Kind)
+		if err != nil {
+			h.logger.Warn("lark: download message resource", "message", messageID, "key", ref.Key, "err", err)
+			continue
+		}
+		filename = cmp.Or(ref.Filename, filename, ref.Key)
+		path, err := h.router.UploadAttachment(sessionID, filename, reader)
+		if err != nil {
+			h.logger.Warn("lark: store message resource", "session", sessionID, "key", ref.Key, "err", err)
+			continue
+		}
+		paths[identity] = path
+		text = strings.ReplaceAll(text, ref.Placeholder, "[file: "+path+"]")
+	}
+	return text
 }
 
 func capGuestLines(lines []guestLine) ([]guestLine, bool) {
