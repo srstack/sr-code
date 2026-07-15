@@ -201,11 +201,13 @@ func BackendForModel(model string) string { return backendForModel(model) }
 
 // backendForModel maps a new-session model choice to its backend. Model names
 // are unique across backends except the literal "default" (the UI resolves that
-// to an explicit backend); gpt-*/o-series/codex are Codex, everything else
-// (claude-*, opus, sonnet, haiku, fable) is Claude.
+// to an explicit backend); gpt-*/o-series/codex are Codex, "opencode" is
+// OpenCode, everything else (claude-*, opus, sonnet, haiku, fable) is Claude.
 func backendForModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case m == "opencode":
+		return "opencode"
 	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"),
 		strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"),
 		strings.Contains(m, "codex"):
@@ -1471,6 +1473,9 @@ func (r *Router) runStart(ctx context.Context, sessionID, prompt, cwd, model, ba
 		if ev.Type == "subprocess.exit" {
 			r.markSendIdle(sessionID, tok)
 		}
+	}
+	if p := r.senderForBackend(backend).Path(sessionID); p != "" {
+		r.discovery.Upsert(p)
 	}
 }
 

@@ -239,11 +239,13 @@ export const BACKEND_MARKS = {
   codex: '<path d="M13.81,5.24A3.680 3.680 0 0 1 18.76,10.19A3.680 3.680 0 0 1 16.95,16.95'
     + 'A3.680 3.680 0 0 1 10.19,18.76A3.680 3.680 0 0 1 5.24,13.81A3.680 3.680 0 0 1 7.05,7.05'
     + 'A3.680 3.680 0 0 1 13.81,5.24Z" fill="currentColor"/>',
+  opencode: '<path d="M12 3.2 19.6 7.6v8.8L12 20.8 4.4 16.4V7.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="2"/>'
+    + '<path d="M9.25 9.3 6.85 12l2.4 2.7M14.75 9.3l2.4 2.7-2.4 2.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
 };
 
 // Unknown/empty backend falls back to claude, mirroring the router default.
 export function backendMark(backend) {
-  const b = backend === 'codex' ? 'codex' : 'claude';
+  const b = backend === 'codex' || backend === 'opencode' ? backend : 'claude';
   return `<svg class="backend-mark backend-mark--${b}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${BACKEND_MARKS[b]}</svg>`;
 }
 

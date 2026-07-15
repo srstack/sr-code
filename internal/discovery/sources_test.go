@@ -119,3 +119,34 @@ func TestCodexSource_IsSessionFile(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenCodeSource_DiscoversShadowJSONL(t *testing.T) {
+	tmp := t.TempDir()
+	log := filepath.Join(tmp, "project", "ses_123.jsonl")
+	writeJSONL(t, log, "ses_123", "/tmp/opencode", "hello opencode")
+	writeFile(t, filepath.Join(tmp, "project", "notes.txt"), "ignore me")
+
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)), NewOpenCodeSource(tmp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+	if err := d.scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := d.List()
+	if len(got) != 1 {
+		t.Fatalf("got %d sessions, want 1; %+v", len(got), got)
+	}
+	s := got[0]
+	if s.ID != "ses_123" {
+		t.Errorf("ID = %q, want ses_123", s.ID)
+	}
+	if s.Backend != "opencode" {
+		t.Errorf("Backend = %q, want opencode", s.Backend)
+	}
+	if s.Cwd != "/tmp/opencode" {
+		t.Errorf("Cwd = %q, want /tmp/opencode", s.Cwd)
+	}
+}

@@ -130,3 +130,38 @@ func (s CodexSource) SessionID(path string) string {
 func (s CodexSource) ReadMeta(path string) (jsonl.SessionMeta, error) {
 	return codexrollout.ReadSessionMeta(path)
 }
+
+// OpenCodeSource scans usher's shadow transcripts for opencode sessions:
+// <root>/<sanitized-cwd>/<id>.jsonl. opencode stores its native state in
+// SQLite, so usher writes this small Claude-shaped jsonl for sessions it
+// drives instead of binding discovery to opencode's internal database schema.
+type OpenCodeSource struct{ root string }
+
+func NewOpenCodeSource(root string) OpenCodeSource { return OpenCodeSource{root: root} }
+
+func (s OpenCodeSource) Backend() string { return "opencode" }
+func (s OpenCodeSource) Root() string    { return s.root }
+
+func (s OpenCodeSource) IsSessionFile(path string) bool {
+	if !strings.HasSuffix(path, ".jsonl") {
+		return false
+	}
+	rel, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	return len(parts) == 2
+}
+
+func (s OpenCodeSource) SessionID(path string) string {
+	name := filepath.Base(path)
+	if !strings.HasSuffix(name, ".jsonl") {
+		return ""
+	}
+	return strings.TrimSuffix(name, ".jsonl")
+}
+
+func (s OpenCodeSource) ReadMeta(path string) (jsonl.SessionMeta, error) {
+	return jsonl.ReadSessionMeta(path)
+}

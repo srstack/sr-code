@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -99,6 +100,9 @@ func serve(args []string) error {
 		"extra flags for spawned codex (space-separated). Empty uses codex's own approval "+
 			"policy (usher gates whatever codex natively escalates); e.g. \"-c approval_policy=untrusted\" "+
 			"to route most commands through usher like Claude.")
+	openCodeCmd := fs.String("opencode", "opencode", "path to the opencode binary (OpenCode backend)")
+	openCodeSessionsDir := fs.String("opencode-sessions-dir", "",
+		"usher-owned OpenCode shadow transcript directory; empty uses <data-dir>/opencode-sessions")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
@@ -186,11 +190,25 @@ func serve(args []string) error {
 		}
 		logger.Info("codex backend enabled", "sessions_dir", dir)
 	}
+	if *openCodeSessionsDir == "" {
+		*openCodeSessionsDir = filepath.Join(*dataDir, "opencode-sessions")
+	}
+	if *openCodeCmd != "" && commandExists(*openCodeCmd) {
+		if err := os.MkdirAll(*openCodeSessionsDir, 0o755); err != nil {
+			return fmt.Errorf("create opencode sessions dir: %w", err)
+		}
+		sources = append(sources, discovery.NewOpenCodeSource(*openCodeSessionsDir))
+		senders["opencode"] = sender.NewOpenCode(*openCodeCmd, *openCodeSessionsDir, *maxLiveSessions, logger)
+		if defaultBackend == "" {
+			defaultBackend = "opencode"
+		}
+		logger.Info("opencode backend enabled", "sessions_dir", *openCodeSessionsDir)
+	}
 
 	if len(senders) == 0 {
-		return fmt.Errorf("no backend found: neither %q (Claude Code) nor %q (Codex) exists.\n"+
-			"  run claude or codex once first, or pass --projects-dir / --codex-sessions-dir.",
-			*projectsDir, *codexSessionsDir)
+		return fmt.Errorf("no backend found: %q (Claude Code), %q (Codex), and %q (OpenCode) are unavailable.\n"+
+			"  run claude or codex once first, install opencode, or pass --projects-dir / --codex-sessions-dir / --opencode.",
+			*projectsDir, *codexSessionsDir, *openCodeCmd)
 	}
 
 	d, err := discovery.NewMulti(logger, sources...)
@@ -362,6 +380,15 @@ func addrIsLoopback(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func commandExists(cmd string) bool {
+	if strings.ContainsRune(cmd, os.PathSeparator) {
+		info, err := os.Stat(cmd)
+		return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+	}
+	_, err := exec.LookPath(cmd)
+	return err == nil
 }
 
 // hookSockPath returns the Unix socket path for the hook listener.

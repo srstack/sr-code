@@ -122,6 +122,9 @@ export async function showNewSession(prefillCwd) {
                   <option value="opusplan">Opus Plan</option>
                 </optgroup>
                 <optgroup label="Codex" id="codex-modelgroup"></optgroup>
+                <optgroup label="OpenCode" id="opencode-modelgroup">
+                  <option value="opencode">OpenCode</option>
+                </optgroup>
               </select>
             </div>
             <div class="composer-send"><button id="send">send</button></div>
@@ -154,6 +157,7 @@ export async function showNewSession(prefillCwd) {
   const syncModelColor = () => {
     const og = modelEl.selectedOptions[0] && modelEl.selectedOptions[0].closest('optgroup');
     modelEl.classList.toggle('codex', !!og && og.label === 'Codex');
+    modelEl.classList.toggle('opencode', !!og && og.label === 'OpenCode');
   };
   const applySavedModel = () => {
     try {
@@ -189,6 +193,10 @@ export async function showNewSession(prefillCwd) {
           grp.appendChild(o);
         }
       }
+    }
+    if (!backends.includes('opencode')) {
+      const og = document.getElementById('opencode-modelgroup');
+      if (og) og.remove();
     }
     applySavedModel();
   }).catch(applySavedModel);

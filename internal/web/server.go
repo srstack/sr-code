@@ -541,6 +541,8 @@ var allowedModels = map[string]bool{
 	// Codex models are NOT listed here — they're validated per request against
 	// the account's live catalog (see codexModelAllowed), so the picker supports
 	// whatever the plan offers without a hardcoded list.
+	// OpenCode means "use opencode's configured/default model".
+	"opencode": true,
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {

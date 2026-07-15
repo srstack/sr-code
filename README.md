@@ -2,8 +2,8 @@
 
 *Ultra-Simple Harness for Everything Routing.*
 
-Drive multiple Claude Code and Codex sessions from any browser — including your
-phone over Tailscale.
+Drive multiple Claude Code, Codex, and OpenCode sessions from any browser —
+including your phone over Tailscale.
 
 <p align="center">
   <img src="docs/screenshot.png" alt="usher dashboard" width="830">
@@ -17,17 +17,17 @@ approve or deny tool-permission prompts — without being at the keyboard.
 
 - Kick off a long refactor or test run and step away — from your phone, watch it
   stream, send a follow-up, and approve a permission prompt if one comes up.
-- Manage sessions across several projects — and both CLIs, Claude Code and
-  Codex, side by side — from one dashboard, instead of hunting through
-  `claude --resume` or `codex resume`.
+- Manage sessions across several projects — Claude Code, Codex, and OpenCode
+  side by side — from one dashboard, instead of hunting through `claude
+  --resume`, `codex resume`, or `opencode run --session`.
 - Route work from one main chat instead of switching tabs — quick slash commands
   by default, or plain language ("run the tests in the auth session and tell me
   what fails") once you enable the optional LLM agent ([Main chat](#main-chat)).
 
 ## Install
 
-Needs at least one of the `claude` or `codex` CLIs you've already signed in
-to. On Windows, run usher inside
+Needs at least one of the `claude`, `codex`, or `opencode` CLIs you've already
+signed in to. On Windows, run usher inside
 [WSL](https://learn.microsoft.com/en-us/windows/wsl/install).
 
 ### One-line install (recommended)
@@ -54,10 +54,10 @@ To reach usher from another device, see [Remote access](#remote-access).
 
 ## Why usher
 
-- **A thin wrapper over the native claude/codex CLIs.** usher drives the official
-  Claude Code and Codex CLIs exactly as they ship — not another agent or a layer
-  on top, no reimplemented agent loop. The CLIs do the work; usher adds a GUI,
-  remote access, and session management over both.
+- **A thin wrapper over the native agent CLIs.** usher drives Claude Code, Codex,
+  and OpenCode through their own CLIs — not another agent or a layer on top, no
+  reimplemented agent loop. The CLIs do the work; usher adds a GUI, remote
+  access, and session management around them.
 - **The same actions from any device.** List, resume, send, approve a permission,
   start a session — identical on phone and desktop, where it installs as a PWA.
   (The official GUI skips Linux; usher runs anywhere there's a browser.)
@@ -84,9 +84,10 @@ Step-by-step for both tunnels, plus the auth internals and threat model, is in
 
 ## Configuration
 
-`usher serve --help` lists every flag. Each backend turns on only if its session
-dir exists, so usher runs with either CLI or both (it needs at least one). The
-most common:
+`usher serve --help` lists every flag. Claude and Codex turn on when their
+session dirs exist; OpenCode turns on when the `opencode` command is available
+and uses an usher-owned shadow transcript dir. usher needs at least one backend.
+The most common:
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -94,6 +95,8 @@ most common:
 | `--data-dir` | `$XDG_DATA_HOME/usher` | usher's state (auth, hook socket, chat history). |
 | `--projects-dir` | `~/.claude/projects` | Claude Code session dir; enables the Claude backend when present. |
 | `--codex-sessions-dir` | `~/.codex/sessions` | Codex session dir; enables the Codex backend when present. |
+| `--opencode` | `opencode` | OpenCode binary; enables the OpenCode backend when found. |
+| `--opencode-sessions-dir` | `<data-dir>/opencode-sessions` | usher-owned JSONL shadow transcripts for OpenCode sessions. |
 | `--permission-mode` | `default` | Claude only. `default` uses the hook UI; `bypassPermissions` skips prompting. |
 | `--tmux-socket` | `usher` | Prefix for usher's tmux sockets: Claude on `<name>-claude`, Codex on `<name>-codex`. |
 | `--max-live-sessions` | `8` | Cap on live CLI processes; least-recently-used are evicted and re-spawned on the next send. |
@@ -142,8 +145,8 @@ flowchart LR
   phone["browser / phone"]
   subgraph host["your machine"]
     usher["usher<br/>web · API · hook listener"]
-    drivers["protocol drivers<br/>claude stream-json · codex app-server"]
-    files[("~/.claude/projects · ~/.codex/sessions<br/>session logs")]
+    drivers["protocol drivers<br/>claude stream-json · codex app-server · opencode run"]
+    files[("~/.claude/projects · ~/.codex/sessions · opencode shadow logs<br/>session logs")]
   end
   phone <-->|"HTTP · SSE"| usher
   usher -->|"send · resume · interrupt"| drivers
@@ -153,14 +156,16 @@ flowchart LR
   usher -->|"allow / deny"| drivers
 ```
 
-- **Discovery** is read-only: usher watches `~/.claude/projects/` and
-  `~/.codex/sessions/`, listing every session — including ones you started in a
-  terminal or IDE — tagged with the CLI that produced it. It never takes ownership.
+- **Discovery** is read-only for native JSONL stores: usher watches
+  `~/.claude/projects/`, `~/.codex/sessions/`, and its OpenCode shadow transcript
+  dir. Claude and Codex sessions you started in a terminal or IDE are listed;
+  OpenCode listing covers sessions created or continued through usher's shadow
+  logs.
 - **Sending** uses a long-running `claude -p` stream-json process per active
-  Claude session and one shared `codex app-server`. Session logs remain the
-  content source; protocols provide lifecycle, interrupts, and approvals. New
-  sessions route by the model
-  you pick: `claude-*` → Claude Code, `gpt-*` → Codex.
+  Claude session, one shared `codex app-server`, and `opencode run --session`
+  for OpenCode. Session logs remain the content source; protocols provide
+  lifecycle, interrupts, and approvals. New sessions route by the model you pick:
+  `claude-*` → Claude Code, `gpt-*` → Codex, `opencode` → OpenCode.
 - **Permissions** flow through an inline Claude `PreToolUse` hook and Codex
   app-server approval requests. A request blocks until you decide in the UI;
   remembered rules and auto-approve work for both backends.

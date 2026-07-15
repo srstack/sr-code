@@ -38,6 +38,7 @@ type timing struct{ confirm, poll time.Duration }
 type Sender struct {
 	app          *appserver.Manager // non-nil for the headless Codex backend
 	claude       *claudestream.Manager
+	opencode     *openCodeBackend
 	preAssignsID bool
 	locateFn     func(string) string
 	logger       *slog.Logger
@@ -228,6 +229,9 @@ func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-cha
 	if s.claude != nil {
 		return s.claudeTurn(ctx, sessionID, prompt, cwd, "", true)
 	}
+	if s.opencode != nil {
+		return s.opencodeTurn(ctx, sessionID, prompt, cwd, "")
+	}
 	return nil, errors.New("sender has no headless backend")
 }
 
@@ -238,6 +242,9 @@ func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model stri
 	if s.claude != nil {
 		return s.claudeTurn(ctx, sessionID, prompt, cwd, model, false)
 	}
+	if s.opencode != nil {
+		return s.opencodeTurn(ctx, sessionID, prompt, cwd, model)
+	}
 	return nil, errors.New("new sessions are unsupported by this backend")
 }
 
@@ -245,6 +252,11 @@ func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model stri
 // via --session-id) or the backend assigns its own to be discovered after spawn
 // (Codex). The router uses it to choose the new-session path.
 func (s *Sender) PreAssignsID() bool { return s.preAssignsID }
+
+// Path returns the backend transcript path for sessionID when the sender can
+// locate it. It is best-effort and mainly lets the router synchronously ingest
+// freshly-created preassigned sessions whose log was written by the sender.
+func (s *Sender) Path(sessionID string) string { return s.locate(sessionID) }
 
 // StartCodexSession spawns a brand-new session whose id the backend assigns
 // itself (Codex has no --session-id flag). It spawns under the temporary window
@@ -276,6 +288,9 @@ func (s *Sender) Has(sessionID string) bool {
 	if s.claude != nil {
 		return s.claude.Has(sessionID)
 	}
+	if s.opencode != nil {
+		return s.opencode.Has(sessionID)
+	}
 	return false
 }
 
@@ -286,6 +301,9 @@ func (s *Sender) LiveSessions() []string {
 	}
 	if s.claude != nil {
 		return s.claude.LiveSessions()
+	}
+	if s.opencode != nil {
+		return s.opencode.LiveSessions()
 	}
 	return nil
 }
@@ -300,6 +318,9 @@ func (s *Sender) Interrupt(sessionID string) error {
 	if s.claude != nil {
 		return s.claude.Interrupt(sessionID)
 	}
+	if s.opencode != nil {
+		return s.opencode.Kill(sessionID)
+	}
 	return nil
 }
 
@@ -312,6 +333,9 @@ func (s *Sender) Kill(sessionID string) error {
 	}
 	if s.claude != nil {
 		return s.claude.Kill(sessionID)
+	}
+	if s.opencode != nil {
+		return s.opencode.Kill(sessionID)
 	}
 	return nil
 }
@@ -342,6 +366,10 @@ func (s *Sender) Shutdown() {
 	}
 	if s.claude != nil {
 		s.claude.Shutdown()
+		return
+	}
+	if s.opencode != nil {
+		s.opencode.Shutdown()
 		return
 	}
 }

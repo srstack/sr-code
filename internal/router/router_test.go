@@ -121,6 +121,7 @@ func TestBackendForModel(t *testing.T) {
 		"sonnet":            "claude",
 		"haiku":             "claude",
 		"claude-fable-5":    "claude",
+		"opencode":          "opencode",
 		"":                  "claude", // unspecified → default backend
 		"default":           "claude", // ambiguous name resolves to the default backend
 		"GPT-5.5":           "codex",  // case-insensitive
