@@ -1275,18 +1275,6 @@ type hookPayload struct {
 	ToolInput      json.RawMessage `json:"tool_input"`
 	Cwd            string          `json:"cwd"`
 	TranscriptPath string          `json:"transcript_path"`
-	ContextWindow  struct {
-		TotalInputTokens  int64   `json:"total_input_tokens"`
-		TotalOutputTokens int64   `json:"total_output_tokens"`
-		ContextWindowSize int64   `json:"context_window_size"`
-		UsedPercentage    float64 `json:"used_percentage"`
-	} `json:"context_window"`
-	Model struct {
-		ID string `json:"id"`
-	} `json:"model"`
-	Effort struct {
-		Level string `json:"level"`
-	} `json:"effort"`
 }
 
 // codexPermissionDecision builds Codex's PermissionRequest hook reply:
@@ -1321,22 +1309,6 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	if ev.HookEventName == "" {
 		ev.HookEventName = eventName
 	}
-	if eventName == "claude-status-line" {
-		contextTokens := ev.ContextWindow.TotalInputTokens + ev.ContextWindow.TotalOutputTokens
-		if ev.SessionID == "" || contextTokens <= 0 {
-			writeErr(w, http.StatusBadRequest, "status line payload missing session/context usage")
-			return
-		}
-		s.router.UpdateClaudeRuntime(ev.SessionID, ev.TranscriptPath, core.SessionRuntime{
-			Model:         ev.Model.ID,
-			Effort:        ev.Effort.Level,
-			ContextTokens: contextTokens,
-			ContextWindow: ev.ContextWindow.ContextWindowSize,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{})
-		return
-	}
-
 	// PreToolUse is Claude Code's tool-approval hook; PermissionRequest is
 	// Codex's. The request payload (snake_case session_id/tool_name/tool_input/
 	// cwd) is identical for both — only the decision the hook must emit differs.

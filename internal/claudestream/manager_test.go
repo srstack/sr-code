@@ -204,6 +204,39 @@ func TestPartialTextDeltaRoutesToCurrentTurn(t *testing.T) {
 	<-done
 }
 
+func TestResultUsesLastAssistantModelContextWindow(t *testing.T) {
+	m := New("", "", "", nil, 2, nil)
+	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
+	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
+	r, w := io.Pipe()
+	done := make(chan struct{})
+	go func() { m.readLoop(p, r); close(done) }()
+	_, _ = io.WriteString(w, `{"type":"assistant","message":{"model":"claude-opus-4-7"}}`+"\n")
+	_, _ = io.WriteString(w, `{"type":"result","subtype":"success","modelUsage":{"claude-sonnet-4-6":{"contextWindow":200000},"claude-opus-4-7":{"contextWindow":1000000}}}`+"\n")
+	result := <-req.done
+	if result.Model != "claude-opus-4-7" || result.ContextWindow != 1000000 {
+		t.Fatalf("result runtime = %+v", result)
+	}
+	_ = w.Close()
+	<-done
+}
+
+func TestResultSingleModelUsageFallback(t *testing.T) {
+	m := New("", "", "", nil, 2, nil)
+	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
+	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
+	r, w := io.Pipe()
+	done := make(chan struct{})
+	go func() { m.readLoop(p, r); close(done) }()
+	_, _ = io.WriteString(w, `{"type":"result","subtype":"success","modelUsage":{"claude-sonnet-4-6":{"contextWindow":200000}}}`+"\n")
+	result := <-req.done
+	if result.Model != "claude-sonnet-4-6" || result.ContextWindow != 200000 {
+		t.Fatalf("result runtime = %+v", result)
+	}
+	_ = w.Close()
+	<-done
+}
+
 func TestMaxLiveDoesNotGrowWhenAllProcessesBusy(t *testing.T) {
 	m := New("missing", "", "", nil, 1, nil)
 	m.processes["busy"] = &process{id: "busy", turns: []*turnRequest{nil}}

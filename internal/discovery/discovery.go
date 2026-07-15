@@ -275,9 +275,8 @@ func (d *Discovery) MarkInput(id string, t time.Time) {
 	d.mu.Unlock()
 }
 
-// UpdateRuntime replaces the cached model/context snapshot for a session.
-// Claude's status-line callback supplies this directly, without rereading the
-// transcript. It returns false when discovery has not seen the session yet.
+// UpdateRuntime merges newly observed model/context fields into the cached
+// snapshot. It returns false when discovery has not seen the session yet.
 func (d *Discovery) UpdateRuntime(id string, runtime core.SessionRuntime) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -285,7 +284,18 @@ func (d *Discovery) UpdateRuntime(id string, runtime core.SessionRuntime) bool {
 	if !ok {
 		return false
 	}
-	s.Runtime = runtime
+	if runtime.Model != "" {
+		s.Runtime.Model = runtime.Model
+	}
+	if runtime.Effort != "" {
+		s.Runtime.Effort = runtime.Effort
+	}
+	if runtime.ContextTokens > 0 {
+		s.Runtime.ContextTokens = runtime.ContextTokens
+	}
+	if runtime.ContextWindow > 0 {
+		s.Runtime.ContextWindow = runtime.ContextWindow
+	}
 	d.sessions[id] = s
 	return true
 }

@@ -58,21 +58,13 @@ func TestMCPConfigArgs_NoHookSock(t *testing.T) {
 	}
 }
 
-func TestClaudeHookSettingsIncludesStatusLine(t *testing.T) {
+func TestClaudeHookSettingsDoesNotIncludeStatusLine(t *testing.T) {
 	raw := claudeHookSettings("/tmp/usher-hook.sock", slog.Default())
-	var cfg struct {
-		StatusLine struct {
-			Type    string `json:"type"`
-			Command string `json:"command"`
-		} `json:"statusLine"`
-	}
+	var cfg map[string]any
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StatusLine.Type != "command" || !strings.Contains(cfg.StatusLine.Command, "hook claude-status-line") {
-		t.Fatalf("statusLine = %+v", cfg.StatusLine)
-	}
-	if !strings.Contains(cfg.StatusLine.Command, "USHER_HOOK_SOCK=/tmp/usher-hook.sock") {
-		t.Fatalf("statusLine command missing socket: %q", cfg.StatusLine.Command)
+	if _, ok := cfg["statusLine"]; ok {
+		t.Fatalf("unexpected statusLine in settings: %s", raw)
 	}
 }

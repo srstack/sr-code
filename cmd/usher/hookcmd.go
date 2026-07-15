@@ -36,14 +36,11 @@ func runHook(args []string) error {
 		return fmt.Errorf("usage: usher hook <event-name>")
 	}
 	event := args[0]
-	statusLine := event == "claude-status-line"
 
 	sockPath := os.Getenv("USHER_HOOK_SOCK")
 	if sockPath == "" {
 		// Not a usher-managed session — fail open at once.
-		if !statusLine {
-			fmt.Println("{}")
-		}
+		fmt.Println("{}")
 		return nil
 	}
 
@@ -77,9 +74,6 @@ func runHook(args []string) error {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			if statusLine {
-				return nil // telemetry is best-effort; never stall Claude's UI
-			}
 			// usher down / restarting → retry until we give up, then fail open.
 			if time.Now().After(deadline) {
 				fmt.Fprintln(os.Stderr, "usher hook: server unreachable for", hookConnectTimeout, "- failing open")
@@ -92,18 +86,13 @@ func runHook(args []string) error {
 		out, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			if statusLine {
-				return nil
-			}
 			// Reachable but declined (shouldn't happen for an env-tagged
 			// session) → fail open.
 			fmt.Fprintln(os.Stderr, "usher hook: server returned", resp.StatusCode, ":", strings.TrimSpace(string(out)))
 			fmt.Println("{}")
 			return nil
 		}
-		if !statusLine {
-			fmt.Println(strings.TrimRight(string(out), "\n"))
-		}
+		fmt.Println(strings.TrimRight(string(out), "\n"))
 		return nil
 	}
 }

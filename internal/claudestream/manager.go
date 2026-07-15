@@ -18,8 +18,10 @@ import (
 )
 
 type Result struct {
-	IsError bool
-	Subtype string
+	IsError       bool
+	Subtype       string
+	Model         string
+	ContextWindow int64
 }
 
 // Delta is ephemeral protocol output used for live preview. Session JSONL
@@ -29,6 +31,7 @@ type Delta struct{ Text string }
 type turnRequest struct {
 	done   chan Result
 	deltas chan Delta
+	model  string
 }
 
 // finish closes deltas before done, so a receiver of done may safely abandon
@@ -200,7 +203,13 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 			Type    string `json:"type"`
 			Subtype string `json:"subtype"`
 			IsError bool   `json:"is_error"`
-			Event   struct {
+			Message struct {
+				Model string `json:"model"`
+			} `json:"message"`
+			ModelUsage map[string]struct {
+				ContextWindow int64 `json:"contextWindow"`
+			} `json:"modelUsage"`
+			Event struct {
 				Type  string `json:"type"`
 				Delta struct {
 					Type string `json:"type"`
@@ -223,6 +232,9 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 				default: // preview may drop under backpressure; JSONL truth-up repairs it
 				}
 			}
+			if len(p.turns) > 0 && p.turns[0] != nil && e.Message.Model != "" {
+				p.turns[0].model = e.Message.Model
+			}
 			p.mu.Unlock()
 			continue
 		}
@@ -235,7 +247,14 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 		p.lastUsed = time.Now()
 		p.mu.Unlock()
 		if req != nil {
-			req.finish(Result{IsError: e.IsError, Subtype: e.Subtype})
+			model := req.model
+			usage, ok := e.ModelUsage[model]
+			if !ok && len(e.ModelUsage) == 1 {
+				for fallbackModel, fallbackUsage := range e.ModelUsage {
+					model, usage = fallbackModel, fallbackUsage
+				}
+			}
+			req.finish(Result{IsError: e.IsError, Subtype: e.Subtype, Model: model, ContextWindow: usage.ContextWindow})
 		}
 	}
 	if err := s.Err(); err != nil {

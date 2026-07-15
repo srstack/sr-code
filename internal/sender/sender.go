@@ -118,10 +118,8 @@ func claudeHookSettings(hookSock string, logger *slog.Logger) string {
 		return ""
 	}
 	cmd := exe + " hook PreToolUse"
-	statusCmd := exe + " hook claude-status-line"
 	if hookSock != "" {
 		cmd = "USHER_HOOK_SOCK=" + hookSock + " " + cmd
-		statusCmd = "USHER_HOOK_SOCK=" + hookSock + " " + statusCmd
 	}
 	settings := map[string]any{
 		"hooks": map[string]any{"PreToolUse": []any{
@@ -129,7 +127,6 @@ func claudeHookSettings(hookSock string, logger *slog.Logger) string {
 				map[string]any{"type": "command", "command": cmd, "timeout": 604800},
 			}},
 		}},
-		"statusLine": map[string]any{"type": "command", "command": statusCmd},
 	}
 	b, _ := json.Marshal(settings)
 	return string(b)
@@ -376,6 +373,7 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 				if !ok {
 					select {
 					case result := <-done:
+						emitClaudeRuntime(ctx, out, result)
 						if result.IsError && result.Subtype != "error_during_execution" {
 							emitError(ctx, out, "claude turn failed: "+result.Subtype)
 						}
@@ -397,6 +395,7 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 				// the log reach its completion marker before cancelling it.
 				drainTail(ctx, out, events, cancel, 3*time.Second, s.logger,
 					"claude rollout drain timed out", "session_id", id)
+				emitClaudeRuntime(ctx, out, result)
 				return
 			case <-ctx.Done():
 				return
@@ -404,6 +403,17 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 		}
 	}()
 	return out, nil
+}
+
+func emitClaudeRuntime(ctx context.Context, out chan<- StreamEvent, result claudestream.Result) bool {
+	if result.ContextWindow <= 0 {
+		return true
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"model":          result.Model,
+		"context_window": result.ContextWindow,
+	})
+	return sendEvent(ctx, out, StreamEvent{Type: "session.runtime", Raw: raw})
 }
 
 // appTurn keeps rollout jsonl as the content plane while app-server supplies
