@@ -163,8 +163,9 @@ flowchart LR
   content source; protocols provide lifecycle, interrupts, and approvals. New
   sessions route by the model
   you pick: `claude-*` → Claude Code, `gpt-*` → Codex.
-- **Permissions** flow through an inline Claude `PreToolUse` hook and Codex
-  app-server approval requests. A request blocks until you decide in the UI;
+- **Permissions** flow through an inline Claude `PermissionRequest` hook and
+  Codex app-server approval requests. Claude keeps a narrow `PreToolUse` hook
+  for `AskUserQuestion` answers. A request blocks until you decide in the UI;
   remembered rules and auto-approve work for both backends.
 - **Session terminals** provide one tmux shell per conversation, starting in its
   cwd. Hiding the panel leaves the shell running; `exit` or session deletion

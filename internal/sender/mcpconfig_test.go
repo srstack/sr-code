@@ -58,7 +58,7 @@ func TestMCPConfigArgs_NoHookSock(t *testing.T) {
 	}
 }
 
-func TestClaudeHookSettingsDoesNotIncludeStatusLine(t *testing.T) {
+func TestClaudeHookSettings(t *testing.T) {
 	raw := claudeHookSettings("/tmp/usher-hook.sock", slog.Default())
 	var cfg map[string]any
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
@@ -67,4 +67,27 @@ func TestClaudeHookSettingsDoesNotIncludeStatusLine(t *testing.T) {
 	if _, ok := cfg["statusLine"]; ok {
 		t.Fatalf("unexpected statusLine in settings: %s", raw)
 	}
+	hooks := cfg["hooks"].(map[string]any)
+	assertHook := func(event, matcher, commandSuffix string) {
+		t.Helper()
+		groups, ok := hooks[event].([]any)
+		if !ok || len(groups) != 1 {
+			t.Fatalf("%s groups = %#v", event, hooks[event])
+		}
+		group := groups[0].(map[string]any)
+		if group["matcher"] != matcher {
+			t.Errorf("%s matcher = %q, want %q", event, group["matcher"], matcher)
+		}
+		handlers := group["hooks"].([]any)
+		handler := handlers[0].(map[string]any)
+		command := handler["command"].(string)
+		if !strings.HasPrefix(command, "USHER_HOOK_SOCK=/tmp/usher-hook.sock ") || !strings.HasSuffix(command, commandSuffix) {
+			t.Errorf("%s command = %q", event, command)
+		}
+		if handler["timeout"] != float64(604800) {
+			t.Errorf("%s timeout = %v", event, handler["timeout"])
+		}
+	}
+	assertHook("PermissionRequest", "*", " hook PermissionRequest")
+	assertHook("PreToolUse", "AskUserQuestion", " hook PreToolUse")
 }

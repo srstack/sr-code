@@ -732,7 +732,7 @@ DO NOT USE FOR: routing into an existing session that matches the work — use s
 					Type: "function",
 					Function: ChatFunction{
 						Name: "list_pending_interactions",
-						Description: `List PreToolUse permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
+						Description: `List permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
 
 			USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
 
@@ -748,7 +748,7 @@ DO NOT USE FOR: routing into an existing session that matches the work — use s
 					Type: "function",
 					Function: ChatFunction{
 						Name: "respond_to_interaction",
-						Description: `Approve or deny a single pending PreToolUse permission request by id.
+						Description: `Approve or deny a single pending permission request by id.
 
 			USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
 
@@ -770,7 +770,7 @@ DO NOT USE FOR: routing into an existing session that matches the work — use s
 			Type: "function",
 			Function: ChatFunction{
 				Name: "set_auto_approve",
-				Description: `Turn a session's permission auto-approval on or off. When on, usher silently allows that session's PreToolUse prompts instead of queuing them for a decision.
+				Description: `Turn a session's permission auto-approval on or off. When on, usher silently allows that session's permission prompts instead of queuing them for a decision.
 
 USE FOR: "stop asking me about session X", "auto-approve the deploy session", "let X run unattended", and turning it back off ("ask me again for X").
 

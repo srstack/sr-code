@@ -1276,12 +1276,13 @@ type hookPayload struct {
 	TranscriptPath string          `json:"transcript_path"`
 }
 
-// codexPermissionDecision builds Codex's PermissionRequest hook reply:
+// permissionRequestDecision builds the PermissionRequest hook reply shared by
+// Claude Code and legacy hook-based Codex sessions:
 // {"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":
 // {"behavior":"allow"|"deny","message":"…"}}}. message is included only on a
 // deny with a reason. An empty/allow reply lets the tool proceed; deny blocks it
 // (Codex's built-in approval flow is skipped because the hook decided).
-func codexPermissionDecision(behavior, reason string) map[string]any {
+func permissionRequestDecision(behavior, reason string) map[string]any {
 	dec := map[string]any{"behavior": behavior}
 	if behavior == "deny" && reason != "" {
 		dec["message"] = reason
@@ -1336,10 +1337,9 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if eventName == "PermissionRequest" {
-		// Codex's shape (see codexPermissionDecision). No updatedInput channel
-		// (reserved → fails closed), so the AskUserQuestion answer-merge below is
-		// Claude-only.
-		writeJSON(w, http.StatusOK, codexPermissionDecision(decision, resp.Reason))
+		// PermissionRequest has no AskUserQuestion answer path; Claude handles
+		// that interaction through the dedicated PreToolUse hook below.
+		writeJSON(w, http.StatusOK, permissionRequestDecision(decision, resp.Reason))
 		return
 	}
 

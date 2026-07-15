@@ -117,16 +117,27 @@ func claudeHookSettings(hookSock string, logger *slog.Logger) string {
 		logger.Warn("claude hook: cannot resolve usher executable", "err", err)
 		return ""
 	}
-	cmd := exe + " hook PreToolUse"
-	if hookSock != "" {
-		cmd = "USHER_HOOK_SOCK=" + hookSock + " " + cmd
+	hookCommand := func(event string) string {
+		cmd := exe + " hook " + event
+		if hookSock != "" {
+			cmd = "USHER_HOOK_SOCK=" + hookSock + " " + cmd
+		}
+		return cmd
+	}
+	handler := func(event string) []any {
+		return []any{map[string]any{
+			"type": "command", "command": hookCommand(event), "timeout": 604800,
+		}}
 	}
 	settings := map[string]any{
-		"hooks": map[string]any{"PreToolUse": []any{
-			map[string]any{"matcher": "", "hooks": []any{
-				map[string]any{"type": "command", "command": cmd, "timeout": 604800},
-			}},
-		}},
+		"hooks": map[string]any{
+			// Let Claude's native permission policy settle safe operations and
+			// route only prompts it would otherwise show to a terminal through
+			// usher. AskUserQuestion still needs PreToolUse so the web UI can
+			// collect an answer and return it as updatedInput under -p.
+			"PermissionRequest": []any{map[string]any{"matcher": "*", "hooks": handler("PermissionRequest")}},
+			"PreToolUse":        []any{map[string]any{"matcher": "AskUserQuestion", "hooks": handler("PreToolUse")}},
+		},
 	}
 	b, _ := json.Marshal(settings)
 	return string(b)
