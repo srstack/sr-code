@@ -25,7 +25,8 @@ make lark          # from the repo root; builds ./usher-lark
 2. Grant permissions: read/send group messages (`im:message`), upload images
    (`im:resource`), add reactions (`im:message.reactions:write`), and message
    history read for guest thread context. `im:chat:readonly` is optional and
-   only improves display names in guest transcripts.
+   improves member names; the optional **Get application information**
+   permission improves names of other bots/apps in guest transcripts.
 3. Under **Events & callbacks**, set the subscription mode to **long
    connection** (长连接) and subscribe to `im.message.receive_v1`; set the
    card callback mode to the long connection as well.
@@ -61,6 +62,14 @@ The first mention creates a new usher session rooted at that Lark message.
 Later mentions in the same thread are turn boundaries: messages between
 mentions are pulled from Lark history and included as background context, but
 they are not sent as prompts by themselves.
+When a thread starts from an interactive card, its visible title and content
+are included in that background context; mentions inside the card do not
+trigger a turn.
+
+Attachments on the first mention are not transferred into the new session.
+The session ID—and therefore its managed attachment directory—does not exist
+until the initial prompt has already been sent. Rich-text resource elements in
+that creation prompt remain textual placeholders.
 
 `--cwd` and `--model` are accepted only on the creation mention. The default
 cwd is `--default-cwd` (default `/tmp`). An empty allowlist disables guest

@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkchannel "github.com/larksuite/oapi-sdk-go/v3/channel"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -34,7 +37,9 @@ type larkAPI interface {
 	// React adds an emoji reaction to a message.
 	React(ctx context.Context, messageID, emojiType string) error
 	ThreadMessages(ctx context.Context, threadID string, afterMs int64, limit int) ([]pulledMsg, bool, error)
+	MergedMessages(ctx context.Context, messageID string) ([]pulledMsg, error)
 	ChatMemberNames(ctx context.Context, chatID string) (map[string]string, error)
+	AppName(ctx context.Context, appID string) (string, error)
 	BotInfo(ctx context.Context) (string, error)
 }
 
@@ -46,13 +51,13 @@ type mentionRef struct {
 
 // pulledMsg is the hub-facing shape of one thread-history message.
 type pulledMsg struct {
-	ID         string
-	CreateTime int64
-	SenderOpen string
-	SenderApp  bool
-	MsgType    string
-	Content    string
-	Mentions   []mentionRef
+	ID          string
+	CreateTime  int64
+	SenderOpen  string
+	SenderAppID string
+	MsgType     string
+	Content     string
+	Mentions    []mentionRef
 }
 
 // larkClient implements larkAPI on the official SDK client.
@@ -227,6 +232,29 @@ func (l *larkClient) ThreadMessages(ctx context.Context, threadID string, afterM
 	return out, truncated, nil
 }
 
+func (l *larkClient) MergedMessages(ctx context.Context, messageID string) ([]pulledMsg, error) {
+	resp, err := l.c.Im.V1.Message.Get(ctx, larkim.NewGetMessageReqBuilder().
+		MessageId(messageID).
+		Build())
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success() {
+		return nil, apiErr("get merged message", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil {
+		return nil, nil
+	}
+	out := make([]pulledMsg, 0, len(resp.Data.Items))
+	for _, item := range resp.Data.Items {
+		if item == nil || deref(item.UpperMessageId) == "" {
+			continue
+		}
+		out = append(out, convertPulled(item))
+	}
+	return out, nil
+}
+
 func convertPulled(m *larkim.Message) pulledMsg {
 	if m == nil {
 		return pulledMsg{}
@@ -241,8 +269,9 @@ func convertPulled(m *larkim.Message) pulledMsg {
 		pm.Content = deref(m.Body.Content)
 	}
 	if m.Sender != nil {
-		pm.SenderApp = deref(m.Sender.SenderType) == "app"
-		if !pm.SenderApp {
+		if deref(m.Sender.SenderType) == "app" {
+			pm.SenderAppID = deref(m.Sender.Id)
+		} else {
 			pm.SenderOpen = deref(m.Sender.Id)
 		}
 	}
@@ -299,6 +328,22 @@ func (l *larkClient) ChatMemberNames(ctx context.Context, chatID string) (map[st
 		}
 	}
 	return names, nil
+}
+
+func (l *larkClient) AppName(ctx context.Context, appID string) (string, error) {
+	resp, err := l.c.Application.V6.Application.Get(ctx, larkapplication.NewGetApplicationReqBuilder().
+		AppId(appID).
+		Build())
+	if err != nil {
+		return "", err
+	}
+	if !resp.Success() {
+		return "", apiErr("get application", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.App == nil {
+		return "", errors.New("lark get application: empty response")
+	}
+	return strings.TrimSpace(deref(resp.Data.App.AppName)), nil
 }
 
 func (l *larkClient) BotInfo(ctx context.Context) (string, error) {

@@ -43,6 +43,7 @@ type RouterAPI interface {
 
 // Config configures a Hub. App credentials are baked into the lark client.
 type Config struct {
+	AppID     string // usher's Lark app id (cli_...), used to filter its own messages
 	ChatID    string // the Lark group chat usher mirrors into (oc_...)
 	StatePath string // session→thread map file; "" = in-memory (tests)
 	// AllowedUserIDs whitelists open ids (ou_...) that may drive sessions;
@@ -72,6 +73,7 @@ const ackEmoji = "Get"
 const maxImageBytes = 10 << 20
 const guestCapMsgs = 60
 const guestTranscriptRunes = 6000
+const larkMsgTypeMergeForward = "merge_forward"
 
 // askEntry remembers a posted AskUserQuestion awaiting an answer: the question
 // text (to key the answer) and the option labels (so a tapped index → label).
@@ -91,6 +93,7 @@ type Hub struct {
 	router       RouterAPI
 	store        *threadStore
 	chat         string
+	appID        string
 	allowed      map[string]bool // empty = any chat member allowed
 	guestEnabled bool
 	defaultCwd   string
@@ -125,8 +128,9 @@ type Hub struct {
 	seenMu sync.Mutex
 	seen   map[string]time.Time
 
-	namesMu sync.Mutex
-	names   map[string]map[string]string // chat id -> open id -> display name
+	namesMu  sync.Mutex
+	names    map[string]map[string]string // chat id -> open id -> display name
+	appNames map[string]string            // app id -> display name or stable fallback
 
 	// spawn runs accepted-inbound routing off the websocket handler
 	// goroutine (see HandleMessage). Tests override it to run synchronously.
@@ -158,6 +162,7 @@ func NewHub(client larkAPI, router RouterAPI, cfg Config, logger *slog.Logger) (
 		router:        router,
 		store:         store,
 		chat:          cfg.ChatID,
+		appID:         strings.TrimSpace(cfg.AppID),
 		allowed:       allowed,
 		guestEnabled:  len(allowed) > 0,
 		defaultCwd:    defaultCwd,
@@ -169,6 +174,7 @@ func NewHub(client larkAPI, router RouterAPI, cfg Config, logger *slog.Logger) (
 		recentSent:    map[string]string{},
 		seen:          map[string]time.Time{},
 		names:         map[string]map[string]string{},
+		appNames:      map[string]string{},
 		spawn:         func(f func()) { go f() },
 	}, nil
 }
@@ -744,6 +750,11 @@ func (h *Hub) handleGuest(event *larkim.P2MessageReceiveV1) {
 }
 
 func (h *Hub) guestCreate(ctx context.Context, chat string, msg guestMeta, text string) {
+	// The creation mention cannot materialize Lark resources into usher's
+	// per-session attachment directory: that directory needs the session ID,
+	// while StartSession sends this initial prompt as part of creating it.
+	// Keep resource placeholders in the prompt; attachment transfer is only a
+	// supported future path for later turns on an already-bound session.
 	cwd, model, instruction, err := parseGuestFlags(text, h.defaultCwd)
 	if err != nil {
 		_, _ = h.lark.ReplyText(ctx, msg.id, "⚠️ "+err.Error())
@@ -853,20 +864,27 @@ func (h *Hub) ack(ctx context.Context, messageID string) {
 	}
 }
 
-// inboundText extracts the typed text of an inbound message (text messages
-// only; posts/files/etc. are ignored).
+// inboundText extracts the user-visible text of an inbound text or post
+// message. Other message types remain ignored as turn boundaries.
 func inboundText(msg *larkim.EventMessage) string {
-	if deref(msg.MessageType) != larkim.MsgTypeText {
-		return ""
-	}
-	return renderTextContent(deref(msg.Content), eventMentions(msg.Mentions), "")
+	return renderMessageContent(deref(msg.MessageType), deref(msg.Content), eventMentions(msg.Mentions), "")
 }
 
 func guestText(msg *larkim.EventMessage, botOpenID string) string {
-	if deref(msg.MessageType) != larkim.MsgTypeText {
+	return renderMessageContent(deref(msg.MessageType), deref(msg.Content), eventMentions(msg.Mentions), botOpenID)
+}
+
+func renderMessageContent(msgType, raw string, mentions []mentionRef, dropOpenID string) string {
+	switch msgType {
+	case larkim.MsgTypeText:
+		return renderTextContent(raw, mentions, dropOpenID)
+	case larkim.MsgTypePost:
+		return renderPostContent(raw, mentions, dropOpenID)
+	case larkim.MsgTypeInteractive:
+		return renderCardContent(raw, mentions, dropOpenID)
+	default:
 		return ""
 	}
-	return renderTextContent(deref(msg.Content), eventMentions(msg.Mentions), botOpenID)
 }
 
 func renderTextContent(raw string, mentions []mentionRef, dropOpenID string) string {
@@ -892,6 +910,271 @@ func renderTextContent(raw string, mentions []mentionRef, dropOpenID string) str
 		text = strings.ReplaceAll(text, m.Key, repl)
 	}
 	return strings.TrimSpace(mentionPlaceholder.ReplaceAllString(text, ""))
+}
+
+type postContent struct {
+	Title   string          `json:"title"`
+	Content [][]postElement `json:"content"`
+}
+
+type postElement struct {
+	Tag       string   `json:"tag"`
+	Text      string   `json:"text"`
+	Href      string   `json:"href"`
+	UserID    string   `json:"user_id"`
+	UserName  string   `json:"user_name"`
+	ImageKey  string   `json:"image_key"`
+	FileKey   string   `json:"file_key"`
+	FileName  string   `json:"file_name"`
+	EmojiType string   `json:"emoji_type"`
+	Language  string   `json:"language"`
+	Style     []string `json:"style"`
+}
+
+func renderPostContent(raw string, mentions []mentionRef, dropOpenID string) string {
+	var post postContent
+	if err := json.Unmarshal([]byte(raw), &post); err != nil {
+		return ""
+	}
+	// Events and history currently return title/content directly. Accept the
+	// locale-wrapped shape too, since it is also used by Lark's post APIs.
+	if post.Content == nil {
+		var locales map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &locales); err != nil {
+			return ""
+		}
+		keys := make([]string, 0, len(locales))
+		for key := range locales {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			var candidate postContent
+			if json.Unmarshal(locales[key], &candidate) == nil && candidate.Content != nil {
+				post = candidate
+				break
+			}
+		}
+	}
+
+	lines := make([]string, 0, len(post.Content)+1)
+	if title := strings.TrimSpace(post.Title); title != "" {
+		lines = append(lines, title)
+	}
+	for _, paragraph := range post.Content {
+		var line strings.Builder
+		for _, el := range paragraph {
+			line.WriteString(renderPostElement(el, mentions, dropOpenID))
+		}
+		if text := strings.TrimSpace(line.String()); text != "" {
+			lines = append(lines, text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func renderPostElement(el postElement, mentions []mentionRef, dropOpenID string) string {
+	switch el.Tag {
+	case "text", "code_block":
+		return el.Text
+	case "a":
+		text, href := strings.TrimSpace(el.Text), strings.TrimSpace(el.Href)
+		if href == "" || text == href {
+			return cmp.Or(text, href)
+		}
+		if text == "" {
+			return href
+		}
+		return text + " (" + href + ")"
+	case "at":
+		for _, mention := range mentions {
+			// Accept both the documented placeholder and a resolved open_id.
+			if el.UserID != mention.Key && el.UserID != mention.OpenID {
+				continue
+			}
+			if mention.OpenID == dropOpenID {
+				return ""
+			}
+			return "@" + cmp.Or(strings.TrimSpace(el.UserName), strings.TrimSpace(mention.Name), shortMember(mention.OpenID))
+		}
+		if name := strings.TrimSpace(el.UserName); name != "" {
+			return "@" + name
+		}
+		return ""
+	case "img":
+		return resourcePlaceholder("image", el.ImageKey)
+	case "media":
+		return resourcePlaceholder("video", el.FileKey)
+	case "file":
+		name, key := strings.TrimSpace(el.FileName), strings.TrimSpace(el.FileKey)
+		if name != "" && key != "" {
+			return "[file: " + name + ", key: " + key + "]"
+		}
+		return resourcePlaceholder("file", cmp.Or(name, key))
+	case "emotion":
+		return resourcePlaceholder("emoji", el.EmojiType)
+	case "hr":
+		return "---"
+	default:
+		return el.Text
+	}
+}
+
+func resourcePlaceholder(kind, key string) string {
+	if key = strings.TrimSpace(key); key != "" {
+		return "[" + kind + ": " + key + "]"
+	}
+	return "[" + kind + "]"
+}
+
+type cardContent struct {
+	Title    json.RawMessage `json:"title"`
+	Elements json.RawMessage `json:"elements"`
+	Header   struct {
+		Title json.RawMessage `json:"title"`
+	} `json:"header"`
+	Body struct {
+		Elements json.RawMessage `json:"elements"`
+	} `json:"body"`
+}
+
+type cardElement struct {
+	Tag      string          `json:"tag"`
+	Text     json.RawMessage `json:"text"`
+	Content  string          `json:"content"`
+	Href     string          `json:"href"`
+	URL      string          `json:"url"`
+	UserID   string          `json:"user_id"`
+	UserName string          `json:"user_name"`
+	ImageKey string          `json:"image_key"`
+	Elements json.RawMessage `json:"elements"`
+	Actions  json.RawMessage `json:"actions"`
+	Columns  json.RawMessage `json:"columns"`
+	Fields   json.RawMessage `json:"fields"`
+	Options  json.RawMessage `json:"options"`
+}
+
+func renderCardContent(raw string, mentions []mentionRef, dropOpenID string) string {
+	var card cardContent
+	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+		return ""
+	}
+	lines := compactCardText(cardVisibleText(card.Title), cardVisibleText(card.Header.Title))
+	elements := card.Elements
+	if len(elements) == 0 {
+		elements = card.Body.Elements
+	}
+	lines = append(lines, renderCardNodes(elements, mentions, dropOpenID)...)
+	return strings.TrimSpace(strings.Join(compactCardText(lines...), "\n"))
+}
+
+func renderCardNodes(raw json.RawMessage, mentions []mentionRef, dropOpenID string) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var nodes []json.RawMessage
+	if json.Unmarshal(raw, &nodes) == nil {
+		var lines []string
+		for _, node := range nodes {
+			var row []json.RawMessage
+			if json.Unmarshal(node, &row) == nil {
+				var parts []string
+				for _, item := range row {
+					parts = append(parts, renderCardNode(item, mentions, dropOpenID))
+				}
+				lines = append(lines, joinCardRow(parts))
+				continue
+			}
+			lines = append(lines, renderCardNode(node, mentions, dropOpenID))
+		}
+		return compactCardText(lines...)
+	}
+	return compactCardText(renderCardNode(raw, mentions, dropOpenID))
+}
+
+func joinCardRow(parts []string) string {
+	var b strings.Builder
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			b.WriteString(part)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func renderCardNode(raw json.RawMessage, mentions []mentionRef, dropOpenID string) string {
+	var el cardElement
+	if json.Unmarshal(raw, &el) != nil {
+		return ""
+	}
+	text := cardVisibleText(el.Text)
+	switch el.Tag {
+	case "markdown":
+		text = el.Content
+	case "a":
+		return renderCardLink(text, cmp.Or(strings.TrimSpace(el.Href), strings.TrimSpace(el.URL)))
+	case "at":
+		for _, mention := range mentions {
+			if el.UserID != mention.Key && el.UserID != mention.OpenID {
+				continue
+			}
+			if mention.OpenID == dropOpenID {
+				return ""
+			}
+			return "@" + cmp.Or(strings.TrimSpace(el.UserName), strings.TrimSpace(mention.Name), shortMember(mention.OpenID))
+		}
+		if el.UserName != "" {
+			return "@" + el.UserName
+		}
+	case "img":
+		return resourcePlaceholder("image", el.ImageKey)
+	}
+	children := append(renderCardNodes(el.Elements, mentions, dropOpenID), renderCardNodes(el.Actions, mentions, dropOpenID)...)
+	children = append(children, renderCardNodes(el.Columns, mentions, dropOpenID)...)
+	children = append(children, renderCardNodes(el.Fields, mentions, dropOpenID)...)
+	children = append(children, renderCardNodes(el.Options, mentions, dropOpenID)...)
+	if len(children) == 0 {
+		return text
+	}
+	return strings.Join(compactCardText(append([]string{text}, children...)...), "\n")
+}
+
+func cardVisibleText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var obj struct {
+		Content string `json:"content"`
+		Text    string `json:"text"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return cmp.Or(obj.Content, obj.Text)
+	}
+	return ""
+}
+
+func renderCardLink(text, href string) string {
+	if href == "" || text == href {
+		return cmp.Or(text, href)
+	}
+	if text == "" {
+		return href
+	}
+	return text + " (" + href + ")"
+}
+
+func compactCardText(in ...string) []string {
+	out := make([]string, 0, len(in))
+	for _, text := range in {
+		if text = strings.TrimSpace(text); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
 }
 
 func eventMentions(in []*larkim.MentionEvent) []mentionRef {
@@ -931,18 +1214,27 @@ type guestLine struct {
 func (h *Hub) transcriptLines(ctx context.Context, chat string, msgs []pulledMsg, excludeID string, b binding) ([]guestLine, bool) {
 	var lines []guestLine
 	for _, m := range msgs {
-		if m.ID == "" || m.ID == excludeID || m.SenderApp {
+		if m.ID == "" || m.ID == excludeID || (h.appID != "" && m.SenderAppID == h.appID) {
 			continue
 		}
 		if b.WMTime > 0 && (m.CreateTime < b.WMTime || (m.CreateTime == b.WMTime && m.ID == b.WMID)) {
 			continue
 		}
 		h.harvestMentions(chat, m.Mentions)
-		text := renderPulledText(m)
+		text := ""
+		if m.MsgType == larkMsgTypeMergeForward {
+			text = h.renderMergedMessage(ctx, chat, m)
+		} else {
+			text = renderPulledText(m)
+		}
 		if text == "" {
 			continue
 		}
-		l := guestLine{Speaker: h.speakerName(ctx, chat, m.SenderOpen), Text: text}
+		speaker := h.appName(ctx, m.SenderAppID)
+		if m.SenderAppID == "" {
+			speaker = h.speakerName(ctx, chat, m.SenderOpen)
+		}
+		l := guestLine{Speaker: speaker, Text: text}
 		if m.CreateTime > 0 {
 			l.Time = time.UnixMilli(m.CreateTime)
 		}
@@ -951,10 +1243,42 @@ func (h *Hub) transcriptLines(ctx context.Context, chat string, msgs []pulledMsg
 	return capGuestLines(lines)
 }
 
+func (h *Hub) renderMergedMessage(ctx context.Context, chat string, parent pulledMsg) string {
+	children, err := h.lark.MergedMessages(ctx, parent.ID)
+	if err != nil {
+		h.logger.Warn("lark: expand merged message", "message", parent.ID, "err", err)
+		return "[merge_forward]"
+	}
+	lines := make([]string, 0, len(children))
+	for _, child := range children {
+		if child.ID == "" || (h.appID != "" && child.SenderAppID == h.appID) {
+			continue
+		}
+		h.harvestMentions(chat, child.Mentions)
+		text := renderPulledText(child)
+		if text == "" {
+			continue
+		}
+		speaker := h.appName(ctx, child.SenderAppID)
+		if child.SenderAppID == "" {
+			speaker = h.speakerName(ctx, chat, child.SenderOpen)
+		}
+		line := guestLine{Speaker: speaker, Text: text}
+		if child.CreateTime > 0 {
+			line.Time = time.UnixMilli(child.CreateTime)
+		}
+		lines = append(lines, strings.TrimSuffix(formatGuestLine(line), "\n"))
+	}
+	if len(lines) == 0 {
+		return "[merge_forward]"
+	}
+	return "[forwarded messages]\n" + strings.Join(lines, "\n")
+}
+
 func renderPulledText(m pulledMsg) string {
 	switch m.MsgType {
-	case larkim.MsgTypeText:
-		return renderTextContent(m.Content, m.Mentions, "")
+	case larkim.MsgTypeText, larkim.MsgTypePost, larkim.MsgTypeInteractive:
+		return renderMessageContent(m.MsgType, m.Content, m.Mentions, "")
 	case larkim.MsgTypeImage:
 		return "[image]"
 	case larkim.MsgTypeFile:
@@ -1124,6 +1448,27 @@ func (h *Hub) speakerName(ctx context.Context, chat, openID string) string {
 		name = shortMember(openID)
 		h.names[chat][openID] = name
 	}
+	h.namesMu.Unlock()
+	return name
+}
+
+func (h *Hub) appName(ctx context.Context, appID string) string {
+	if appID == "" {
+		return "App"
+	}
+	h.namesMu.Lock()
+	if name := h.appNames[appID]; name != "" {
+		h.namesMu.Unlock()
+		return name
+	}
+	h.namesMu.Unlock()
+
+	name, _ := h.lark.AppName(ctx, appID)
+	if name = strings.TrimSpace(name); name == "" {
+		name = "app-" + strings.TrimPrefix(shortMember(appID), "member-")
+	}
+	h.namesMu.Lock()
+	h.appNames[appID] = name
 	h.namesMu.Unlock()
 	return name
 }
