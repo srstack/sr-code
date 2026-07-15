@@ -64,14 +64,15 @@ func init() {
 var _ usheragent.AgentAPI = (*router.Router)(nil)
 
 type Server struct {
-	addr         string
-	hookSockPath string
-	auth         *auth.Store
-	router       *router.Router
-	main         *mainchat.Store
-	agent        usheragent.Agent
-	push         *push.Manager
-	logger       *slog.Logger
+	addr           string
+	hookSockPath   string
+	attachmentsDir string
+	auth           *auth.Store
+	router         *router.Router
+	main           *mainchat.Store
+	agent          usheragent.Agent
+	push           *push.Manager
+	logger         *slog.Logger
 	// codexModelsPath is ~/.codex/models_cache.json (codex's per-account model
 	// catalog). "" when codex isn't enabled. Read per request so a plan change
 	// (cache refetch) shows up without restarting usher.
@@ -97,6 +98,7 @@ type Server struct {
 func NewServer(
 	addr string,
 	hookSockPath string,
+	attachmentsDir string,
 	authStore *auth.Store,
 	r *router.Router,
 	main *mainchat.Store,
@@ -113,6 +115,7 @@ func NewServer(
 	return &Server{
 		addr:            addr,
 		hookSockPath:    hookSockPath,
+		attachmentsDir:  attachmentsDir,
 		auth:            authStore,
 		router:          r,
 		main:            main,
@@ -853,7 +856,8 @@ func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "not a supported image type")
 		return
 	}
-	full, ok := pathutil.ResolveImagePath(sess.Cwd, rel)
+	full, ok := pathutil.ResolveImagePath(sess.Cwd, rel,
+		filepath.Join(s.attachmentsDir, id), pathutil.CodexGeneratedImagesDir(id))
 	if !ok {
 		writeErr(w, http.StatusNotFound, "image not found")
 		return
@@ -875,24 +879,28 @@ func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filepath.Base(full), info.ModTime(), f)
 }
 
-const maxUploadSize = 20 << 20 // 20 MB
+const (
+	maxUploadSize   = 100 << 20 // 100 MB total request limit
+	maxUploadMemory = 8 << 20   // spill larger multipart file data to disk
+)
 
 // handleUpload accepts a multipart file upload and stores it in the session's
-// working directory. Returns the absolute path so the user can reference it
-// in a prompt for Claude to Read.
+// managed attachment directory. Returns the absolute path so the user can
+// reference it in a prompt for the session agent to read.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	sess, ok := s.router.GetSession(id)
+	_, ok := s.router.GetSession(id)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+	if err := r.ParseMultipartForm(maxUploadMemory); err != nil {
 		writeErr(w, http.StatusBadRequest, "file too large or invalid multipart")
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -902,25 +910,36 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	name := filepath.Base(header.Filename)
+	if name == "." || name == ".." || name == string(filepath.Separator) || name == "" {
+		writeErr(w, http.StatusBadRequest, "invalid filename")
+		return
+	}
 	ext := filepath.Ext(name)
 	base := strings.TrimSuffix(name, ext)
-	dst := filepath.Join(sess.Cwd, name)
-	for i := 1; ; i++ {
-		if _, err := os.Stat(dst); err != nil {
-			break
-		}
-		name = fmt.Sprintf("%s_%d%s", base, i, ext)
-		dst = filepath.Join(sess.Cwd, name)
+	dir := filepath.Join(s.attachmentsDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create attachment directory")
+		return
 	}
 
-	out, err := os.Create(dst)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "failed to create file")
-		return
+	dst := filepath.Join(dir, name)
+	var out *os.File
+	for i := 1; ; i++ {
+		out, err = os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			writeErr(w, http.StatusInternalServerError, "failed to create file")
+			return
+		}
+		name = fmt.Sprintf("%s_%d%s", base, i, ext)
+		dst = filepath.Join(dir, name)
 	}
 	defer out.Close()
 
 	if _, err := io.Copy(out, file); err != nil {
+		_ = os.Remove(dst)
 		writeErr(w, http.StatusInternalServerError, "failed to write file")
 		return
 	}

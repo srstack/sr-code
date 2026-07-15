@@ -447,7 +447,7 @@ func (h *Hub) mirrorImage(ctx context.Context, sessionID, root, ref string) {
 	if !ok {
 		return
 	}
-	full, ok := pathutil.ResolveImagePath(sess.Cwd, ref)
+	full, ok := pathutil.ResolveImagePath(sess.Cwd, ref, pathutil.CodexGeneratedImagesDir(sessionID))
 	if !ok {
 		h.logger.Warn("lark: image outside allowed dirs", "session", sessionID, "path", ref)
 		return

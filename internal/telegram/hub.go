@@ -539,7 +539,7 @@ func (h *Hub) mirrorImage(ctx context.Context, sessionID string, thread int64, r
 	if !ok {
 		return
 	}
-	full, ok := pathutil.ResolveImagePath(sess.Cwd, ref)
+	full, ok := pathutil.ResolveImagePath(sess.Cwd, ref, pathutil.CodexGeneratedImagesDir(sessionID))
 	if !ok {
 		h.logger.Warn("telegram: image outside allowed dirs", "session", sessionID, "path", ref)
 		return

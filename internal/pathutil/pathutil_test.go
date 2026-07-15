@@ -58,3 +58,25 @@ func TestResolveWithinDir(t *testing.T) {
 		t.Fatal("empty dir must not resolve")
 	}
 }
+
+func TestResolveImagePathAllowsCodexGeneratedImages(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	sessionID := "019f523e-c091-7af2-8b73-a36711148c73"
+	dir := filepath.Join(codexHome, "generated_images", sessionID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "result.png")
+	if err := os.WriteFile(want, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := ResolveWithinDir(CodexGeneratedImagesDir(sessionID), want)
+	if !ok || got != want {
+		t.Fatalf("ResolveWithinDir() = %q, %v; want %q, true", got, ok, want)
+	}
+	if _, ok := ResolveWithinDir(CodexGeneratedImagesDir("another-session"), want); ok {
+		t.Fatal("another session must not resolve this generated image")
+	}
+}

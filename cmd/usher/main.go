@@ -150,6 +150,10 @@ func serve(args []string) error {
 	if *dataDir == "" {
 		return fmt.Errorf("could not resolve data dir; pass --data-dir")
 	}
+	attachmentsDir, err := filepath.Abs(filepath.Join(*dataDir, "attachments"))
+	if err != nil {
+		return fmt.Errorf("resolve attachments dir: %w", err)
+	}
 
 	authStore, err := auth.Load(*dataDir)
 	if err != nil {
@@ -278,7 +282,7 @@ func serve(args []string) error {
 		}
 	}()
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), authStore, r, mainStore, agent, pushMgr, codexModelsPath, *editorURL, *uiDir, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, codexModelsPath, *editorURL, *uiDir, logger)
 
 	// Foreign-turn watcher: turns usher didn't start (background workflow
 	// continuations, pane-typed prompts) get relayed to the chats that

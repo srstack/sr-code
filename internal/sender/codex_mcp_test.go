@@ -14,7 +14,7 @@ func TestCodexMCPConfigUsesNativeValues(t *testing.T) {
 		t.Fatalf("args must be a native string array: %#v", cfg["mcp_servers.usher.args"])
 	}
 	direct, ok := cfg["code_mode.direct_only_tool_namespaces"].([]string)
-	if !ok || len(direct) != 1 || direct[0] != "usher" {
+	if !ok || len(direct) != 2 || direct[0] != "mcp__usher" || direct[1] != "usher" {
 		t.Fatalf("usher namespace must bypass deferred loading: %#v", direct)
 	}
 }

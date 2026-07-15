@@ -142,10 +142,12 @@ func codexMCPConfig(logger *slog.Logger) map[string]any {
 		return nil
 	}
 	return map[string]any{
-		"mcp_servers.usher.command":             exe,
-		"mcp_servers.usher.args":                []string{"mcp-stdio"},
-		"mcp_servers.usher.env_vars":            []string{"USHER_HOOK_SOCK"},
-		"code_mode.direct_only_tool_namespaces": []string{"usher"},
+		"mcp_servers.usher.command":  exe,
+		"mcp_servers.usher.args":     []string{"mcp-stdio"},
+		"mcp_servers.usher.env_vars": []string{"USHER_HOOK_SOCK"},
+		// Codex's default callable MCP namespace keeps the legacy mcp__ prefix;
+		// the unprefixed form covers installations with that feature enabled.
+		"code_mode.direct_only_tool_namespaces": []string{"mcp__usher", "usher"},
 	}
 }
 
