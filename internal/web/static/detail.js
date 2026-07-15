@@ -746,10 +746,11 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
     },
     // The canonical user prompt hit the jsonl. Adopt our optimistic echo
     // (stamp the persisted ts, commit it). No echo means the prompt came
-    // from elsewhere (mid-turn steering, another frontend) — server-side it
-    // closed the in-progress assistant turn, which this client didn't
-    // witness, so mark the turn dirty and let the turn-end full fetch
-    // render everything in canonical order.
+    // from another frontend: render it immediately, ahead of the live
+    // assistant bubble that subprocess.started may already have created.
+    // Keep the turn dirty as well: for mid-turn steering the prompt closed
+    // assistant output this client may not have witnessed, so the turn-end
+    // fetch still reconciles the complete canonical order.
     'turn.user': (d) => {
       if (!d || !d.content) return;
       const el = document.getElementById('chat-scroll');
@@ -767,6 +768,14 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
         renderedTurns.push({ key: turnKey(t), node: echo });
         transcriptTotal++;
         return;
+      }
+      const node = appendChatMessage(t);
+      if (node) {
+        if (liveTurn && liveTurn.node && liveTurn.node.parentNode === el) {
+          el.insertBefore(node, liveTurn.node);
+        }
+        renderedTurns.push({ key: turnKey(t), node });
+        transcriptTotal++;
       }
       liveTurnDirty = true;
     },
