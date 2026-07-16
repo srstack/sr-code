@@ -88,6 +88,8 @@ func TestClaudeHookSettings(t *testing.T) {
 			t.Errorf("%s timeout = %v", event, handler["timeout"])
 		}
 	}
-	assertHook("PermissionRequest", "*", " hook PermissionRequest")
+	if _, ok := hooks["PermissionRequest"]; ok {
+		t.Fatalf("PermissionRequest must use the stdio control protocol: %s", raw)
+	}
 	assertHook("PreToolUse", "AskUserQuestion", " hook PreToolUse")
 }

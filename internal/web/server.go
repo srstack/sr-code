@@ -1267,57 +1267,26 @@ func (s *Server) handleTerminalControl(w http.ResponseWriter, r *http.Request) {
 // --- hooks ---------------------------------------------------------------
 
 type hookPayload struct {
-	SessionID             string            `json:"session_id"`
-	ToolUseID             string            `json:"tool_use_id"`
-	HookEventName         string            `json:"hook_event_name"`
-	ToolName              string            `json:"tool_name"`
-	ToolInput             json.RawMessage   `json:"tool_input"`
-	Cwd                   string            `json:"cwd"`
-	TranscriptPath        string            `json:"transcript_path"`
-	PermissionSuggestions []json.RawMessage `json:"permission_suggestions"`
-}
-
-// permissionRequestDecision builds the PermissionRequest hook reply shared by
-// Claude Code and legacy hook-based Codex sessions:
-// {"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":
-// {"behavior":"allow"|"deny","message":"…"}}}. message is included only on a
-// deny with a reason. An empty/allow reply lets the tool proceed; deny blocks it
-// (Codex's built-in approval flow is skipped because the hook decided).
-func permissionRequestDecision(behavior, reason string, updatedPermissions []json.RawMessage) map[string]any {
-	dec := map[string]any{"behavior": behavior}
-	if behavior == "deny" && reason != "" {
-		dec["message"] = reason
-	}
-	if behavior == "allow" && len(updatedPermissions) > 0 {
-		dec["updatedPermissions"] = updatedPermissions
-	}
-	return map[string]any{
-		"hookSpecificOutput": map[string]any{
-			"hookEventName": "PermissionRequest",
-			"decision":      dec,
-		},
-	}
-}
-
-func hasAllowSuggestion(suggestions []json.RawMessage) bool {
-	return len(allowSuggestions(suggestions)) > 0
-}
-
-func allowSuggestions(suggestions []json.RawMessage) []json.RawMessage {
-	var out []json.RawMessage
-	for _, raw := range suggestions {
-		var suggestion struct {
-			Behavior string `json:"behavior"`
-		}
-		if json.Unmarshal(raw, &suggestion) == nil && suggestion.Behavior == "allow" {
-			out = append(out, raw)
-		}
-	}
-	return out
+	SessionID      string          `json:"session_id"`
+	ToolUseID      string          `json:"tool_use_id"`
+	HookEventName  string          `json:"hook_event_name"`
+	ToolName       string          `json:"tool_name"`
+	ToolInput      json.RawMessage `json:"tool_input"`
+	Cwd            string          `json:"cwd"`
+	TranscriptPath string          `json:"transcript_path"`
 }
 
 func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	eventName := r.PathValue("event")
+	// Upgrade bridge: an old hook binary may POST here after the server has
+	// switched to native backend approval protocols. Return no decision so
+	// Claude falls through to stdio can_use_tool and Codex to app-server. Keep
+	// this endpoint for one rolling-upgrade window; it never creates a pending
+	// interaction.
+	if eventName == "PermissionRequest" {
+		writeJSON(w, http.StatusOK, map[string]any{"continue": true})
+		return
+	}
 
 	body, _ := io.ReadAll(r.Body)
 	var ev hookPayload
@@ -1330,9 +1299,9 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	if ev.HookEventName == "" {
 		ev.HookEventName = eventName
 	}
-	// PreToolUse handles Claude's AskUserQuestion interaction. PermissionRequest
-	// handles Claude permission prompts and legacy hook-based Codex prompts.
-	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
+	// Managed Claude permissions use the stream-json control protocol. The only
+	// command hook still routed over HTTP is AskUserQuestion's PreToolUse.
+	if eventName != "PreToolUse" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
@@ -1344,7 +1313,7 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 		ToolName:    ev.ToolName,
 		ToolInput:   ev.ToolInput,
 		Cwd:         ev.Cwd,
-		AllowAlways: eventName == "PermissionRequest" && hasAllowSuggestion(ev.PermissionSuggestions),
+		AllowAlways: false,
 	})
 	if err != nil {
 		s.logger.Warn("hook submit cancelled", "session", ev.SessionID, "err", err)
@@ -1355,17 +1324,6 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 	decision := resp.Behavior
 	if decision == "" {
 		decision = "allow"
-	}
-
-	if eventName == "PermissionRequest" {
-		// PermissionRequest has no AskUserQuestion answer path; Claude handles
-		// that interaction through the dedicated PreToolUse hook below.
-		var updated []json.RawMessage
-		if resp.Scope == "session" {
-			updated = allowSuggestions(ev.PermissionSuggestions)
-		}
-		writeJSON(w, http.StatusOK, permissionRequestDecision(decision, resp.Reason, updated))
-		return
 	}
 
 	hookOut := map[string]any{

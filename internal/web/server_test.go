@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +26,19 @@ func TestTerminalControlsAreAllowListed(t *testing.T) {
 		if terminalControls[name] != key {
 			t.Errorf("terminalControls[%q] = %q, want %q", name, terminalControls[name], key)
 		}
+	}
+}
+
+func TestLegacyPermissionRequestContinuesWithoutPending(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/hook/PermissionRequest", nil)
+	req.SetPathValue("event", "PermissionRequest")
+	(&Server{}).handleHook(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got, want := rec.Body.String(), "{\"continue\":true}\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 
@@ -158,60 +170,6 @@ func TestGzipMiddleware(t *testing.T) {
 			t.Errorf("body = %q", rec.Body.String())
 		}
 	})
-}
-
-func TestPermissionRequestDecision(t *testing.T) {
-	// allow → behavior allow, no message
-	allow := permissionRequestDecision("allow", "ignored reason", nil)
-	hso, _ := allow["hookSpecificOutput"].(map[string]any)
-	if hso == nil || hso["hookEventName"] != "PermissionRequest" {
-		t.Fatalf("allow: bad hookSpecificOutput: %v", allow)
-	}
-	dec, _ := hso["decision"].(map[string]any)
-	if dec == nil || dec["behavior"] != "allow" {
-		t.Fatalf("allow: behavior = %v", dec)
-	}
-	if _, hasMsg := dec["message"]; hasMsg {
-		t.Errorf("allow must not carry a message: %v", dec)
-	}
-
-	// deny with reason → behavior deny + message
-	deny := permissionRequestDecision("deny", "blocked by usher", nil)
-	dec = deny["hookSpecificOutput"].(map[string]any)["decision"].(map[string]any)
-	if dec["behavior"] != "deny" || dec["message"] != "blocked by usher" {
-		t.Fatalf("deny: decision = %v", dec)
-	}
-
-	// deny without reason → behavior deny, no message key
-	bare := permissionRequestDecision("deny", "", nil)
-	dec = bare["hookSpecificOutput"].(map[string]any)["decision"].(map[string]any)
-	if _, hasMsg := dec["message"]; hasMsg {
-		t.Errorf("deny without reason must omit message: %v", dec)
-	}
-}
-
-func TestPermissionRequestDecisionUpdatedPermissions(t *testing.T) {
-	first := json.RawMessage(`{"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash","ruleContent":"npm test"}],"destination":"session"}`)
-	second := json.RawMessage(`{"type":"addDirectories","behavior":"allow","directories":["/work/shared"],"destination":"session"}`)
-	deny := json.RawMessage(`{"type":"addRules","behavior":"deny","rules":[{"toolName":"Read"}]}`)
-	suggestions := allowSuggestions([]json.RawMessage{first, deny, second})
-	if len(suggestions) != 2 || string(suggestions[0]) != string(first) || string(suggestions[1]) != string(second) {
-		t.Fatalf("filtered suggestions = %s", suggestions)
-	}
-	out := permissionRequestDecision("allow", "", suggestions)
-	data, err := json.Marshal(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(data, []byte(`"updatedPermissions":[{"type":"addRules"`)) {
-		t.Fatalf("response missing updatedPermissions: %s", data)
-	}
-	if !hasAllowSuggestion([]json.RawMessage{first}) {
-		t.Fatal("allow suggestion was not recognized")
-	}
-	if hasAllowSuggestion([]json.RawMessage{deny}) {
-		t.Fatal("deny suggestion enabled allow always")
-	}
 }
 
 func TestCodexModels(t *testing.T) {

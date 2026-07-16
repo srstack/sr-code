@@ -1,13 +1,19 @@
 package claudestream
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/hook"
 )
 
 func fakeClaude(t *testing.T) (string, string) {
@@ -33,7 +39,7 @@ done
 
 func TestLongRunningProcessServesMultipleTurns(t *testing.T) {
 	bin, log := fakeClaude(t)
-	m := New(bin, `{"hooks":{}}`, "/tmp/h.sock", nil, 4, nil)
+	m := New(bin, `{"hooks":{}}`, "/tmp/h.sock", nil, 4, nil, nil)
 	m.processes = map[string]*process{}
 	os.Setenv("FAKE_CLAUDE_LOG", log)
 	t.Cleanup(func() { os.Unsetenv("FAKE_CLAUDE_LOG"); m.Shutdown() })
@@ -70,11 +76,147 @@ func TestLongRunningProcessServesMultipleTurns(t *testing.T) {
 	}
 }
 
+func TestCanUseToolControlRequest(t *testing.T) {
+	h := hook.New("")
+	m := New("", "", "", nil, 2, h, nil)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	p := &process{id: "sid", cwd: "/work", in: w}
+	m.handleControlRequest(p, []byte(`{
+		"type":"control_request","request_id":"req-1","request":{
+			"subtype":"can_use_tool","tool_name":"Edit","tool_use_id":"tool-1",
+			"input":{"file_path":"/work/a"},
+			"permission_suggestions":[{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Edit"}]}]
+		}}`))
+	deadline := time.Now().Add(time.Second)
+	for len(h.List()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	pending := h.List()
+	if len(pending) != 1 || !pending[0].AllowAlways || pending[0].ToolName != "Edit" {
+		t.Fatalf("pending permission = %+v", pending)
+	}
+	if err := h.Respond(pending[0].ID, hook.Response{Behavior: "allow", Scope: "session"}); err != nil {
+		t.Fatal(err)
+	}
+
+	line := make(chan []byte, 1)
+	go func() {
+		b, _ := bufio.NewReader(r).ReadBytes('\n')
+		line <- b
+	}()
+	select {
+	case b := <-line:
+		var got struct {
+			Type     string `json:"type"`
+			Response struct {
+				Subtype   string         `json:"subtype"`
+				RequestID string         `json:"request_id"`
+				Response  map[string]any `json:"response"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Type != "control_response" || got.Response.Subtype != "success" || got.Response.RequestID != "req-1" {
+			t.Fatalf("response envelope = %s", b)
+		}
+		if got.Response.Response["behavior"] != "allow" {
+			t.Fatalf("decision = %#v", got.Response.Response)
+		}
+		input, ok := got.Response.Response["updatedInput"].(map[string]any)
+		if !ok || input["file_path"] != "/work/a" {
+			t.Fatalf("updatedInput = %#v", got.Response.Response["updatedInput"])
+		}
+		permissions, ok := got.Response.Response["updatedPermissions"].([]any)
+		if !ok || len(permissions) != 1 {
+			t.Fatalf("updatedPermissions = %#v", got.Response.Response["updatedPermissions"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control response timeout")
+	}
+}
+
+func TestPermissionPromptToolFlagWhenHandlerConfigured(t *testing.T) {
+	bin, log := fakeClaude(t)
+	os.Setenv("FAKE_CLAUDE_LOG", log)
+	defer os.Unsetenv("FAKE_CLAUDE_LOG")
+	m := New(bin, "", "", nil, 4, hook.New(""), nil)
+	defer m.Shutdown()
+	ch, _, _, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-ch
+	b, _ := os.ReadFile(log)
+	if !strings.Contains(string(b), "--permission-prompt-tool stdio") {
+		t.Fatalf("args=%s", b)
+	}
+}
+
+func TestClaudePermissionControlE2E(t *testing.T) {
+	if os.Getenv("USHER_CLAUDE_E2E") == "" {
+		t.Skip("set USHER_CLAUDE_E2E=1 to run against the installed Claude CLI")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "edit.txt")
+	if err := os.WriteFile(path, []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var idBytes [16]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		t.Fatal(err)
+	}
+	idBytes[6] = (idBytes[6] & 0x0f) | 0x40
+	idBytes[8] = (idBytes[8] & 0x3f) | 0x80
+	id := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		idBytes[0:4], idBytes[4:6], idBytes[6:8], idBytes[8:10], idBytes[10:16])
+
+	h := hook.New("")
+	m := New("claude", "", "", []string{"--permission-mode", "default"}, 1, h, nil)
+	defer m.Shutdown()
+	result, _, _, _, err := m.Send(context.Background(), id,
+		"Use Edit to replace the exact text before with after in "+path+", then reply only done.", dir, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for len(h.List()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	pending := h.List()
+	if len(pending) != 1 || pending[0].ToolName != "Edit" {
+		t.Fatalf("pending permission = %+v", pending)
+	}
+	if err := h.Respond(pending[0].ID, hook.Response{Behavior: "allow", Scope: "once"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.IsError {
+			t.Fatalf("Claude result = %+v", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Claude result timeout")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "after\n" {
+		t.Fatalf("edited file = %q", b)
+	}
+}
+
 func TestResumeUsesResumeFlag(t *testing.T) {
 	bin, log := fakeClaude(t)
 	os.Setenv("FAKE_CLAUDE_LOG", log)
 	defer os.Unsetenv("FAKE_CLAUDE_LOG")
-	m := New(bin, "", "", nil, 4, nil)
+	m := New(bin, "", "", nil, 4, nil, nil)
 	defer m.Shutdown()
 	ch, _, _, _, err := m.Send(context.Background(), "sid", "hello", "/tmp", "", true)
 	if err != nil {
@@ -88,7 +230,7 @@ func TestResumeUsesResumeFlag(t *testing.T) {
 }
 
 func TestSpontaneousTurnTailEventsDoNotStickOrStealNextResult(t *testing.T) {
-	m := New("", "", "", nil, 2, nil)
+	m := New("", "", "", nil, 2, nil, nil)
 	p := &process{id: "s", lastUsed: time.Now()}
 	m.processes["s"] = p
 	r, w := io.Pipe()
@@ -134,7 +276,7 @@ func TestSpontaneousTurnTailEventsDoNotStickOrStealNextResult(t *testing.T) {
 }
 
 func TestMessageStartMarksSpontaneousTurnButDeltasDoNot(t *testing.T) {
-	m := New("", "", "", nil, 2, nil)
+	m := New("", "", "", nil, 2, nil, nil)
 	p := &process{id: "s", lastUsed: time.Now()}
 	m.processes["s"] = p
 	r, w := io.Pipe()
@@ -183,7 +325,7 @@ func TestMessageStartMarksSpontaneousTurnButDeltasDoNot(t *testing.T) {
 }
 
 func TestPartialTextDeltaRoutesToCurrentTurn(t *testing.T) {
-	m := New("", "", "", nil, 2, nil)
+	m := New("", "", "", nil, 2, nil, nil)
 	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 2)}
 	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
 	r, w := io.Pipe()
@@ -205,7 +347,7 @@ func TestPartialTextDeltaRoutesToCurrentTurn(t *testing.T) {
 }
 
 func TestResultUsesLastAssistantModelContextWindow(t *testing.T) {
-	m := New("", "", "", nil, 2, nil)
+	m := New("", "", "", nil, 2, nil, nil)
 	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
 	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
 	r, w := io.Pipe()
@@ -222,7 +364,7 @@ func TestResultUsesLastAssistantModelContextWindow(t *testing.T) {
 }
 
 func TestResultSingleModelUsageFallback(t *testing.T) {
-	m := New("", "", "", nil, 2, nil)
+	m := New("", "", "", nil, 2, nil, nil)
 	req := &turnRequest{done: make(chan Result, 1), deltas: make(chan Delta, 1)}
 	p := &process{id: "s", lastUsed: time.Now(), turns: []*turnRequest{req}}
 	r, w := io.Pipe()
@@ -238,7 +380,7 @@ func TestResultSingleModelUsageFallback(t *testing.T) {
 }
 
 func TestMaxLiveDoesNotGrowWhenAllProcessesBusy(t *testing.T) {
-	m := New("missing", "", "", nil, 1, nil)
+	m := New("missing", "", "", nil, 1, nil, nil)
 	m.processes["busy"] = &process{id: "busy", turns: []*turnRequest{nil}}
 	if _, _, err := m.ensure(context.Background(), "new", "/tmp", "", true); err == nil {
 		t.Fatal("expected max-live busy error")

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/procutil"
 )
 
@@ -49,6 +50,7 @@ type process struct {
 	cwd      string
 	mu       sync.Mutex
 	turns    []*turnRequest // nil entry represents a spontaneous turn
+	controls map[string]context.CancelFunc
 	lastUsed time.Time
 	stopping bool
 	done     chan struct{}
@@ -61,18 +63,19 @@ type Manager struct {
 	hookSock  string
 	maxLive   int
 	logger    *slog.Logger
+	hooks     *hook.Manager
 	mu        sync.Mutex
 	processes map[string]*process
 }
 
-func New(bin, settings, hookSock string, mcpArgs []string, maxLive int, logger *slog.Logger) *Manager {
+func New(bin, settings, hookSock string, mcpArgs []string, maxLive int, hooks *hook.Manager, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if maxLive <= 0 {
 		maxLive = 8
 	}
-	return &Manager{bin: bin, settings: settings, hookSock: hookSock, mcpArgs: append([]string(nil), mcpArgs...), maxLive: maxLive, logger: logger, processes: map[string]*process{}}
+	return &Manager{bin: bin, settings: settings, hookSock: hookSock, mcpArgs: append([]string(nil), mcpArgs...), maxLive: maxLive, hooks: hooks, logger: logger, processes: map[string]*process{}}
 }
 
 func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool) (*process, bool, error) {
@@ -101,6 +104,9 @@ func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool
 		}
 	}
 	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose"}
+	if m.hooks != nil {
+		args = append(args, "--permission-prompt-tool", "stdio")
+	}
 	if resume {
 		args = append(args, "--resume", id)
 	} else {
@@ -132,7 +138,7 @@ func (m *Manager) ensure(ctx context.Context, id, cwd, model string, resume bool
 		m.mu.Unlock()
 		return nil, false, err
 	}
-	p := &process{id: id, cmd: cmd, in: in, cwd: cwd, lastUsed: time.Now(), done: make(chan struct{})}
+	p := &process{id: id, cmd: cmd, in: in, cwd: cwd, controls: map[string]context.CancelFunc{}, lastUsed: time.Now(), done: make(chan struct{})}
 	m.processes[id] = p
 	m.mu.Unlock()
 	go m.readLoop(p, out)
@@ -220,6 +226,14 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 		if json.Unmarshal(s.Bytes(), &e) != nil {
 			continue
 		}
+		if e.Type == "control_request" {
+			m.handleControlRequest(p, append([]byte(nil), s.Bytes()...))
+			continue
+		}
+		if e.Type == "control_cancel_request" {
+			m.cancelControlRequest(p, s.Bytes())
+			continue
+		}
 		if e.Type != "result" {
 			p.mu.Lock()
 			if len(p.turns) == 0 && marksSpontaneousTurn(e.Type, e.Subtype, e.Event.Type) {
@@ -265,6 +279,126 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 	}
 }
 
+// handleControlRequest implements the permission callback protocol used by
+// the Claude Agent SDK. Permission prompts in -p mode do not enter the normal
+// terminal dialog (and therefore do not reliably fire PermissionRequest
+// command hooks); --permission-prompt-tool stdio instead sends can_use_tool
+// requests over the stream-json transport.
+func (m *Manager) handleControlRequest(p *process, raw []byte) {
+	var msg struct {
+		RequestID string `json:"request_id"`
+		Request   struct {
+			Subtype               string            `json:"subtype"`
+			ToolName              string            `json:"tool_name"`
+			Input                 json.RawMessage   `json:"input"`
+			ToolUseID             string            `json:"tool_use_id"`
+			PermissionSuggestions []json.RawMessage `json:"permission_suggestions"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(raw, &msg) != nil || msg.RequestID == "" || msg.Request.Subtype != "can_use_tool" {
+		return
+	}
+	if m.hooks == nil {
+		m.writeControlError(p, msg.RequestID, "permission handler unavailable")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.mu.Lock()
+	if p.controls == nil {
+		p.controls = map[string]context.CancelFunc{}
+	}
+	p.controls[msg.RequestID] = cancel
+	p.mu.Unlock()
+	go func() {
+		defer func() {
+			cancel()
+			p.mu.Lock()
+			delete(p.controls, msg.RequestID)
+			p.mu.Unlock()
+		}()
+		go func() {
+			select {
+			case <-p.done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		resp, err := m.hooks.Submit(ctx, hook.Event{
+			SessionID:   p.id,
+			ToolUseID:   msg.Request.ToolUseID,
+			Event:       "PermissionRequest",
+			ToolName:    msg.Request.ToolName,
+			ToolInput:   msg.Request.Input,
+			Cwd:         p.cwd,
+			AllowAlways: hasAllowSuggestion(msg.Request.PermissionSuggestions),
+		})
+		if err != nil {
+			m.writeControlError(p, msg.RequestID, err.Error())
+			return
+		}
+		decision := map[string]any{"behavior": resp.Behavior}
+		if resp.Behavior == "allow" {
+			// The SDK always echoes the original input for an allow decision.
+			decision["updatedInput"] = json.RawMessage(msg.Request.Input)
+			if resp.Scope == "session" {
+				if suggestions := allowSuggestions(msg.Request.PermissionSuggestions); len(suggestions) > 0 {
+					decision["updatedPermissions"] = suggestions
+				}
+			}
+		} else if resp.Reason != "" {
+			decision["message"] = resp.Reason
+		}
+		_ = write(p, map[string]any{
+			"type": "control_response",
+			"response": map[string]any{
+				"subtype": "success", "request_id": msg.RequestID, "response": decision,
+			},
+		})
+	}()
+}
+
+func (m *Manager) cancelControlRequest(p *process, raw []byte) {
+	var msg struct {
+		RequestID string `json:"request_id"`
+	}
+	if json.Unmarshal(raw, &msg) != nil || msg.RequestID == "" {
+		return
+	}
+	p.mu.Lock()
+	cancel := p.controls[msg.RequestID]
+	delete(p.controls, msg.RequestID)
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) writeControlError(p *process, requestID, message string) {
+	_ = write(p, map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype": "error", "request_id": requestID, "error": message,
+		},
+	})
+}
+
+func hasAllowSuggestion(suggestions []json.RawMessage) bool {
+	return len(allowSuggestions(suggestions)) > 0
+}
+
+func allowSuggestions(suggestions []json.RawMessage) []json.RawMessage {
+	var out []json.RawMessage
+	for _, raw := range suggestions {
+		var suggestion struct {
+			Behavior string `json:"behavior"`
+		}
+		if json.Unmarshal(raw, &suggestion) == nil && suggestion.Behavior == "allow" {
+			out = append(out, raw)
+		}
+	}
+	return out
+}
+
 func marksSpontaneousTurn(typ, subtype, eventType string) bool {
 	if typ == "control_response" || typ == "rate_limit_event" || typ == "command_lifecycle" {
 		return false
@@ -291,9 +425,14 @@ func (m *Manager) died(p *process, err error) {
 	p.mu.Lock()
 	turns := p.turns
 	p.turns = nil
+	controls := p.controls
+	p.controls = nil
 	wasStopping := p.stopping
 	p.stopping = true
 	p.mu.Unlock()
+	for _, cancel := range controls {
+		cancel()
+	}
 	for _, req := range turns {
 		if req != nil {
 			req.finish(Result{IsError: true, Subtype: "process_exited"})

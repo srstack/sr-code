@@ -178,7 +178,7 @@ func serve(args []string) error {
 
 	if dir := *projectsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewClaudeSource(dir))
-		senders["claude"] = sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, logger)
+		senders["claude"] = sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, h, logger)
 		defaultBackend = "claude"
 		logger.Info("claude backend enabled", "projects_dir", dir)
 	}

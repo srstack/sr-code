@@ -1,7 +1,6 @@
-// Package hook brokers Claude Code permission decisions through usher's web
-// UI. The CLI subcommand `usher hook <event>` POSTs a hook payload to the
-// running server, which holds a pending interaction until a UI client decides
-// allow / deny, then returns the decision back to Claude Code on stdout.
+// Package hook brokers backend interactions through usher's web UI. Claude's
+// stdio permission callback, Codex app-server approvals, and the command hook
+// used for AskUserQuestion all submit here and wait for a UI response.
 package hook
 
 import (

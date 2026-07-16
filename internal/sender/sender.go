@@ -80,8 +80,9 @@ func claudeMCPConfigArgs(hookSock string, logger *slog.Logger) []string {
 // non-empty) is passed through as --permission-mode; projectsDir is Claude
 // Code's projects root (used to locate session jsonl files by their globally
 // unique id); socket is retained for configuration compatibility; hookSock
-// routes permission hooks back to this instance; maxLive caps Claude workers.
-func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, injectMCPTools bool, logger *slog.Logger) *Sender {
+// routes AskUserQuestion hooks back to this instance; maxLive caps Claude
+// workers. Tool permissions use claudestream's stdio control protocol.
+func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLive int, injectMCPTools bool, hooks *hook.Manager, logger *slog.Logger) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -99,7 +100,7 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	}
 	t := timing{confirm: 8 * time.Second, poll: 150 * time.Millisecond}
 	return &Sender{
-		claude:       claudestream.New(claudeCmd, claudeHookSettings(hookSock, logger), hookSock, extra, maxLive, logger),
+		claude:       claudestream.New(claudeCmd, claudeHookSettings(hookSock, logger), hookSock, extra, maxLive, hooks, logger),
 		preAssignsID: true,
 		locateFn:     func(id string) string { return locateClaude(projectsDir, id) },
 		logger:       logger,
@@ -131,12 +132,10 @@ func claudeHookSettings(hookSock string, logger *slog.Logger) string {
 	}
 	settings := map[string]any{
 		"hooks": map[string]any{
-			// Let Claude's native permission policy settle safe operations and
-			// route only prompts it would otherwise show to a terminal through
-			// usher. AskUserQuestion still needs PreToolUse so the web UI can
-			// collect an answer and return it as updatedInput under -p.
-			"PermissionRequest": []any{map[string]any{"matcher": "*", "hooks": handler("PermissionRequest")}},
-			"PreToolUse":        []any{map[string]any{"matcher": "AskUserQuestion", "hooks": handler("PreToolUse")}},
+			// Permissions use Claude's streaming can_use_tool callback protocol.
+			// AskUserQuestion still needs PreToolUse so the web UI can collect an
+			// answer and return it as updatedInput under -p.
+			"PreToolUse": []any{map[string]any{"matcher": "AskUserQuestion", "hooks": handler("PreToolUse")}},
 		},
 	}
 	b, _ := json.Marshal(settings)

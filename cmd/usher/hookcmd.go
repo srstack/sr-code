@@ -39,7 +39,13 @@ func runHook(args []string) error {
 
 	sockPath := os.Getenv("USHER_HOOK_SOCK")
 	if sockPath == "" {
-		// Not a usher-managed session — fail open at once.
+		// Not a usher-managed session — fail open at once. Be explicit for a
+		// stale PermissionRequest registration so both backends continue to
+		// their native approval path.
+		if continueLegacyPermissionLocally(event, sockPath) {
+			fmt.Println(`{"continue":true}`)
+			return nil
+		}
 		fmt.Println("{}")
 		return nil
 	}
@@ -95,4 +101,8 @@ func runHook(args []string) error {
 		fmt.Println(strings.TrimRight(string(out), "\n"))
 		return nil
 	}
+}
+
+func continueLegacyPermissionLocally(event, sockPath string) bool {
+	return event == "PermissionRequest" && sockPath == ""
 }
