@@ -1,6 +1,8 @@
 // usher SPA: permission modal + AskUserQuestion interactions.
 
-import { esc } from './state.js';
+import {
+  esc, currentDetailId, setPendingPermissionCounts,
+} from './state.js';
 
 // --- interaction-private state ---
 let pendingInteractions = [];
@@ -12,8 +14,9 @@ export async function pollInteractions() {
     const list = (await res.json()) || [];
     if (!sameInteractions(pendingInteractions, list)) {
       pendingInteractions = list;
-      renderInteractions();
     }
+    // Render even when only the active route changed.
+    renderInteractions();
   } catch {/* server may be down briefly */}
 }
 
@@ -68,7 +71,7 @@ function renderAskQuestion(p, sid) {
     </div>`;
 }
 
-function renderPermission(p, sid) {
+function renderPermission(p, position, total) {
   let inputJSON = '';
   try { inputJSON = JSON.stringify(p.tool_input || {}, null, 2); }
   catch { inputJSON = String(p.tool_input || ''); }
@@ -79,7 +82,7 @@ function renderPermission(p, sid) {
     <div class="interaction" data-id="${esc(p.id)}">
       <div class="meta">
         <strong>${esc(p.tool_name || p.event)}</strong>
-        <span class="muted">session ${esc(sid)}</span>
+        ${total > 1 ? `<span class="muted">${position} of ${total}</span>` : ''}
       </div>
       <pre class="tool-input">${esc(inputJSON)}</pre>
       <div class="actions">
@@ -145,8 +148,30 @@ function wireAskQuestion(node, id) {
 }
 
 function renderInteractions() {
+  const permissions = pendingInteractions.filter(p => !isAskQuestion(p));
+  const counts = new Map();
+  for (const p of permissions) {
+    if (p.session_id) counts.set(p.session_id, (counts.get(p.session_id) || 0) + 1);
+  }
+  setPendingPermissionCounts(counts);
+
+  // Show this session's permissions beside its composer, one at a time.
+  document.getElementById('session-permission')?.remove();
+  const here = permissions.filter(p => p.session_id === currentDetailId);
+  const composer = document.querySelector('.send-anchor > .composer');
+  if (here.length && composer) {
+    const bar = document.createElement('div');
+    bar.id = 'session-permission';
+    bar.className = 'session-permission';
+    bar.innerHTML = renderPermission(here[0], 1, here.length);
+    composer.before(bar);
+    wirePermission(bar.querySelector('.interaction'));
+  }
+
+  // Keep AskUserQuestion in its existing modal.
+  const asks = pendingInteractions.filter(isAskQuestion);
   let modal = document.getElementById('modal');
-  if (!pendingInteractions.length) {
+  if (!asks.length) {
     if (modal) modal.remove();
     return;
   }
@@ -155,29 +180,31 @@ function renderInteractions() {
     modal.id = 'modal';
     document.body.appendChild(modal);
   }
-  const items = pendingInteractions.map(p => {
+  const items = asks.map(p => {
     const sid = (p.session_id || '').slice(0, 8) || '(unknown)';
-    return isAskQuestion(p) ? renderAskQuestion(p, sid) : renderPermission(p, sid);
+    return renderAskQuestion(p, sid);
   }).join('');
   modal.innerHTML = `
     <div class="overlay"></div>
     <div class="dialog">
-      <h3>pending requests (${pendingInteractions.length})</h3>
+      <h3>pending questions (${asks.length})</h3>
       ${items}
     </div>
   `;
   modal.querySelectorAll('.interaction').forEach(node => {
     const id = node.dataset.id;
-    if (node.classList.contains('ask')) {
-      wireAskQuestion(node, id);
-      return;
-    }
-    node.querySelectorAll('button.allow,button.deny').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const behavior = btn.classList.contains('allow') ? 'allow' : 'deny';
-        const scope = btn.dataset.scope || 'once';
-        respond(id, behavior, scope);
-      });
+    wireAskQuestion(node, id);
+  });
+}
+
+function wirePermission(node) {
+  if (!node) return;
+  const id = node.dataset.id;
+  node.querySelectorAll('button.allow,button.deny').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const behavior = btn.classList.contains('allow') ? 'allow' : 'deny';
+      btn.closest('.actions').querySelectorAll('button').forEach(b => { b.disabled = true; });
+      respond(id, behavior, btn.dataset.scope || 'once');
     });
   });
 }

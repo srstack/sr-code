@@ -1097,6 +1097,7 @@ pre.raw-markdown {
 /* Unread (responded, not yet viewed): steady full-brightness dot, never on the
    open row (that session is excluded from unread). */
 .running-dot.unread { color: var(--unread); opacity: 1; }
+.running-dot.permission { color: var(--danger); opacity: 1; }
 
 .running-dot.executing { animation: breathe 4s ease-in-out infinite; }
 @keyframes breathe {
@@ -1331,6 +1332,14 @@ pre.raw-markdown {
   overflow-y: auto;
 }
 #modal h3 { margin: 0 0 0.75rem 0; font-size: 1rem; }
+.session-permission {
+  margin-top: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-chrome);
+}
+.session-permission .interaction { padding: 0; border: 0; }
 .interaction { padding: 0.75rem 0; border-top: 1px solid var(--border-muted); }
 .interaction:first-of-type { border-top: 0; }
 .interaction .meta { margin-bottom: 0.4rem; font-size: 0.9rem; }

@@ -337,7 +337,6 @@ export async function showDetail(id) {
                 <div id="session-usage-detail" class="session-usage-detail" hidden></div>
               </div>
               <button id="send">send</button>
-              <button id="cancel" class="cancel" hidden>cancel</button>
             </div>
           </div>
         </div>
@@ -351,7 +350,6 @@ export async function showDetail(id) {
   const chatEl = document.getElementById('chat-scroll');
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
-  const cancelBtn = document.getElementById('cancel');
   const usageBtn = document.getElementById('session-usage');
   const usageDetail = document.getElementById('session-usage-detail');
   if (usageBtn && usageDetail) {
@@ -537,17 +535,6 @@ export async function showDetail(id) {
     });
   }
 
-  cancelBtn.addEventListener('click', async () => {
-    cancelBtn.disabled = true;
-    try {
-      await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', { method: 'DELETE' });
-    } catch (e) {
-      appendChatMessage({ role: 'error', content: 'cancel failed: ' + String(e), ts: new Date().toISOString() });
-    } finally {
-      cancelBtn.disabled = false;
-    }
-  });
-
   const uploadBtn = document.getElementById('upload-btn');
   const uploadInput = document.getElementById('upload-input');
   if (uploadBtn && uploadInput) {
@@ -582,12 +569,31 @@ export async function showDetail(id) {
     });
   }
 
-  openEventStream(id, chatEl, sendBtn, cancelBtn);
+  // Keep one send/cancel button stable while its request is in flight.
+  let actionPending = null; // null | send | cancel
+  let sendAccepted = false;
+  let sendLifecycleObserved = false;
+  const renderAction = () => {
+    const action = actionPending || (detailStreaming ? 'cancel' : 'send');
+    sendBtn.textContent = action;
+    sendBtn.classList.toggle('cancel', action === 'cancel');
+    sendBtn.disabled = actionPending !== null;
+  };
+
+  const confirmRunningAction = () => {
+    sendLifecycleObserved = true;
+    if (sendAccepted) actionPending = null;
+    renderAction();
+  };
+  openEventStream(id, chatEl, renderAction, confirmRunningAction);
 
   const submit = async () => {
     const text = promptEl.value;
-    if (!text.trim() || sendBtn.disabled) return;
-    sendBtn.disabled = true;
+    if (!text.trim() || detailStreaming || actionPending) return;
+    actionPending = 'send';
+    sendAccepted = false;
+    sendLifecycleObserved = false;
+    renderAction();
     promptEl.value = '';
     clearDraft();
     growPrompt(promptEl); // shrink back; programmatic clear fires no input event
@@ -608,17 +614,39 @@ export async function showDetail(id) {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         appendChatMessage({ role: 'error', content: 'send failed: ' + (err.error || ('HTTP ' + res.status)), ts: new Date().toISOString() });
-        sendBtn.disabled = false;
+        actionPending = null;
+        renderAction();
         return;
       }
-      // button stays disabled until subprocess.exit handler re-enables
+      sendAccepted = true;
+      // Wait for the running lifecycle event; it may precede this response.
+      if (sendLifecycleObserved) {
+        actionPending = null;
+        renderAction();
+      }
     } catch (e) {
       appendChatMessage({ role: 'error', content: String(e), ts: new Date().toISOString() });
-      sendBtn.disabled = false;
+      actionPending = null;
+      renderAction(); // an SSE start may already have made this cancel
     }
   };
 
-  sendBtn.addEventListener('click', submit);
+  const cancel = async () => {
+    if (!detailStreaming || actionPending) return;
+    actionPending = 'cancel';
+    renderAction();
+    try {
+      const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', { method: 'DELETE' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+    } catch (e) {
+      appendChatMessage({ role: 'error', content: 'cancel failed: ' + String(e), ts: new Date().toISOString() });
+    } finally {
+      actionPending = null;
+      renderAction();
+    }
+  };
+
+  sendBtn.addEventListener('click', () => detailStreaming ? cancel() : submit());
   promptEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
@@ -650,7 +678,7 @@ function openSubagentEventStream(id) {
 // adopts our optimistic echo as the canonical user turn; subprocess.exit
 // promotes the live bubble in place (full fetch only when the turn is
 // dirty — see finalizeTurn). Turn errors surface via the 'error' event.
-function openEventStream(id, chatEl, sendBtn, cancelBtn) {
+function openEventStream(id, chatEl, renderAction, confirmRunningAction) {
   const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/events');
   setCurrentES(es);
 
@@ -673,14 +701,13 @@ function openEventStream(id, chatEl, sendBtn, cancelBtn) {
   };
   const onIdle = () => {
     detailStreaming = false;
-    sendBtn.disabled = false;
-    if (cancelBtn) cancelBtn.hidden = true;
+    renderAction();
     setLoadEarlierDisabled(false);
   };
   const onRunning = () => {
     detailStreaming = true;
-    sendBtn.disabled = true;
-    if (cancelBtn) cancelBtn.hidden = false;
+    // Confirm a successful send through the turn lifecycle.
+    confirmRunningAction();
     setLoadEarlierDisabled(true);
   };
   // beginTurn stands up the live bubble + running-state UI for

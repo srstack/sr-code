@@ -67,6 +67,13 @@ let viewingId = null;          // session whose detail is open
 let lastSessions = [];         // latest /api/sessions payload — written by sidebar
 export function getLastSessions() { return lastSessions; }
 export function setLastSessions(v) { lastSessions = v; }
+let pendingPermissionCounts = new Map(); // session id -> unresolved permission count
+export function pendingPermissionCount(id) { return pendingPermissionCounts.get(id) || 0; }
+export function setPendingPermissionCounts(v) {
+  pendingPermissionCounts = v;
+  if (lastSessions.length && _renderSidebarSessionsFn) _renderSidebarSessionsFn(lastSessions);
+  updateTabBadge();
+}
 const prevStatus = {};         // id -> status at the previous poll
 const unreadIds = new Set();   // sessions with an unseen finished turn
 
@@ -109,10 +116,16 @@ export function clearViewing() {
   updateTabBadge();
 }
 
-// Unread count in the tab title, front-loaded so it survives truncation.
+// Count unique sessions that are unread or awaiting permission.
 export function updateTabBadge() {
-  const n = lastSessions.filter(isUnread).length;
+  const attention = new Set(lastSessions.filter(isUnread).map(s => s.id));
+  for (const id of pendingPermissionCounts.keys()) attention.add(id);
+  const n = attention.size;
   document.title = n > 0 ? `(${n}) usher` : 'usher';
+  if ('setAppBadge' in navigator) {
+    if (n > 0) navigator.setAppBadge(n).catch(() => {});
+    else if ('clearAppBadge' in navigator) navigator.clearAppBadge().catch(() => {});
+  }
 }
 
 // --- render mode (shared between render.js writer and state reader) ---
