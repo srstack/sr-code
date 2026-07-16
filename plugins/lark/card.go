@@ -176,15 +176,15 @@ func permissionCard(p hook.Pending, mentions []string, resolved string) obj {
 	if md := mentionMD(mentions); md != "" {
 		elements = append(elements, markdownEl(md))
 	}
-	elements = append(elements,
-		buttonRow(
-			button("✅ Allow", "primary", decisionValue{Kind: "a", ID: p.ID}),
-			button("⛔ Deny", "danger", decisionValue{Kind: "d", ID: p.ID}),
-		),
-		buttonRow(
-			button("✅ Allow for session", "default", decisionValue{Kind: "s", ID: p.ID}),
-		),
-	)
+	elements = append(elements, buttonRow(
+		button("✅ Allow", "primary", decisionValue{Kind: "a", ID: p.ID}),
+		button("⛔ Deny", "danger", decisionValue{Kind: "d", ID: p.ID}),
+	))
+	if p.AllowAlways {
+		elements = append(elements, buttonRow(
+			button("✅ Allow always", "default", decisionValue{Kind: "s", ID: p.ID}),
+		))
+	}
 	return card(header, "orange", elements)
 }
 

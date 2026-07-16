@@ -337,13 +337,20 @@ func (c *Client) approval(m rpcMessage) {
 		m.Method == "item/fileChange/requestApproval" ||
 		m.Method == "execCommandApproval" || m.Method == "applyPatchApproval"
 	if known && h != nil {
-		if r, err := h.Submit(context.Background(), hook.Event{SessionID: sid, Event: "PermissionRequest", ToolName: tool, ToolInput: input, Cwd: cwd}); err == nil && r.Behavior == "allow" {
-			decision = "accept"
+		allowAlways := supportsAllowAlways(m.Method, p["availableDecisions"])
+		if r, err := h.Submit(context.Background(), hook.Event{SessionID: sid, Event: "PermissionRequest", ToolName: tool, ToolInput: input, Cwd: cwd, AllowAlways: allowAlways}); err == nil && r.Behavior == "allow" {
+			if r.Scope == "session" && allowAlways {
+				decision = "acceptForSession"
+			} else {
+				decision = "accept"
+			}
 		}
 	}
 	// The legacy request methods use the older ReviewDecision enum.
 	if m.Method == "execCommandApproval" || m.Method == "applyPatchApproval" {
-		if decision == "accept" {
+		if decision == "acceptForSession" {
+			decision = "approved_for_session"
+		} else if decision == "accept" {
 			decision = "approved"
 		} else {
 			decision = "denied"
@@ -353,6 +360,28 @@ func (c *Client) approval(m rpcMessage) {
 		c.logger.Warn("declining unknown app-server request", "method", m.Method)
 	}
 	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(m.ID), "result": map[string]any{"decision": decision}})
+}
+
+func supportsAllowAlways(method string, availableDecisions json.RawMessage) bool {
+	return method == "execCommandApproval" || method == "applyPatchApproval" ||
+		rawJSONContainsString(availableDecisions, "acceptForSession")
+}
+
+func rawJSONContainsString(raw json.RawMessage, want string) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var values []json.RawMessage
+	if json.Unmarshal(raw, &values) != nil {
+		return false
+	}
+	for _, value := range values {
+		var decision string
+		if json.Unmarshal(value, &decision) == nil && decision == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) died(cmd *exec.Cmd, err error) {

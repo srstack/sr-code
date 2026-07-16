@@ -366,8 +366,8 @@ func (r *Router) Unarchive(sessionID string) {
 
 // DeleteSession permanently removes a session: it cancels any in-flight turn,
 // kills usher's live window for it (if any), deletes the session jsonl from
-// disk, and forgets all per-session state (archive decision, auto-approve,
-// remembered permission rules). Irreversible — the conversation is gone with
+// disk, and forgets all per-session state (archive decision and auto-approve).
+// Irreversible — the conversation is gone with
 // the file. Errors if the session is unknown or the file delete fails; the
 // live-process teardown is best-effort. Unlike Archive (a reversible sidebar
 // hide), this is destructive.
@@ -396,7 +396,6 @@ func (r *Router) DeleteSession(id string) error {
 	r.discovery.Remove(id)
 	r.meta.Forget(id)
 	r.hooks.SetAutoApprove(id, false)
-	r.hooks.ForgetSessionRules(id)
 	return nil
 }
 
@@ -932,8 +931,8 @@ func (r *Router) RespondInteraction(id string, resp hook.Response) error {
 	return r.hooks.Respond(id, resp)
 }
 
-// HandleHook applies a remembered per-session decision first, then blocks for
-// the web UI when usher owns the session. Ownership = the session has a live
+// HandleHook applies blanket auto-approve first, then blocks for the web UI
+// when usher owns the session. Ownership = the session has a live
 // window in usher's process pool (sender.Has) — a simple membership test, NOT
 // whether a turn is currently executing. The old activeSend (turn-in-flight)
 // gate raced the send/inject/turn lifecycle and bounced mid-turn tool prompts

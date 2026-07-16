@@ -2,12 +2,6 @@
 // UI. The CLI subcommand `usher hook <event>` POSTs a hook payload to the
 // running server, which holds a pending interaction until a UI client decides
 // allow / deny, then returns the decision back to Claude Code on stdout.
-//
-// "Remember this choice" decisions are kept per-session in memory: when the
-// user picks Allow / Deny "always", the manager derives a matcher from the
-// payload (Bash uses a "Bash(<first-word>:*)" pattern, every other tool just
-// matches by name) and stores it; subsequent identical hook events for the
-// same session are answered automatically without bothering the UI.
 package hook
 
 import (
@@ -16,12 +10,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
@@ -34,7 +25,10 @@ type Pending struct {
 	ToolName  string          `json:"tool_name,omitempty"`
 	ToolInput json.RawMessage `json:"tool_input,omitempty"`
 	Cwd       string          `json:"cwd,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
+	// AllowAlways is true only when the originating backend advertised a
+	// native rule or repeated-approval decision for this request.
+	AllowAlways bool      `json:"allow_always"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type pendingEntry struct {
@@ -46,9 +40,8 @@ type pendingEntry struct {
 type Response struct {
 	Behavior string `json:"behavior"` // allow | deny
 	Reason   string `json:"reason,omitempty"`
-	// Scope is "once" (default) or "session". A "session"-scope decision is
-	// remembered for the originating session and reapplied to matching
-	// future hook events without prompting the UI again.
+	// Scope is "once" (default) or "session". "session" is the historical API
+	// spelling for the UI's "always" choice; the backend owns its exact scope.
 	Scope string `json:"scope,omitempty"`
 	// Answers resolves an AskUserQuestion tool call: each entry maps a
 	// question (verbatim from the tool input) to the option label the user
@@ -58,36 +51,23 @@ type Response struct {
 	Answers map[string]string `json:"answers,omitempty"`
 }
 
-// Rule is a remembered allow/deny decision derived from a Response with
-// Scope="session". Matcher is either an exact tool name or a Bash subset
-// pattern "Bash(<prefix>:*)" — same shape as claudecodeui's allowedTools
-// entries.
-type Rule struct {
-	SessionID string `json:"session_id"`
-	Behavior  string `json:"behavior"` // allow | deny
-	Matcher   string `json:"matcher"`
-}
-
 // Event is the input usher receives from `usher hook` and forwards to Submit.
 type Event struct {
-	SessionID string
-	ToolUseID string
-	Event     string
-	ToolName  string
-	ToolInput json.RawMessage
-	Cwd       string
+	SessionID   string
+	ToolUseID   string
+	Event       string
+	ToolName    string
+	ToolInput   json.RawMessage
+	Cwd         string
+	AllowAlways bool
 }
 
-// Manager owns the in-memory map of pending interactions, the per-session
-// remembered-rule list, and the per-session auto-approve flag. Pending
-// and remembered are process-lifetime only; autoApprove is persisted to
-// disk (autoPath) when set, so the trust boundary survives restarts.
+// Manager owns pending interactions and the per-session blanket auto-approve
+// flag. Auto-approve is persisted to disk so the trust boundary survives
+// restarts.
 type Manager struct {
 	mu      sync.Mutex
 	pending map[string]*pendingEntry
-
-	rememberMu sync.Mutex
-	remembered map[string][]Rule // sessionID → rules
 
 	autoMu      sync.Mutex
 	autoApprove map[string]bool // sessionID → true when blanket-allow is on
@@ -119,7 +99,6 @@ type pendingSub struct {
 func New(autoPath string) *Manager {
 	m := &Manager{
 		pending:     map[string]*pendingEntry{},
-		remembered:  map[string][]Rule{},
 		autoApprove: map[string]bool{},
 		autoPath:    autoPath,
 		pendingSubs: map[*pendingSub]struct{}{},
@@ -181,23 +160,15 @@ func (m *Manager) persistAutoApprove() {
 	}
 }
 
-// QuickDecide settles ev from per-session state (remembered rule or
-// auto-approve) without UI; returns (zero, false) when input is needed.
-// Remembered rules win over auto-approve so explicit deny-always opt-outs
-// survive later blanket trust toggles.
+// QuickDecide settles ev from blanket auto-approve without UI; returns
+// (zero, false) when input is needed.
 func (m *Manager) QuickDecide(ev Event) (Response, bool) {
-	// AskUserQuestion can't be settled without a chosen answer: a bare "allow"
-	// (from a remembered rule or blanket auto-approve) just lets the tool run
-	// and block on the pane TUI selector — the very thing usher routes around.
+	// AskUserQuestion can't be settled without a chosen answer: a bare allow
+	// from blanket auto-approve would let the tool run and block on the pane TUI
+	// selector — the very thing usher routes around.
 	// Always defer it to the web UI for an explicit per-call choice.
 	if ev.ToolName == "AskUserQuestion" {
 		return Response{}, false
-	}
-	if rule := m.findMatchingRule(ev); rule != nil {
-		return Response{
-			Behavior: rule.Behavior,
-			Reason:   "remembered: " + rule.Matcher,
-		}, true
 	}
 	if m.IsAutoApprove(ev.SessionID) {
 		return Response{
@@ -209,8 +180,7 @@ func (m *Manager) QuickDecide(ev Event) (Response, bool) {
 }
 
 // Submit blocks until the user responds via Respond or ctx is cancelled.
-// Short-circuits via QuickDecide first. A Scope="session" response is
-// stored as a rule before returning.
+// Short-circuits via QuickDecide first.
 func (m *Manager) Submit(ctx context.Context, ev Event) (Response, error) {
 	if ev.ToolUseID == "" {
 		return m.submit(ctx, ev)
@@ -249,13 +219,14 @@ func (m *Manager) submit(ctx context.Context, ev Event) (Response, error) {
 
 	p := &pendingEntry{
 		Pending: Pending{
-			ID:        newID(),
-			SessionID: ev.SessionID,
-			Event:     ev.Event,
-			ToolName:  ev.ToolName,
-			ToolInput: ev.ToolInput,
-			Cwd:       ev.Cwd,
-			CreatedAt: time.Now().UTC(),
+			ID:          newID(),
+			SessionID:   ev.SessionID,
+			Event:       ev.Event,
+			ToolName:    ev.ToolName,
+			ToolInput:   ev.ToolInput,
+			Cwd:         ev.Cwd,
+			AllowAlways: ev.AllowAlways,
+			CreatedAt:   time.Now().UTC(),
 		},
 		response: make(chan Response, 1),
 	}
@@ -272,9 +243,6 @@ func (m *Manager) submit(ctx context.Context, ev Event) (Response, error) {
 
 	select {
 	case r := <-p.response:
-		if r.Scope == "session" {
-			m.rememberRule(ev, r.Behavior)
-		}
 		return r, nil
 	case <-ctx.Done():
 		return Response{}, ctx.Err()
@@ -339,6 +307,14 @@ func (m *Manager) Respond(id string, r Response) error {
 	if !ok {
 		return errors.New("interaction not found")
 	}
+	if r.Scope == "session" {
+		if r.Behavior != "allow" {
+			return errors.New("session scope is only valid for allow")
+		}
+		if !p.AllowAlways {
+			return errors.New("session approval is not available for this interaction")
+		}
+	}
 	select {
 	case p.response <- r:
 		return nil
@@ -351,26 +327,6 @@ func newID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-// --- Remembered rules ----------------------------------------------------
-
-// ListRules returns a snapshot of all remembered rules across all sessions.
-func (m *Manager) ListRules() []Rule {
-	m.rememberMu.Lock()
-	defer m.rememberMu.Unlock()
-	var out []Rule
-	for _, rules := range m.remembered {
-		out = append(out, rules...)
-	}
-	return out
-}
-
-// ForgetSessionRules clears all remembered rules for sessionID.
-func (m *Manager) ForgetSessionRules(sessionID string) {
-	m.rememberMu.Lock()
-	delete(m.remembered, sessionID)
-	m.rememberMu.Unlock()
 }
 
 // SetAutoApprove flips the blanket "allow every tool call" flag for a
@@ -391,78 +347,4 @@ func (m *Manager) IsAutoApprove(sessionID string) bool {
 	m.autoMu.Lock()
 	defer m.autoMu.Unlock()
 	return m.autoApprove[sessionID]
-}
-
-func (m *Manager) findMatchingRule(ev Event) *Rule {
-	m.rememberMu.Lock()
-	rules := m.remembered[ev.SessionID]
-	m.rememberMu.Unlock()
-	for i := range rules {
-		if matchRule(rules[i], ev.ToolName, ev.ToolInput) {
-			return &rules[i]
-		}
-	}
-	return nil
-}
-
-func (m *Manager) rememberRule(ev Event, behavior string) {
-	matcher := deriveMatcher(ev.ToolName, ev.ToolInput)
-	if matcher == "" {
-		return
-	}
-	rule := Rule{SessionID: ev.SessionID, Behavior: behavior, Matcher: matcher}
-
-	m.rememberMu.Lock()
-	defer m.rememberMu.Unlock()
-	for _, existing := range m.remembered[ev.SessionID] {
-		if existing.Matcher == matcher && existing.Behavior == behavior {
-			return // dedupe
-		}
-	}
-	m.remembered[ev.SessionID] = append(m.remembered[ev.SessionID], rule)
-}
-
-var bashPrefixRE = regexp.MustCompile(`^Bash\((.+):\*\)$`)
-
-// matchRule reports whether a remembered rule applies to the given event.
-func matchRule(rule Rule, toolName string, toolInput json.RawMessage) bool {
-	if rule.Matcher == toolName {
-		return true
-	}
-	if m := bashPrefixRE.FindStringSubmatch(rule.Matcher); m != nil && toolName == "Bash" {
-		var in struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal(toolInput, &in); err != nil {
-			return false
-		}
-		return strings.HasPrefix(strings.TrimSpace(in.Command), m[1])
-	}
-	return false
-}
-
-// deriveMatcher picks a session-scope matcher for ev. Bash commands turn
-// into "Bash(<first-word>:*)" so e.g. "git push" remembered means future
-// "git status" / "git log" / "git pull" are also auto-allowed. Every other
-// tool collapses to the bare tool name (a single Read decision applies to
-// all later Read calls in this session).
-func deriveMatcher(toolName string, toolInput json.RawMessage) string {
-	if toolName == "" {
-		return ""
-	}
-	if toolName == "Bash" {
-		var in struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal(toolInput, &in); err == nil {
-			cmd := strings.TrimSpace(in.Command)
-			if cmd != "" {
-				first := strings.SplitN(cmd, " ", 2)[0]
-				if first != "" {
-					return fmt.Sprintf("Bash(%s:*)", first)
-				}
-			}
-		}
-	}
-	return toolName
 }

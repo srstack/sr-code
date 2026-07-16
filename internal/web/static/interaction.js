@@ -72,7 +72,9 @@ function renderPermission(p, sid) {
   let inputJSON = '';
   try { inputJSON = JSON.stringify(p.tool_input || {}, null, 2); }
   catch { inputJSON = String(p.tool_input || ''); }
-  const matcher = deriveMatcherPreview(p.tool_name, p.tool_input);
+  const always = p.allow_always
+    ? '<button class="allow secondary" data-scope="session">allow always</button>'
+    : '';
   return `
     <div class="interaction" data-id="${esc(p.id)}">
       <div class="meta">
@@ -82,8 +84,7 @@ function renderPermission(p, sid) {
       <pre class="tool-input">${esc(inputJSON)}</pre>
       <div class="actions">
         <button class="allow primary" data-scope="once">allow</button>
-        <button class="allow secondary" data-scope="session" title="auto-allow ${esc(matcher)} for this session">allow always</button>
-        <button class="deny secondary" data-scope="session" title="auto-deny ${esc(matcher)} for this session">deny always</button>
+        ${always}
         <button class="deny primary" data-scope="once">deny</button>
       </div>
     </div>`;
@@ -208,15 +209,4 @@ async function respondAnswers(id, answers) {
     console.error('respond answers', e);
   }
   pollInteractions();
-}
-
-// Mirror of internal/hook/hook.go deriveMatcher — used purely for the
-// tooltip preview ("auto-allow Bash(git:*)" etc). Server is authoritative.
-function deriveMatcherPreview(toolName, toolInput) {
-  if (!toolName) return '(unknown)';
-  if (toolName === 'Bash' && toolInput && typeof toolInput.command === 'string') {
-    const cmd = toolInput.command.trim();
-    if (cmd) return 'Bash(' + cmd.split(/\s+/, 1)[0] + ':*)';
-  }
-  return toolName;
 }

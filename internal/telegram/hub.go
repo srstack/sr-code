@@ -292,17 +292,19 @@ func (h *Hub) postPermission(ctx context.Context, p hook.Pending) {
 		h.postAskQuestion(ctx, thread, p)
 		return
 	}
+	buttons := [][]InlineKeyboardButton{{
+		{Text: "✅ Allow", CallbackData: encodeDecision("a", p.ID)},
+		{Text: "⛔ Deny", CallbackData: encodeDecision("d", p.ID)},
+	}}
+	if p.AllowAlways {
+		buttons = append(buttons, []InlineKeyboardButton{{Text: "✅ Allow always", CallbackData: encodeDecision("s", p.ID)}})
+	}
 	if _, err := h.client.SendMessage(ctx, SendMessageParams{
 		ChatID:          h.group,
 		MessageThreadID: thread,
 		Text:            permissionHTML(p) + h.mentionSuffix(),
 		ParseMode:       "HTML",
-		ReplyMarkup: &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{{
-			{Text: "✅ Allow", CallbackData: encodeDecision("a", p.ID)},
-			{Text: "⛔ Deny", CallbackData: encodeDecision("d", p.ID)},
-		}, {
-			{Text: "✅ Allow for session", CallbackData: encodeDecision("s", p.ID)},
-		}}},
+		ReplyMarkup:     &InlineKeyboardMarkup{InlineKeyboard: buttons},
 	}); err != nil {
 		h.logger.Warn("telegram: post permission", "session", p.SessionID, "err", err)
 	}
@@ -334,7 +336,7 @@ func (h *Hub) handleCallback(ctx context.Context, cb *CallbackQuery) {
 	case behavior == "deny":
 		toast = "⛔ denied"
 	case scope == "session":
-		toast = "✅ allowed for session"
+		toast = "✅ always allowed"
 	}
 	if err := h.router.RespondInteraction(id, resp); err != nil {
 		toast = "already resolved"

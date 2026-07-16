@@ -1653,7 +1653,7 @@ func (h *Hub) HandleCardAction(ctx context.Context, event *callback.CardActionTr
 	case behavior == "deny":
 		msg = "⛔ denied"
 	case scope == "session":
-		msg = "✅ allowed for session"
+		msg = "✅ always allowed"
 	}
 	err := h.router.RespondInteraction(v.ID, hook.Response{Behavior: behavior, Scope: scope, Reason: "via lark"})
 	if err != nil && !isServerReject(err) {

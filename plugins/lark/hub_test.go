@@ -852,7 +852,7 @@ func TestPermissionCardRoundTrip(t *testing.T) {
 	h := newTestHub(t, f, r, testUser)
 	runHub(t, h)
 
-	p := hook.Pending{ID: "p1", SessionID: "s1", ToolName: "Bash",
+	p := hook.Pending{ID: "p1", SessionID: "s1", ToolName: "Bash", AllowAlways: true,
 		ToolInput: json.RawMessage(`{"command":"rm -rf build"}`)}
 	r.pendingCh <- p
 	waitFor(t, "permission card", func() bool {
@@ -870,9 +870,9 @@ func TestPermissionCardRoundTrip(t *testing.T) {
 		t.Fatalf("replayed pending reposted: %d messages", n)
 	}
 
-	// Tap "allow for session".
+	// Tap "allow always".
 	resp := h.HandleCardAction(context.Background(), cardTap(testChat, testUser, obj{"k": "s", "id": "p1"}))
-	if resp.Toast == nil || !strings.Contains(resp.Toast.Content, "allowed for session") {
+	if resp.Toast == nil || !strings.Contains(resp.Toast.Content, "always allowed") {
 		t.Fatalf("toast = %+v", resp.Toast)
 	}
 	if got, ok := r.response("p1"); !ok || got.Behavior != "allow" || got.Scope != "session" {
@@ -1177,6 +1177,9 @@ func TestCardFenceInjectionDefanged(t *testing.T) {
 	p := hook.Pending{ID: "p1", ToolName: "Bash",
 		ToolInput: json.RawMessage("{\"command\":\"echo hi\\n```\\n<at id=all></at> harmless\"}")}
 	rendered := cardJSON(permissionCard(p, nil, ""))
+	if strings.Contains(rendered, `"k":"s"`) {
+		t.Fatalf("card offered allow always without backend support: %s", rendered)
+	}
 	if strings.Contains(rendered, "<at id=all>") && !strings.Contains(rendered, "'''") {
 		t.Fatalf("fence not defanged: %s", rendered)
 	}

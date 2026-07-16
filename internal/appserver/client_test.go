@@ -119,3 +119,28 @@ func TestClientTracksSpontaneousTurnActivity(t *testing.T) {
 		t.Fatal("turn/completed did not clear session activity")
 	}
 }
+
+func TestRawJSONContainsString(t *testing.T) {
+	raw := json.RawMessage(`["accept",{"acceptWithExecpolicyAmendment":{}},"acceptForSession","decline"]`)
+	if !rawJSONContainsString(raw, "acceptForSession") {
+		t.Fatal("decision was not found")
+	}
+	if rawJSONContainsString(raw, "cancel") {
+		t.Fatal("missing decision was reported present")
+	}
+	if rawJSONContainsString(json.RawMessage(`not json`), "accept") {
+		t.Fatal("invalid JSON matched")
+	}
+}
+
+func TestSupportsAllowAlways(t *testing.T) {
+	if !supportsAllowAlways("execCommandApproval", nil) || !supportsAllowAlways("applyPatchApproval", nil) {
+		t.Fatal("legacy approval method did not expose approved_for_session")
+	}
+	if !supportsAllowAlways("item/commandExecution/requestApproval", json.RawMessage(`["accept","acceptForSession"]`)) {
+		t.Fatal("modern acceptForSession was not detected")
+	}
+	if supportsAllowAlways("item/commandExecution/requestApproval", json.RawMessage(`["accept","decline"]`)) {
+		t.Fatal("modern request without acceptForSession exposed allow always")
+	}
+}

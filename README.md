@@ -166,7 +166,8 @@ flowchart LR
 - **Permissions** flow through an inline Claude `PermissionRequest` hook and
   Codex app-server approval requests. Claude keeps a narrow `PreToolUse` hook
   for `AskUserQuestion` answers. A request blocks until you decide in the UI;
-  remembered rules and auto-approve work for both backends.
+  "allow always" uses each backend's native session approval when available,
+  and usher's blanket auto-approve works for both backends.
 - **Session terminals** provide one tmux shell per conversation, starting in its
   cwd. Hiding the panel leaves the shell running; `exit` or session deletion
   closes it.
