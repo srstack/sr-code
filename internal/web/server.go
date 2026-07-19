@@ -607,8 +607,8 @@ type forkRequest struct {
 	AfterUUID string `json:"after_uuid"` // fork point: the uuid a transcript turn carries
 }
 
-// handleFork branches a session at a past turn into a new session (a prefix
-// copy of its jsonl — conversation only). Responds with the new session id.
+// handleFork branches a session at a past turn into a new session. Responds
+// with the new session id.
 func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req forkRequest

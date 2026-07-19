@@ -65,6 +65,12 @@ type Assembler interface {
 	Model() string
 }
 
+// MultiPartAssembler optionally exposes every display part stored in one record.
+type MultiPartAssembler interface {
+	Assembler
+	FeedLineParts(raw []byte) (completed []core.Turn, parts []*core.TurnPart)
+}
+
 // Transcript owns one backend's persisted session format.
 type Transcript interface {
 	ReadTurns(path string, limit int) ([]core.Turn, int, error)

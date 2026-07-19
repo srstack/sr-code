@@ -8,6 +8,7 @@ import (
 	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/jsonl"
+	piagent "github.com/nexustar/usher/internal/pi"
 )
 
 // Source describes where one backend's session logs live on disk and how to
@@ -130,4 +131,19 @@ func (s CodexSource) SessionID(path string) string {
 
 func (s CodexSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return codexrollout.ReadSessionMeta(path)
+}
+
+// PiSource scans pi's per-working-directory session tree. Directory names are
+// an implementation detail; the stable session id and cwd live in the header.
+type PiSource struct{ root string }
+
+func NewPiSource(root string) PiSource { return PiSource{root: root} }
+func (s PiSource) Backend() string     { return "pi" }
+func (s PiSource) Root() string        { return s.root }
+func (s PiSource) IsSessionFile(path string) bool {
+	return strings.HasSuffix(filepath.Base(path), ".jsonl")
+}
+func (s PiSource) SessionID(path string) string { return piagent.SessionIDFromPath(path) }
+func (s PiSource) ReadMeta(path string) (core.SessionMeta, error) {
+	return piagent.ReadSessionMeta(path)
 }

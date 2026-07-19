@@ -23,6 +23,7 @@ import (
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/modelcatalog"
+	piagent "github.com/nexustar/usher/internal/pi"
 	"github.com/nexustar/usher/internal/pluginapi"
 	"github.com/nexustar/usher/internal/push"
 	"github.com/nexustar/usher/internal/router"
@@ -103,6 +104,10 @@ func serve(args []string) error {
 		"extra flags for spawned codex (space-separated). Empty uses codex's own approval "+
 			"policy (usher gates whatever codex natively escalates); e.g. \"-c approval_policy=untrusted\" "+
 			"to route most commands through usher like Claude.")
+	piCmd := fs.String("pi", defaultPiCmd(), "path to the pi binary (pi backend)")
+	piSessionsDir := fs.String("pi-sessions-dir", defaultPiSessionsDir(),
+		"pi coding-agent sessions directory; the pi backend auto-enables when it exists")
+	piArgs := fs.String("pi-args", "", "extra flags for spawned pi RPC workers (space-separated)")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
@@ -194,11 +199,28 @@ func serve(args []string) error {
 		}
 		logger.Info("codex backend enabled", "sessions_dir", dir)
 	}
+	if dir := *piSessionsDir; dir != "" && isDir(dir) {
+		sources = append(sources, discovery.NewPiSource(dir))
+		extra := strings.Fields(*piArgs)
+		if !*disableUsherTools {
+			if extensionPath, extensionErr := piagent.PrepareUsherExtension(*dataDir); extensionErr != nil {
+				logger.Warn("pi extension: write failed; show_image disabled", "err", extensionErr)
+			} else {
+				extra = append(extra, "--extension", extensionPath)
+			}
+		}
+		piRuntime := piagent.NewRuntime(*piCmd, dir, extra, *maxLiveSessions, h, logger)
+		backends["pi"] = backend.Backend{Runtime: piRuntime, Transcript: piagent.Transcript{}, Forker: piRuntime, Models: piagent.Models{Bin: *piCmd, SessionsDir: dir, Extra: extra}}
+		if defaultBackend == "" {
+			defaultBackend = "pi"
+		}
+		logger.Info("pi backend enabled", "sessions_dir", dir)
+	}
 
 	if len(backends) == 0 {
-		return fmt.Errorf("no backend found: neither %q (Claude Code) nor %q (Codex) exists.\n"+
-			"  run claude or codex once first, or pass --projects-dir / --codex-sessions-dir.",
-			*projectsDir, *codexSessionsDir)
+		return fmt.Errorf("no backend found: Claude %q, Codex %q, and pi %q do not exist.\n"+
+			"  run a supported agent once first, or pass its sessions-directory flag.",
+			*projectsDir, *codexSessionsDir, *piSessionsDir)
 	}
 
 	d, err := discovery.NewMulti(logger, sources...)
@@ -411,6 +433,34 @@ func defaultCodexSessionsDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".codex", "sessions")
+}
+
+func defaultPiSessionsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	if dir := os.Getenv("PI_CODING_AGENT_SESSION_DIR"); dir != "" {
+		return dir
+	}
+	if dir := os.Getenv("PI_CODING_AGENT_DIR"); dir != "" {
+		return filepath.Join(dir, "sessions")
+	}
+	return filepath.Join(home, ".pi", "agent", "sessions")
+}
+
+func defaultPiCmd() string {
+	home, err := os.UserHomeDir()
+	if err == nil {
+		// pi's official installer keeps a matching Node runtime beside the CLI.
+		// Prefer it when present so services that do not source ~/.bashrc still
+		// work, and runtime.go can prepend that bin directory to PATH.
+		installed := filepath.Join(home, ".local", "share", "pi-node", "current", "bin", "pi")
+		if info, statErr := os.Stat(installed); statErr == nil && !info.IsDir() {
+			return installed
+		}
+	}
+	return "pi"
 }
 
 func isDir(path string) bool {

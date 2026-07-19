@@ -340,11 +340,8 @@ func (r *Router) SessionPath(id string) (string, bool) {
 	return r.discovery.Path(id)
 }
 
-// ForkSession branches the conversation of srcID into a brand-new session:
-// a prefix copy of its jsonl through the turn containing afterUUID (see
-// jsonl.ForkCopy), under a fresh id in the same project dir. Pure file
-// operation — no process is spawned; the fork is resumed lazily by the pool
-// on its first send, like any idle session. Returns the new session id.
+// ForkSession asks the source backend to branch the conversation after the
+// turn containing afterUUID and returns the new session id.
 func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
 	if sess, ok := r.discovery.Get(srcID); ok && sess.IsSubagent {
 		return "", errors.New("subagent transcripts are read-only")
@@ -625,7 +622,7 @@ func lineTimestamp(raw json.RawMessage) time.Time {
 	return o.Timestamp
 }
 
-func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev sender.StreamEvent, started time.Time) *jsonl.TurnPart {
+func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev sender.StreamEvent, started time.Time) []*jsonl.TurnPart {
 	if ev.Type == backendpkg.EventRuntime {
 		var runtime core.SessionRuntime
 		if json.Unmarshal(ev.Raw, &runtime) == nil {
@@ -648,7 +645,17 @@ func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev se
 	}
 	// Feed every log line; the assembler ignores non-conversational ones
 	// (Claude's system events, Codex's session_meta/token_count, etc.).
-	completed, part := asm.FeedLine(ev.Raw)
+	var completed []core.Turn
+	var parts []*core.TurnPart
+	if multi, ok := asm.(backendpkg.MultiPartAssembler); ok {
+		completed, parts = multi.FeedLineParts(ev.Raw)
+	} else {
+		var part *core.TurnPart
+		completed, part = asm.FeedLine(ev.Raw)
+		if part != nil {
+			parts = []*core.TurnPart{part}
+		}
+	}
 	for _, t := range completed {
 		if t.Role != "user" {
 			// Assistant turns are finalized client-side by the turn-end
@@ -660,7 +667,7 @@ func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev se
 			r.broker.Publish(broker.Event{SessionID: sessionID, Type: backendpkg.EventTurnUser, Raw: raw})
 		}
 	}
-	if part != nil {
+	for _, part := range parts {
 		raw, mErr := json.Marshal(map[string]any{
 			"role": "assistant", "ts": lineTimestamp(ev.Raw), "model": asm.Model(), "part": part,
 		})
@@ -668,7 +675,7 @@ func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev se
 			r.broker.Publish(broker.Event{SessionID: sessionID, Type: backendpkg.EventPart, Raw: raw})
 		}
 	}
-	return part
+	return parts
 }
 
 // enrichExitWithTurnTimestamps reads the last two user/assistant turns from
@@ -1561,11 +1568,13 @@ func (r *Router) collectNewSessionText(sessionID, backendName string, ch <-chan 
 	}
 	asm := format.NewAssembler()
 	for ev := range ch {
-		if p := r.publishStream(sessionID, asm, ev, time.Time{}); p != nil && p.Type == "text" {
-			if buf.Len() > 0 {
-				buf.WriteString("\n")
+		for _, p := range r.publishStream(sessionID, asm, ev, time.Time{}) {
+			if p.Type == "text" {
+				if buf.Len() > 0 {
+					buf.WriteString("\n")
+				}
+				buf.WriteString(p.Content)
 			}
-			buf.WriteString(p.Content)
 		}
 	}
 	return buf.String()

@@ -163,11 +163,14 @@ export async function showNewSession(prefillCwd) {
     modelEl.replaceChildren();
     for (const name of backends) {
       const models = catalogs[name] || [];
-      if (!models.length) continue;
       const grp = document.createElement('optgroup');
       grp.label = name.charAt(0).toUpperCase() + name.slice(1);
       grp.dataset.backend = name;
-      for (const m of models) {
+      // Keep an enabled backend selectable even when its account-aware model
+      // lookup temporarily fails. The CLI's own default remains a valid and
+      // useful fallback, and hiding the whole backend makes diagnosis opaque.
+      const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
+      for (const m of choices) {
         const o = document.createElement('option');
         o.value = m.id;
         o.textContent = m.display_name || m.id;
@@ -1049,7 +1052,7 @@ function ensureLiveTurn() {
   const node = appendChatMessage({ role: 'assistant', parts: [] });
   if (!node) return null;
   node.classList.add('optimistic');
-  liveTurn = { node, parts: [], ts: '', preview: null, previewText: '', previewRAF: 0, acceptDeltas: true };
+  liveTurn = { node, parts: [], partNodes: [], ts: '', preview: null, previewText: '', previewRAF: 0, acceptDeltas: true };
   return liveTurn;
 }
 
@@ -1090,7 +1093,22 @@ function appendLivePart(d) {
   if (!p) return;
   const lt = ensureLiveTurn();
   if (!lt) return;
-  lt.parts.push(p);
+  // Pi emits pending tool cards before results; enrich the matching card even
+  // when parallel calls finish out of order instead of rendering a duplicate.
+  let enrichIndex = -1;
+  if (p.type === 'tool' && p.content) {
+    for (let i = lt.parts.length - 1; i >= 0; i--) {
+      const prev = lt.parts[i];
+      if (prev.type === 'tool' && !prev.content &&
+          prev.toolName === p.toolName && prev.toolTarget === p.toolTarget) {
+        enrichIndex = i;
+        break;
+      }
+    }
+  }
+  const enrichTool = enrichIndex >= 0;
+  if (enrichTool) lt.parts[enrichIndex] = p;
+  else lt.parts.push(p);
   if (!lt.ts && d.ts) lt.ts = d.ts;
   const chat = document.getElementById('chat-scroll');
   const stick = chat && isNearBottom(chat);
@@ -1106,6 +1124,7 @@ function appendLivePart(d) {
     lt.preview.classList.remove('stream-preview');
     lt.preview.dataset.raw = p.content || '';
     lt.preview.innerHTML = renderMarkdown(p.content || '');
+    lt.partNodes.push(lt.preview);
     lt.preview = null;
     lt.previewText = '';
     lt.acceptDeltas = false; // discard this item's protocol tail after JSONL lands
@@ -1121,7 +1140,15 @@ function appendLivePart(d) {
   tmpl.innerHTML = p.type === 'tool'
     ? renderToolPart(p)
     : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
-  lt.node.appendChild(tmpl.content);
+  const partNode = tmpl.content.firstElementChild;
+  if (enrichTool && lt.partNodes.length) {
+    const oldNode = lt.partNodes[enrichIndex];
+    oldNode.replaceWith(partNode);
+    lt.partNodes[enrichIndex] = partNode;
+  } else {
+    lt.node.appendChild(partNode);
+    lt.partNodes.push(partNode);
+  }
   if (stick && chat) chat.scrollTop = chat.scrollHeight;
 }
 

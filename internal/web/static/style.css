@@ -38,9 +38,10 @@
   /* Agent purple */
   --purple: #6e40c9;
 
-  /* Backend accents (marks + model picker): Claude coral / Codex periwinkle. */
+  /* Backend marks: Claude coral, Codex periwinkle, Pi's official monochrome. */
   --claude: #bd5b3d;
   --codex: #6f76d6;
+  --pi: #09090b;
 
   /* Code */
   --inline-code-bg: #e4e7eb;
@@ -1128,6 +1129,7 @@ pre.raw-markdown {
 }
 .backend-mark--claude { color: var(--claude); }
 .backend-mark--codex { color: var(--codex); }
+.backend-mark--pi { color: var(--pi); }
 .archived-row .backend-mark { opacity: 0.5; }
 
 .send-controls {
@@ -1551,6 +1553,7 @@ pre.raw-markdown {
     --purple: #bc8cff;
     --claude: #e0916f;
     --codex: #8e93e0;
+    --pi: #fff;
 
     --inline-code-bg: rgba(110, 118, 129, 0.3);
     --code-block-bg: #0a0d12;

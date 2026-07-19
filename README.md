@@ -2,7 +2,7 @@
 
 *Ultra-Simple Harness for Everything Routing.*
 
-Drive multiple Claude Code and Codex sessions from any browser — including your
+Drive multiple Claude Code, Codex, and pi sessions from any browser — including your
 phone over Tailscale.
 
 <p align="center">
@@ -86,7 +86,7 @@ Step-by-step for both tunnels, plus the auth internals and threat model, is in
 ## Configuration
 
 `usher serve --help` lists every flag. Each backend turns on only if its session
-dir exists, so usher runs with either CLI or both (it needs at least one). The
+dir exists, so usher runs with any installed CLI (it needs at least one). The
 most common:
 
 | Flag | Default | Purpose |
@@ -95,6 +95,9 @@ most common:
 | `--data-dir` | `$XDG_DATA_HOME/usher` | usher's state (auth, hook socket, chat history). |
 | `--projects-dir` | `~/.claude/projects` | Claude Code session dir; enables the Claude backend when present. |
 | `--codex-sessions-dir` | `~/.codex/sessions` | Codex session dir; enables the Codex backend when present. |
+| `--pi-sessions-dir` | `~/.pi/agent/sessions` | pi coding-agent session dir; enables the pi backend when present. |
+| `--pi` | `pi` | pi executable used for RPC workers. |
+| `--pi-args` | empty | Extra flags passed to spawned pi RPC workers. |
 | `--permission-mode` | `default` | Claude only. `default` uses the hook UI; `bypassPermissions` skips prompting. |
 | `--tmux-socket` | `usher` | Socket prefix for optional session terminals (`<name>-terminal`). |
 | `--terminal-shell` | `$SHELL` or `bash` | Shell executable used by session terminals. |
