@@ -21,10 +21,16 @@ func NewRule(api AgentAPI) *RuleAgent { return &RuleAgent{api: api} }
 
 const helpText = `commands:
   /list                          list all coding-agent sessions
+  /focus <prefix>                switch focus without sending or reading
   /send <prefix> <text>          send <text>; the session's reply is relayed here when done
-  /ask <prefix> <text>           send <text> and wait for the session's reply
-  /read <prefix> [n]             show the last n turns of a session (default 20)
+  /read <prefix> [n] [offset]    show n turns of a session (default 20), from offset (default: most recent)
+  /search <query>                find sessions whose transcripts contain query
+  /search --session <prefix> <query>
+                                 find matching turns inside one session
   /new <cwd> <text>              start a new session in <cwd> with an initial message
+  /pending                       list permission requests waiting for a decision
+  /approve <interaction-prefix>  allow a pending permission request
+  /deny <interaction-prefix>     deny a pending permission request
   /archive <prefix>              hide a session from the default list
   /unarchive <prefix>            restore an archived session
   /auto-approve <prefix> on|off  toggle auto-approving the session's prompts
@@ -48,22 +54,22 @@ func (a *RuleAgent) Handle(ctx context.Context, _ []HistoryMessage, _ string, us
 		reply = helpText
 	case "/list":
 		reply = a.list()
+	case "/focus":
+		reply, focus = a.focus(rest)
 	case "/send":
 		reply, focus = a.send(rest, relay)
-	case "/ask":
-		reply, focus = a.ask(ctx, rest)
 	case "/read":
 		reply, focus = a.read(rest)
+	case "/search":
+		reply, focus = a.search(rest)
 	case "/new":
 		reply, focus = a.create(ctx, rest)
-	// Permission commands disabled for now (handled by the global web modal).
-	// pending()/respond() kept; uncomment these + their /help lines to restore.
-	// case "/pending":
-	// 	reply = a.pending()
-	// case "/approve":
-	// 	reply = a.respond(rest, "allow")
-	// case "/deny":
-	// 	reply = a.respond(rest, "deny")
+	case "/pending":
+		reply = a.pending()
+	case "/approve":
+		reply = a.respond(rest, "allow")
+	case "/deny":
+		reply = a.respond(rest, "deny")
 	case "/archive":
 		reply = a.setArchived(rest, true)
 	case "/unarchive":
@@ -122,6 +128,18 @@ func (a *RuleAgent) resolveSession(prefix string) (core.Session, string) {
 	return matches[0], ""
 }
 
+func (a *RuleAgent) focus(prefix string) (string, string) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "usage: /focus <session-prefix>", ""
+	}
+	sess, errMsg := a.resolveSession(prefix)
+	if errMsg != "" {
+		return errMsg, ""
+	}
+	return fmt.Sprintf("focused %s (%s)", shortID(sess.ID), titleOr(sess)), sess.ID
+}
+
 func (a *RuleAgent) send(args string, relay RelaySink) (string, string) {
 	prefix, text := splitOnce(args)
 	text = strings.TrimSpace(text)
@@ -144,40 +162,24 @@ func (a *RuleAgent) send(args string, relay RelaySink) (string, string) {
 	return fmt.Sprintf("sent to %s (%s)", shortID(sess.ID), titleOr(sess)), sess.ID
 }
 
-func (a *RuleAgent) ask(ctx context.Context, args string) (string, string) {
-	prefix, text := splitOnce(args)
-	text = strings.TrimSpace(text)
-	if prefix == "" || text == "" {
-		return "usage: /ask <session-prefix> <text>", ""
-	}
-	sess, errMsg := a.resolveSession(prefix)
-	if errMsg != "" {
-		return errMsg, ""
-	}
-	reply, err := a.api.SendToSessionAndWait(ctx, sess.ID, text, defaultWaitTimeout)
-	if err != nil {
-		if reply != "" {
-			return fmt.Sprintf("%s\n\n(error: %s)", reply, err.Error()), sess.ID
-		}
-		return "ask failed: " + err.Error(), sess.ID
-	}
-	if strings.TrimSpace(reply) == "" {
-		reply = "(no text response)"
-	}
-	return reply, sess.ID
-}
-
 func (a *RuleAgent) read(args string) (string, string) {
 	prefix, rest := splitOnce(args)
 	if prefix == "" {
-		return "usage: /read <session-prefix> [n]", ""
+		return "usage: /read <session-prefix> [n] [offset]", ""
 	}
 	limit := defaultReadTurns
+	offset := -1 // most recent page
 	if rest != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil && n > 0 {
+		nStr, offStr := splitOnce(rest)
+		if n, err := strconv.Atoi(strings.TrimSpace(nStr)); err == nil && n > 0 {
 			limit = n
 			if limit > maxReadTurns {
 				limit = maxReadTurns
+			}
+		}
+		if offStr != "" {
+			if o, err := strconv.Atoi(strings.TrimSpace(offStr)); err == nil && o >= 0 {
+				offset = o
 			}
 		}
 	}
@@ -185,7 +187,7 @@ func (a *RuleAgent) read(args string) (string, string) {
 	if errMsg != "" {
 		return errMsg, ""
 	}
-	turns, err := a.api.ReadSessionTranscript(sess.ID, limit)
+	turns, start, total, err := a.api.ReadSessionTranscriptPage(sess.ID, offset, limit)
 	if err != nil {
 		return "read failed: " + err.Error(), ""
 	}
@@ -193,10 +195,59 @@ func (a *RuleAgent) read(args string) (string, string) {
 		return "(empty transcript)", sess.ID
 	}
 	var b strings.Builder
+	fmt.Fprintf(&b, "turns %d-%d of %d\n", start, start+len(turns)-1, total)
 	for _, tn := range turns {
 		fmt.Fprintf(&b, "%s: %s\n", tn.Role, truncate(strings.TrimSpace(tn.Content), 500))
 	}
 	return strings.TrimRight(b.String(), "\n"), sess.ID
+}
+
+func (a *RuleAgent) search(args string) (string, string) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return "usage: /search <query> | /search --session <session-prefix> <query>", ""
+	}
+	if args == "--session" || strings.HasPrefix(args, "--session ") {
+		prefix, query := splitOnce(strings.TrimSpace(strings.TrimPrefix(args, "--session")))
+		query = strings.TrimSpace(query)
+		if prefix == "" || query == "" {
+			return "usage: /search --session <session-prefix> <query>", ""
+		}
+		sess, errMsg := a.resolveSession(prefix)
+		if errMsg != "" {
+			return errMsg, ""
+		}
+		hits, truncated, err := a.api.SearchSessionTranscript(sess.ID, query, defaultSearchHits, defaultSearchContext)
+		if err != nil {
+			return "search failed: " + err.Error(), ""
+		}
+		if len(hits) == 0 {
+			return "no matches", sess.ID
+		}
+		var b strings.Builder
+		for _, h := range hits {
+			fmt.Fprintf(&b, "#%d %s: %s\n", h.TurnIndex, h.Role, truncate(strings.TrimSpace(h.Snippet), 500))
+		}
+		if truncated {
+			b.WriteString("(more matches not shown)")
+		}
+		return strings.TrimRight(b.String(), "\n"), sess.ID
+	}
+	results, truncated, err := a.api.SearchAllSessions(args, defaultSearchSessions, defaultSearchContext)
+	if err != nil {
+		return "search failed: " + err.Error(), ""
+	}
+	if len(results) == 0 {
+		return "no matches", ""
+	}
+	var b strings.Builder
+	for _, result := range results {
+		fmt.Fprintf(&b, "%s  %s  (%d hits)\n", shortID(result.SessionID), truncate(result.Title, 50), result.HitCount)
+	}
+	if truncated {
+		b.WriteString("(more matches not shown)")
+	}
+	return strings.TrimRight(b.String(), "\n"), ""
 }
 
 func (a *RuleAgent) create(ctx context.Context, args string) (string, string) {

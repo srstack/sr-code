@@ -41,7 +41,13 @@ export function renderMarkdown(md) {
     /(<(?:a|img)\b[^>]*?\b(?:href|src)=")\s*(?:javascript|data|vbscript)\s*:[^"]*"/gi,
     '$1#unsafe"',
   );
-  html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
+  // Markdown links open away from the SPA, except hash routes: those are
+  // internal navigation (for example the server-generated "Switching to"
+  // banner) and stay consistent with the header/sidebar focus links.
+  html = html.replace(
+    /<a (?=[^>]*\bhref="(?!#\/))/g,
+    '<a target="_blank" rel="noopener" ',
+  );
   return html;
 }
 

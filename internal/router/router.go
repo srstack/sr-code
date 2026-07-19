@@ -1244,62 +1244,6 @@ func snippetAround(text []rune, start, matchLen, ctx int) string {
 	return snip
 }
 
-// SendToSessionAndWait spawns the same fire-and-forget send as
-// SendToSession but blocks until subprocess.exit (or timeout / ctx cancel),
-// returning the accumulated assistant text streamed during this turn.
-//
-// We subscribe to the broker BEFORE issuing the send so no events are
-// missed in the window between SendToSession returning and the subscriber
-// being attached.
-func (r *Router) SendToSessionAndWait(ctx context.Context, id, text string, timeout time.Duration) (string, error) {
-	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
-	defer waitCancel()
-
-	// The subscription is created by the queue's pre hook — at actual turn
-	// start, after any earlier turn's events have all been published — so the
-	// collected text is this turn's, even when the send had to queue.
-	started := make(chan turnSub, 1)
-	aborted := make(chan error, 1)
-	err := r.enqueueSend(id, text,
-		func() {
-			ch, cancel := r.broker.Subscribe(id)
-			started <- turnSub{ch: ch, cancel: cancel}
-		},
-		func(err error) { aborted <- err },
-	)
-	if err != nil {
-		return "", err
-	}
-
-	select {
-	case sub := <-started:
-		defer sub.cancel()
-		return collectTurnText(waitCtx, sub.ch)
-	case err := <-aborted:
-		return "", err
-	case <-waitCtx.Done():
-		// Wait expired while still queued. The send stays queued (delivered
-		// in order); only the wait gives up. Drain the eventual subscription
-		// so it can't leak.
-		go func() {
-			select {
-			case sub := <-started:
-				sub.cancel()
-			case <-aborted:
-			case <-time.After(relayWaitCeiling):
-			}
-		}()
-		return "", errors.New("timeout (send still queued behind an earlier turn)")
-	}
-}
-
-// turnSub hands a pre-subscribed broker stream from enqueueSend's pre hook to
-// the caller that collects it.
-type turnSub struct {
-	ch     <-chan broker.Event
-	cancel func()
-}
-
 // relayWaitCeiling bounds how long a relayed send's collector goroutine may
 // outlive its turn. It is not a UX timeout — relays are event-driven and fire
 // whenever subprocess.exit lands — only a leak backstop for a session whose

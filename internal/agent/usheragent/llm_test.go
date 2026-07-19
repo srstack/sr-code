@@ -1,9 +1,12 @@
 package usheragent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -56,7 +59,6 @@ type fakeAgentAPI struct {
 	transcripts map[string][]core.TranscriptTurn
 	waitReplies map[string]string
 	waitErrs    map[string]error
-	waitedFor   []sendCall
 	relayed     []sendCall // sends made through SendToSessionRelayed
 
 	created     []createCall
@@ -168,16 +170,6 @@ func (f *fakeAgentAPI) SearchAllSessions(query string, maxSessions, _ int) ([]co
 		out, truncated = out[:maxSessions], true
 	}
 	return out, truncated, nil
-}
-func (f *fakeAgentAPI) SendToSessionAndWait(_ context.Context, id, text string, _ time.Duration) (string, error) {
-	f.waitedFor = append(f.waitedFor, sendCall{id, text})
-	if err, ok := f.waitErrs[id]; ok && err != nil {
-		return f.waitReplies[id], err
-	}
-	if reply, ok := f.waitReplies[id]; ok {
-		return reply, nil
-	}
-	return "", nil
 }
 func (f *fakeAgentAPI) CreateSessionWithBackend(_ context.Context, cwd, msg, backend, model string, _ time.Duration) (string, string, error) {
 	f.created = append(f.created, createCall{Cwd: cwd, Msg: msg, Backend: backend, Model: model})
@@ -298,6 +290,21 @@ func TestLLMAgent_ListSessionsToolThenAnswer(t *testing.T) {
 	if m.calls != 2 {
 		t.Errorf("expected 2 server calls, got %d", m.calls)
 	}
+	if len(res.ToolEvents) != 1 || res.ToolEvents[0].Name != "list_sessions" || res.ToolEvents[0].CallID != "call_1" {
+		t.Fatalf("tool events = %+v", res.ToolEvents)
+	}
+}
+
+func TestDurableToolEventKeepsLongArgumentsValid(t *testing.T) {
+	args := `{"session_id":"s","text":"` + strings.Repeat("长", 3000) + `"}`
+	event := durableToolEvent(ToolCall{ID: "c", Function: ToolCallFunc{Name: "send_to_session", Arguments: args}}, `{"status":"sent"}`)
+	if event.Arguments != args {
+		t.Fatal("durable arguments were modified")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(event.Arguments), &decoded); err != nil {
+		t.Fatalf("replayed arguments are invalid JSON: %v", err)
+	}
 }
 
 func TestLLMAgent_SendToolDispatchAndFocus(t *testing.T) {
@@ -317,6 +324,117 @@ func TestLLMAgent_SendToolDispatchAndFocus(t *testing.T) {
 	if res.FocusSession != "deadbeef" {
 		t.Errorf("FocusSession = %q, want deadbeef", res.FocusSession)
 	}
+}
+
+func TestLLMAgent_FocusToolDoesNotSend(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "deadbeef-0000", Title: "main chat work"}}
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("call_focus", "focus_session", `{"session_id":"deadbeef"}`),
+		chatTextResp("focused"),
+	})
+	defer srv.Close()
+
+	a := newTestLLM(t, api, srv.URL)
+	res := runHandle(t, a, "jump to the main chat session")
+	if res.FocusSession != "deadbeef-0000" {
+		t.Errorf("FocusSession = %q, want deadbeef-0000", res.FocusSession)
+	}
+	if len(api.sent) != 0 || len(api.relayed) != 0 {
+		t.Fatalf("focus_session sent a message: sent=%+v relayed=%+v", api.sent, api.relayed)
+	}
+}
+
+func TestLLMAgent_LogsToolCall(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "deadbeef-0000", Title: "main chat work"}}
+	srv, _ := newMockChatServer(t, []ChatResponse{
+		chatToolCallResp("call_focus", "focus_session", `{"session_id":"deadbeef"}`),
+		chatTextResp("focused"),
+	})
+	defer srv.Close()
+
+	var logs bytes.Buffer
+	a, err := NewLLM(api, LLMConfig{
+		Client: NewChatClient(srv.URL+"/v1", "test-key"),
+		Model:  "test-model",
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = runHandle(t, a, "focus deadbeef")
+	got := logs.String()
+	for _, want := range []string{
+		`"msg":"main chat tool call"`,
+		`"tool":"focus_session"`,
+		`"call_id":"call_focus"`,
+		`"focus_session":"deadbeef-0000"`,
+		`"is_error":false`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("log missing %s: %s", want, got)
+		}
+	}
+}
+
+func TestExecuteTool_FocusRejectsUnknownSession(t *testing.T) {
+	a, _ := NewLLM(newFakeAgentAPI(), LLMConfig{
+		Client: NewChatClient("http://x", "k"), Model: "m",
+	})
+	out, focus := a.executeTool(context.Background(), "focus_session", `{"session_id":"missing"}`, nil)
+	if focus != "" || !strings.Contains(out, "session not found") {
+		t.Fatalf("out=%q focus=%q", out, focus)
+	}
+}
+
+func TestExecuteTool_FocusRejectsAmbiguousPrefix(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{
+		{ID: "deadbeef-0001", Title: "one"},
+		{ID: "deadbeef-0002", Title: "two"},
+	}
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	out, focus := a.executeTool(context.Background(), "focus_session", `{"session_id":"deadbeef"}`, nil)
+	if focus != "" || !strings.Contains(out, "ambiguous session") {
+		t.Fatalf("out=%q focus=%q", out, focus)
+	}
+}
+
+func TestExecuteTool_FocusMatchesTitle(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "abc12345-full", Title: "main chat MCP design"}}
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	out, focus := a.executeTool(context.Background(), "focus_session", `{"session_id":"MCP design"}`, nil)
+	if focus != "abc12345-full" || !strings.Contains(out, `"status":"focused"`) {
+		t.Fatalf("out=%q focus=%q", out, focus)
+	}
+}
+
+func TestDefaultToolsIncludeFocusSession(t *testing.T) {
+	for _, tool := range defaultTools() {
+		if tool.Function.Name == "focus_session" {
+			return
+		}
+	}
+	t.Fatal("focus_session tool is not exposed")
+}
+
+func TestTranscriptToolRoutesPureNavigationToFocus(t *testing.T) {
+	for _, tool := range defaultTools() {
+		if tool.Function.Name != "read_session_transcript" {
+			continue
+		}
+		desc := tool.Function.Description
+		if !strings.Contains(desc, "use focus_session") {
+			t.Fatalf("read_session_transcript description does not route pure navigation to focus_session: %q", desc)
+		}
+		if strings.Contains(desc, `prefer send_to_session`) {
+			t.Fatalf("read_session_transcript description still routes pure navigation through send_to_session: %q", desc)
+		}
+		return
+	}
+	t.Fatal("read_session_transcript tool is not exposed")
 }
 
 func TestLLMAgent_RespondToolDispatchDoesNotSetFocus(t *testing.T) {
@@ -412,44 +530,6 @@ func TestLLMAgent_ReadTranscriptDefaultLimit(t *testing.T) {
 	_ = runHandle(t, a, "summarize s")
 	// We can't easily count returned items without inspecting the tool
 	// response; instead verify that the call didn't error and focus moved.
-}
-
-func TestLLMAgent_SendAndWait(t *testing.T) {
-	api := newFakeAgentAPI()
-	api.waitReplies["abc"] = "/tmp/usher-spike"
-	srv, _ := newMockChatServer(t, []ChatResponse{
-		chatToolCallResp("c", "send_and_wait_for_response", `{"session_id":"abc","text":"pwd"}`),
-		chatTextResp("session abc says: /tmp/usher-spike"),
-	})
-	defer srv.Close()
-
-	a := newTestLLM(t, api, srv.URL)
-	res := runHandle(t, a, "ask abc what its cwd is")
-	if !strings.Contains(res.Reply, "/tmp/usher-spike") {
-		t.Errorf("Reply = %q", res.Reply)
-	}
-	if res.FocusSession != "abc" {
-		t.Errorf("focus = %q", res.FocusSession)
-	}
-	if len(api.waitedFor) != 1 || api.waitedFor[0].ID != "abc" || api.waitedFor[0].Text != "pwd" {
-		t.Errorf("waitedFor = %+v", api.waitedFor)
-	}
-}
-
-func TestLLMAgent_SendAndWaitTimeoutClamped(t *testing.T) {
-	api := newFakeAgentAPI()
-	api.waitReplies["s"] = "ok"
-	// timeout_seconds=99999 should be silently clamped to 1800; we just
-	// verify the call didn't error.
-	srv, _ := newMockChatServer(t, []ChatResponse{
-		chatToolCallResp("c", "send_and_wait_for_response", `{"session_id":"s","text":"x","timeout_seconds":99999}`),
-		chatTextResp("done"),
-	})
-	defer srv.Close()
-	a := newTestLLM(t, api, srv.URL)
-	if _, err := a.Handle(context.Background(), nil, "", "x", nil); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // TestLLMAgent_HistoryMappedNoFocusMessage: focus must NOT appear as a
@@ -610,7 +690,7 @@ func TestLLMAgent_ListSessionsEnrichedWithFlags(t *testing.T) {
 	api.autoApprove["abc12345"] = true
 	api.archived["abc12345"] = true
 	srv, m := newMockChatServer(t, []ChatResponse{
-		chatToolCallResp("c", "list_sessions", `{}`),
+		chatToolCallResp("c", "list_sessions", `{"archived":true}`),
 		chatTextResp("ok"),
 	})
 	defer srv.Close()
@@ -629,6 +709,158 @@ func TestLLMAgent_ListSessionsEnrichedWithFlags(t *testing.T) {
 	}
 	if !strings.Contains(toolMsg.Content, `"auto_approve":true`) || !strings.Contains(toolMsg.Content, `"archived":true`) {
 		t.Errorf("list_sessions output missing flags: %q", toolMsg.Content)
+	}
+}
+
+func TestExecuteTool_ListSessionsFiltersStatusAndLimit(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{
+		{ID: "run-1", Status: core.StatusRunning},
+		{ID: "idle-1", Status: core.StatusIdle},
+		{ID: "live-1", Status: core.StatusLive},
+		{ID: "run-2", Status: core.StatusRunning},
+	}
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	out, focus := a.executeTool(context.Background(), "list_sessions", `{"statuses":["running","live"],"limit":2}`, nil)
+	if focus != "" {
+		t.Fatalf("list_sessions changed focus to %q", focus)
+	}
+	if !strings.Contains(out, `"id":"run-1"`) || !strings.Contains(out, `"id":"live-1"`) {
+		t.Fatalf("filtered output missing expected sessions: %s", out)
+	}
+	if strings.Contains(out, `"id":"idle-1"`) || strings.Contains(out, `"id":"run-2"`) {
+		t.Fatalf("filtered output contains excluded sessions: %s", out)
+	}
+}
+
+func TestExecuteTool_ListSessionsDefaultsTo20AndExcludesArchived(t *testing.T) {
+	api := newFakeAgentAPI()
+	for i := 0; i < 22; i++ {
+		api.sessions = append(api.sessions, core.Session{ID: fmt.Sprintf("session-%02d", i), Status: core.StatusIdle})
+	}
+	api.archived["session-00"] = true
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	out, _ := a.executeTool(context.Background(), "list_sessions", `{}`, nil)
+	var got struct {
+		Sessions      []sessionView `json:"sessions"`
+		Returned      int           `json:"returned"`
+		TotalMatching int           `json:"total_matching"`
+		Truncated     bool          `json:"truncated"`
+		Note          string        `json:"note"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sessions) != 20 {
+		t.Fatalf("default returned %d sessions, want 20", len(got.Sessions))
+	}
+	if got.Returned != 20 || got.TotalMatching != 21 || !got.Truncated {
+		t.Fatalf("default pagination metadata = returned %d total %d truncated %v", got.Returned, got.TotalMatching, got.Truncated)
+	}
+	if strings.Contains(out, `"id":"session-00"`) || !strings.Contains(got.Note, "archived=true") {
+		t.Fatalf("default archive filtering/note wrong: %s", out)
+	}
+	archived, _ := a.executeTool(context.Background(), "list_sessions", `{"archived":true}`, nil)
+	if !strings.Contains(archived, `"id":"session-00"`) || strings.Contains(archived, `"id":"session-01"`) {
+		t.Fatalf("archived query wrong: %s", archived)
+	}
+}
+
+func TestExecuteTool_ReadTranscriptLatestPageHasMore(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.transcripts["s"] = make([]core.TranscriptTurn, 100)
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	out, _ := a.executeTool(context.Background(), "read_session_transcript", `{"session_id":"s"}`, nil)
+	var got struct {
+		Offset  int  `json:"offset"`
+		Total   int  `json:"total"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Offset != 80 || got.Total != 100 || !got.HasMore {
+		t.Fatalf("latest-page metadata = %+v", got)
+	}
+}
+
+func TestExecuteTool_SearchSessionsScopes(t *testing.T) {
+	api := newFakeAgentAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "migration"}}
+	api.transcripts["abc12345"] = []core.TranscriptTurn{{Role: "user", Content: "migration plan"}}
+	a, _ := NewLLM(api, LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+
+	scoped, focus := a.executeTool(context.Background(), "search_sessions", `{"session_id":"abc","query":"migration"}`, nil)
+	if focus != "abc12345" || !strings.Contains(scoped, `"scope":"session"`) || !strings.Contains(scoped, `"migration plan"`) {
+		t.Fatalf("scoped search = %s, focus %q", scoped, focus)
+	}
+	global, focus := a.executeTool(context.Background(), "search_sessions", `{"query":"migration"}`, nil)
+	if focus != "" || !strings.Contains(global, `"scope":"all"`) || !strings.Contains(global, `"session_id":"abc12345"`) {
+		t.Fatalf("global search = %s, focus %q", global, focus)
+	}
+}
+
+func TestDefaultToolsExposeOnlyUnifiedSearch(t *testing.T) {
+	var names []string
+	for _, tool := range defaultTools() {
+		names = append(names, tool.Function.Name)
+	}
+	joined := strings.Join(names, ",")
+	if !strings.Contains(joined, "search_sessions") || strings.Contains(joined, "search_session_transcript") || strings.Contains(joined, "search_all_sessions") {
+		t.Fatalf("tool names = %v", names)
+	}
+}
+
+func TestNormalizeReplayedLegacySearchTool(t *testing.T) {
+	event := normalizeReplayedToolEvent(ToolEvent{
+		CallID: "c", Name: "search_session_transcript",
+		Arguments: `{"session_id":"abc","query":"migration","max_hits":7}`,
+		Result:    `{"hits":[],"truncated":false}`,
+	})
+	if event.Name != "search_sessions" || !strings.Contains(event.Arguments, `"limit":7`) || strings.Contains(event.Arguments, "max_hits") {
+		t.Fatalf("normalized event = %+v", event)
+	}
+	if !strings.Contains(event.Result, `"scope":"session"`) || !strings.Contains(event.Result, `"session_id":"abc"`) {
+		t.Fatalf("normalized result = %s", event.Result)
+	}
+	global := normalizeReplayedToolEvent(ToolEvent{
+		CallID: "g", Name: "search_all_sessions",
+		Arguments: `{"query":"migration","max_sessions":9}`,
+		Result:    `{"results":[],"truncated":false}`,
+	})
+	if global.Name != "search_sessions" || !strings.Contains(global.Arguments, `"limit":9`) || strings.Contains(global.Arguments, "max_sessions") {
+		t.Fatalf("normalized global event = %+v", global)
+	}
+	if !strings.Contains(global.Result, `"scope":"all"`) {
+		t.Fatalf("normalized global result = %s", global.Result)
+	}
+}
+
+func TestSummarizeHistoryNormalizesLegacySearchTool(t *testing.T) {
+	srv, mock := newMockChatServer(t, []ChatResponse{chatTextResp("summary")})
+	defer srv.Close()
+	a := newTestLLM(t, newFakeAgentAPI(), srv.URL)
+	_, err := a.SummarizeHistory(context.Background(), []HistoryMessage{{Tool: &ToolEvent{
+		CallID: "g", Name: "search_all_sessions",
+		Arguments: `{"query":"migration","max_sessions":9}`,
+		Result:    `{"results":[],"truncated":false}`,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := mock.lastReq.Messages[1].Content
+	if !strings.Contains(content, "search_sessions") || strings.Contains(content, "search_all_sessions") || !strings.Contains(content, `"scope":"all"`) {
+		t.Fatalf("summarizer input was not normalized: %s", content)
+	}
+}
+
+func TestExecuteTool_ListSessionsRejectsInvalidFilters(t *testing.T) {
+	a, _ := NewLLM(newFakeAgentAPI(), LLMConfig{Client: NewChatClient("http://x", "k"), Model: "m"})
+	for _, args := range []string{`{"statuses":["busy"]}`, `{"limit":0}`} {
+		out, _ := a.executeTool(context.Background(), "list_sessions", args, nil)
+		if !strings.Contains(out, `"error"`) {
+			t.Errorf("args %s returned %s, want error", args, out)
+		}
 	}
 }
 

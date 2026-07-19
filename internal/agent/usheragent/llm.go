@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type LLMConfig struct {
 	SystemPrompt string // optional override; defaults to embedded prompts/system_prompt.md
 	MaxIters     int    // default 10; bounds runaway tool-call loops
 	Strict       bool   // append small-model enforcement block to the system prompt
+	Logger       *slog.Logger
 }
 
 // LLMAgent is a provider-agnostic main-chat agent built on the OpenAI
@@ -36,6 +38,7 @@ type LLMAgent struct {
 	sysPrompt string
 	tools     []ChatTool
 	maxIter   int
+	logger    *slog.Logger
 }
 
 func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
@@ -56,6 +59,10 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 	if iters <= 0 {
 		iters = 10
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &LLMAgent{
 		api:       api,
 		client:    cfg.Client,
@@ -63,12 +70,11 @@ func NewLLM(api AgentAPI, cfg LLMConfig) (*LLMAgent, error) {
 		sysPrompt: sys,
 		tools:     defaultTools(),
 		maxIter:   iters,
+		logger:    logger,
 	}, nil
 }
 
 const (
-	defaultWaitTimeout    = 300 * time.Second  // 5 min — covers most non-coding turns
-	maxWaitTimeout        = 1800 * time.Second // 30 min — hard ceiling
 	defaultReadTurns      = 20
 	maxReadTurns          = 200
 	defaultSearchHits     = 20
@@ -94,6 +100,14 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 	_ = currentFocus
 	msgs := []ChatMessage{{Role: "system", Content: a.sysPrompt}}
 	for _, h := range history {
+		if h.Tool != nil {
+			event := normalizeReplayedToolEvent(*h.Tool)
+			msgs = append(msgs,
+				ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: event.CallID, Type: "function", Function: ToolCallFunc{Name: event.Name, Arguments: event.Arguments}}}},
+				ChatMessage{Role: "tool", ToolCallID: event.CallID, Content: event.Result},
+			)
+			continue
+		}
 		role := "user"
 		if h.Role == "agent" {
 			role = "assistant"
@@ -103,6 +117,10 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 	msgs = append(msgs, ChatMessage{Role: "user", Content: userMsg})
 
 	focus := "" // session id touched this turn; carries across the loop's tool calls
+	var toolEvents []ToolEvent
+	result := func(reply string) AgentResult {
+		return AgentResult{Reply: reply, FocusSession: focus, ToolEvents: toolEvents}
+	}
 
 	// Anti-poll guard: an immediately-repeated identical (name, args) tool
 	// call is blocked — but only when the first attempt SUCCEEDED, so a
@@ -120,10 +138,10 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 			Tools:    a.tools,
 		})
 		if err != nil {
-			return AgentResult{FocusSession: focus}, err
+			return result(""), err
 		}
 		if len(resp.Choices) == 0 {
-			return AgentResult{FocusSession: focus}, errors.New("empty choices in chat response")
+			return result(""), errors.New("empty choices in chat response")
 		}
 		choice := resp.Choices[0]
 		msgs = append(msgs, choice.Message)
@@ -132,7 +150,7 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 		// response may carry PARTIAL tool calls — dispatching a cut-off
 		// send_to_session would deliver a garbled half-message.
 		if choice.FinishReason == "length" {
-			return AgentResult{FocusSession: focus}, errors.New("response truncated by max_tokens")
+			return result(""), errors.New("response truncated by max_tokens")
 		}
 
 		// Some providers return tool calls with a missing/nonstandard
@@ -142,14 +160,30 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 			for _, call := range choice.Message.ToolCalls {
 				sig := call.Function.Name + "\x00" + call.Function.Arguments
 				if sig == lastCallSig && lastCallOK {
+					out := errResult("repeated identical tool call blocked — do not poll for a session's reply (it is relayed automatically) or resend the same message; answer the user now with what you have")
+					a.logger.Warn("main chat tool call blocked",
+						"tool", call.Function.Name,
+						"call_id", call.ID,
+						"arguments", boundedLogText(call.Function.Arguments, 2048),
+						"reason", "repeated identical successful call")
 					msgs = append(msgs, ChatMessage{
 						Role:       "tool",
 						ToolCallID: call.ID,
-						Content:    errResult("repeated identical tool call blocked — do not poll for a session's reply (it is relayed automatically) or resend the same message; answer the user now with what you have"),
+						Content:    out,
 					})
+					toolEvents = append(toolEvents, durableToolEvent(call, out))
 					continue
 				}
+				started := time.Now()
 				out, focusUpdate := a.executeTool(ctx, call.Function.Name, call.Function.Arguments, relay)
+				a.logger.Info("main chat tool call",
+					"tool", call.Function.Name,
+					"call_id", call.ID,
+					"arguments", boundedLogText(call.Function.Arguments, 2048),
+					"result", boundedLogText(out, 4096),
+					"is_error", strings.HasPrefix(out, `{"error":`),
+					"focus_session", focusUpdate,
+					"duration", time.Since(started))
 				lastCallSig = sig
 				lastCallOK = !strings.HasPrefix(out, `{"error":`)
 				if focusUpdate != "" {
@@ -160,24 +194,25 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 					ToolCallID: call.ID,
 					Content:    out,
 				})
+				toolEvents = append(toolEvents, durableToolEvent(call, out))
 			}
 			continue
 		}
 
 		switch choice.FinishReason {
 		case "stop", "end_turn", "":
-			return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
+			return result(choice.Message.Content), nil
 		case "tool_calls":
 			// Glitch: finish_reason says tool_calls but none were present
 			// (that case was dispatched above). Use the content if there is
 			// any; otherwise surface the malformed turn instead of silently
 			// returning an empty answer.
 			if strings.TrimSpace(choice.Message.Content) != "" {
-				return AgentResult{Reply: choice.Message.Content, FocusSession: focus}, nil
+				return result(choice.Message.Content), nil
 			}
-			return AgentResult{FocusSession: focus}, errors.New("finish_reason=tool_calls but no tool_calls returned")
+			return result(""), errors.New("finish_reason=tool_calls but no tool_calls returned")
 		default:
-			return AgentResult{FocusSession: focus}, fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
+			return result(""), fmt.Errorf("unexpected finish_reason: %q", choice.FinishReason)
 		}
 	}
 
@@ -191,12 +226,76 @@ func (a *LLMAgent) Handle(ctx context.Context, history []HistoryMessage, current
 	})
 	resp, err := a.client.ChatCompletion(ctx, ChatRequest{Model: a.model, Messages: msgs})
 	if err != nil {
-		return AgentResult{FocusSession: focus}, fmt.Errorf("max iterations (%d) reached and wrap-up failed: %w", a.maxIter, err)
+		return result(""), fmt.Errorf("max iterations (%d) reached and wrap-up failed: %w", a.maxIter, err)
 	}
 	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
-		return AgentResult{FocusSession: focus}, fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
+		return result(""), fmt.Errorf("max iterations (%d) reached without final answer", a.maxIter)
 	}
-	return AgentResult{Reply: resp.Choices[0].Message.Content, FocusSession: focus}, nil
+	return result(resp.Choices[0].Message.Content), nil
+}
+
+// normalizeReplayedToolEvent keeps durable history compatible when exposed
+// tool schemas are consolidated. The store remains append-only; migration is
+// applied only to the model view.
+func normalizeReplayedToolEvent(event ToolEvent) ToolEvent {
+	scope := ""
+	switch event.Name {
+	case "search_session_transcript":
+		event.Name = "search_sessions"
+		scope = "session"
+	case "search_all_sessions":
+		event.Name = "search_sessions"
+		scope = "all"
+	default:
+		return event
+	}
+	var args map[string]any
+	if json.Unmarshal([]byte(event.Arguments), &args) == nil {
+		if v, ok := args["max_hits"]; ok {
+			args["limit"] = v
+			delete(args, "max_hits")
+		}
+		if v, ok := args["max_sessions"]; ok {
+			args["limit"] = v
+			delete(args, "max_sessions")
+		}
+		if b, err := json.Marshal(args); err == nil {
+			event.Arguments = string(b)
+		}
+	}
+	var result map[string]any
+	if json.Unmarshal([]byte(event.Result), &result) == nil {
+		result["scope"] = scope
+		if scope == "session" {
+			if id, ok := args["session_id"]; ok {
+				result["session_id"] = id
+			}
+		}
+		if b, err := json.Marshal(result); err == nil {
+			event.Result = string(b)
+		}
+	}
+	return event
+}
+
+func durableToolEvent(call ToolCall, result string) ToolEvent {
+	return ToolEvent{
+		CallID: call.ID,
+		Name:   call.Function.Name,
+		// Arguments are replayed as the protocol-level function.arguments JSON
+		// field on later turns, so they must remain complete and valid. Result
+		// is replayed as free-text tool content and may be safely bounded.
+		Arguments: call.Function.Arguments,
+		Result:    boundedLogText(result, 4096),
+	}
+}
+
+func boundedLogText(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + fmt.Sprintf("… [%d runes omitted]", len(r)-maxRunes)
 }
 
 // summarizePrompt drives history compaction. The main chat is a router, not
@@ -215,6 +314,11 @@ DROP: completed exchanges, pleasantries, session reply bodies (a pointer like "s
 func (a *LLMAgent) SummarizeHistory(ctx context.Context, history []HistoryMessage) (string, error) {
 	var b strings.Builder
 	for _, h := range history {
+		if h.Tool != nil {
+			event := normalizeReplayedToolEvent(*h.Tool)
+			fmt.Fprintf(&b, "tool: %s(%s) -> %s\n\n", event.Name, event.Arguments, event.Result)
+			continue
+		}
 		fmt.Fprintf(&b, "%s: %s\n\n", h.Role, h.Content)
 	}
 	resp, err := a.client.ChatCompletion(ctx, ChatRequest{
@@ -242,8 +346,72 @@ func (a *LLMAgent) SummarizeHistory(ctx context.Context, history []HistoryMessag
 func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay RelaySink) (string, string) {
 	switch name {
 	case "list_sessions":
-		b, _ := json.Marshal(a.enrichedSessions())
+		var args struct {
+			Statuses []string `json:"statuses"`
+			Limit    *int     `json:"limit"`
+			Archived bool     `json:"archived"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		keep := make(map[core.Status]bool, len(args.Statuses))
+		for _, raw := range args.Statuses {
+			status := core.Status(raw)
+			switch status {
+			case core.StatusIdle, core.StatusLive, core.StatusRunning, core.StatusAwaitingPermission:
+				keep[status] = true
+			default:
+				return errResult("invalid status: " + raw), ""
+			}
+		}
+		limit := 20
+		if args.Limit != nil {
+			if *args.Limit <= 0 {
+				return errResult("limit must be positive"), ""
+			}
+			limit = *args.Limit
+			if limit > 200 {
+				limit = 200
+			}
+		}
+		note := "Archived sessions are excluded. Query again with archived=true to list archived sessions separately."
+		if args.Archived {
+			note = "Returning archived sessions only. Use archived=false (the default) for active sessions."
+		}
+		sessions, total := a.enrichedSessions(keep, limit, args.Archived)
+		b, _ := json.Marshal(map[string]any{
+			"sessions":       sessions,
+			"returned":       len(sessions),
+			"total_matching": total,
+			"truncated":      len(sessions) < total,
+			"note":           note,
+		})
 		return string(b), ""
+
+	case "focus_session":
+		var args struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
+			return errResult("invalid arguments: " + err.Error()), ""
+		}
+		if args.SessionID == "" {
+			return errResult("session_id is required"), ""
+		}
+		matches := matchSessions(a.api.ListSessions(), args.SessionID)
+		if len(matches) == 0 {
+			return errResult("session not found: " + args.SessionID), ""
+		}
+		if len(matches) > 1 {
+			return errResult("ambiguous session: " + args.SessionID), ""
+		}
+		sess := matches[0]
+		payload, _ := json.Marshal(map[string]any{
+			"status":     "focused",
+			"session_id": sess.ID,
+			"title":      sess.Title,
+		})
+		return string(payload), sess.ID
 
 	case "send_to_session":
 		var args struct {
@@ -268,34 +436,6 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 			return errResult(err.Error()), ""
 		}
 		return `{"status":"sent","note":"the session's reply will be shown to the user verbatim when it completes — do not wait for it or restate it"}`, args.SessionID
-
-	case "send_and_wait_for_response":
-		var args struct {
-			SessionID      string `json:"session_id"`
-			Text           string `json:"text"`
-			TimeoutSeconds int    `json:"timeout_seconds"`
-		}
-		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
-			return errResult("invalid arguments: " + err.Error()), ""
-		}
-		if args.SessionID == "" || args.Text == "" {
-			return errResult("session_id and text are required"), ""
-		}
-		timeout := defaultWaitTimeout
-		if args.TimeoutSeconds > 0 {
-			t := time.Duration(args.TimeoutSeconds) * time.Second
-			if t > maxWaitTimeout {
-				t = maxWaitTimeout
-			}
-			timeout = t
-		}
-		text, err := a.api.SendToSessionAndWait(ctx, args.SessionID, args.Text, timeout)
-		if err != nil {
-			payload, _ := json.Marshal(map[string]any{"response": text, "error": err.Error()})
-			return string(payload), args.SessionID
-		}
-		payload, _ := json.Marshal(map[string]any{"response": text})
-		return string(payload), args.SessionID
 
 	case "read_session_transcript":
 		var args struct {
@@ -330,48 +470,15 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 			"turns":    turns,
 			"offset":   start,
 			"total":    total,
-			"has_more": start+len(turns) < total,
+			"has_more": start > 0 || start+len(turns) < total,
 		})
 		return string(payload), args.SessionID
 
-	case "search_session_transcript":
+	case "search_sessions":
 		var args struct {
 			SessionID    string `json:"session_id"`
 			Query        string `json:"query"`
-			MaxHits      int    `json:"max_hits"`
-			ContextChars int    `json:"context_chars"`
-		}
-		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
-			return errResult("invalid arguments: " + err.Error()), ""
-		}
-		if args.SessionID == "" || strings.TrimSpace(args.Query) == "" {
-			return errResult("session_id and query are required"), ""
-		}
-		maxHits := args.MaxHits
-		if maxHits <= 0 {
-			maxHits = defaultSearchHits
-		}
-		if maxHits > maxSearchHits {
-			maxHits = maxSearchHits
-		}
-		ctxChars := args.ContextChars
-		if ctxChars <= 0 {
-			ctxChars = defaultSearchContext
-		}
-		if ctxChars > maxSearchContext {
-			ctxChars = maxSearchContext
-		}
-		hits, truncated, err := a.api.SearchSessionTranscript(args.SessionID, args.Query, maxHits, ctxChars)
-		if err != nil {
-			return errResult(err.Error()), ""
-		}
-		payload, _ := json.Marshal(map[string]any{"hits": hits, "truncated": truncated})
-		return string(payload), args.SessionID
-
-	case "search_all_sessions":
-		var args struct {
-			Query        string `json:"query"`
-			MaxSessions  int    `json:"max_sessions"`
+			Limit        int    `json:"limit"`
 			ContextChars int    `json:"context_chars"`
 		}
 		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
@@ -380,13 +487,6 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 		if strings.TrimSpace(args.Query) == "" {
 			return errResult("query is required"), ""
 		}
-		maxSessions := args.MaxSessions
-		if maxSessions <= 0 {
-			maxSessions = defaultSearchSessions
-		}
-		if maxSessions > maxSearchSessions {
-			maxSessions = maxSearchSessions
-		}
 		ctxChars := args.ContextChars
 		if ctxChars <= 0 {
 			ctxChars = defaultSearchContext
@@ -394,11 +494,41 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 		if ctxChars > maxSearchContext {
 			ctxChars = maxSearchContext
 		}
-		results, truncated, err := a.api.SearchAllSessions(args.Query, maxSessions, ctxChars)
+		if args.SessionID != "" {
+			matches := matchSessions(a.api.ListSessions(), args.SessionID)
+			if len(matches) == 0 {
+				return errResult("session not found: " + args.SessionID), ""
+			}
+			if len(matches) > 1 {
+				return errResult("ambiguous session: " + args.SessionID), ""
+			}
+			limit := args.Limit
+			if limit <= 0 {
+				limit = defaultSearchHits
+			}
+			if limit > maxSearchHits {
+				limit = maxSearchHits
+			}
+			sess := matches[0]
+			hits, truncated, err := a.api.SearchSessionTranscript(sess.ID, args.Query, limit, ctxChars)
+			if err != nil {
+				return errResult(err.Error()), ""
+			}
+			payload, _ := json.Marshal(map[string]any{"scope": "session", "session_id": sess.ID, "hits": hits, "truncated": truncated})
+			return string(payload), sess.ID
+		}
+		limit := args.Limit
+		if limit <= 0 {
+			limit = defaultSearchSessions
+		}
+		if limit > maxSearchSessions {
+			limit = maxSearchSessions
+		}
+		results, truncated, err := a.api.SearchAllSessions(args.Query, limit, ctxChars)
 		if err != nil {
 			return errResult(err.Error()), ""
 		}
-		payload, _ := json.Marshal(map[string]any{"results": results, "truncated": truncated})
+		payload, _ := json.Marshal(map[string]any{"scope": "all", "results": results, "truncated": truncated})
 		// Cross-session search doesn't target one session, so it sets no focus.
 		return string(payload), ""
 
@@ -520,17 +650,28 @@ type sessionView struct {
 	AutoApprove bool `json:"auto_approve"`
 }
 
-func (a *LLMAgent) enrichedSessions() []sessionView {
+func (a *LLMAgent) enrichedSessions(statuses map[core.Status]bool, limit int, archived bool) ([]sessionView, int) {
 	sessions := a.api.ListSessions()
-	out := make([]sessionView, len(sessions))
-	for i, s := range sessions {
-		out[i] = sessionView{
-			Session:     s,
-			Archived:    a.api.IsArchived(s.ID),
-			AutoApprove: a.api.IsAutoApprove(s.ID),
+	out := make([]sessionView, 0, len(sessions))
+	total := 0
+	for _, s := range sessions {
+		isArchived := a.api.IsArchived(s.ID)
+		if isArchived != archived {
+			continue
+		}
+		if len(statuses) > 0 && !statuses[s.Status] {
+			continue
+		}
+		total++
+		if limit <= 0 || len(out) < limit {
+			out = append(out, sessionView{
+				Session:     s,
+				Archived:    isArchived,
+				AutoApprove: a.api.IsAutoApprove(s.ID),
+			})
 		}
 	}
-	return out
+	return out, total
 }
 
 func errResult(msg string) string {
@@ -595,14 +736,52 @@ func defaultTools() []ChatTool {
 			Type: "function",
 			Function: ChatFunction{
 				Name: "list_sessions",
-				Description: `Refresh the full list of coding-agent sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at, archived, auto_approve for each.
+				Description: `List coding-agent sessions discovered on this machine. Optionally filter by status and limit the result. Returns {sessions, returned, total_matching, truncated, note}; each session includes id, cwd, title, status, timestamps, runtime metadata, archived, and auto_approve. With no arguments, returns at most 20 non-archived sessions. Archived sessions require a separate archived=true query. If truncated is true, absence from sessions does NOT mean a session is missing.
 
 USE FOR: questions you can't answer from <current_state> — exact timestamps, status that may have changed in the last few seconds.
 
 DO NOT USE FOR: simple metadata trivia like "how many sessions", "which session is in /tmp", "what's the focused cwd" — that's already in the <current_state> block at the end of the user message.`,
 				Parameters: map[string]any{
-					"type":                 "object",
-					"properties":           map[string]any{},
+					"type": "object",
+					"properties": map[string]any{
+						"statuses": map[string]any{
+							"type":        "array",
+							"items":       map[string]any{"type": "string", "enum": []string{"idle", "live", "running", "awaiting_permission"}},
+							"description": "Optional statuses to include. Omit for all statuses.",
+						},
+						"limit": map[string]any{
+							"type":        "integer",
+							"minimum":     1,
+							"maximum":     200,
+							"description": "Maximum sessions to return. Defaults to 20; maximum 200.",
+						},
+						"archived": map[string]any{
+							"type":        "boolean",
+							"description": "False/default returns only non-archived sessions. True returns only archived sessions in a separate query.",
+						},
+					},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name: "focus_session",
+				Description: `Switch the main chat's dashboard focus to an existing session WITHOUT sending a message, starting a turn, or reading its transcript.
+
+USE FOR: pure navigation requests such as "jump to X", "focus X", "switch to X", or "跳到 X" when the user supplied no instruction or question for that session.
+
+DO NOT USE FOR: forwarding work or a question (use send_to_session). Never invent work to accompany a navigation request.`,
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"session_id": map[string]any{
+							"type":        "string",
+							"description": "Session ID, unique ID prefix, or unique title substring.",
+						},
+					},
+					"required":             []string{"session_id"},
 					"additionalProperties": false,
 				},
 			},
@@ -614,6 +793,8 @@ DO NOT USE FOR: simple metadata trivia like "how many sessions", "which session 
 				Description: `Deliver a message to a session. Returns immediately; when the session finishes its turn, its reply is automatically shown to the user IN THIS CHAT, verbatim — you never see it and must not wait for it or restate it. Updates focus to the target session.
 
 USE FOR: the default way to route ANY instruction or question to a session — quick questions, long tasks, "ask X to ...", "run Z", follow-ups. Task duration doesn't matter; the reply arrives whenever it's ready.
+
+DO NOT USE FOR: pure navigation such as "jump/focus/switch to X" when the user supplied no work. Use focus_session instead. The text must faithfully represent an instruction or question the user actually provided; never invent one.
 
 AFTER CALLING: reply with at most one short routing sentence (or nothing beyond what the dashboard already shows). Never say you will "report back" — the relay is automatic.`,
 				Parameters: map[string]any{
@@ -633,28 +814,23 @@ AFTER CALLING: reply with at most one short routing sentence (or nothing beyond 
 				},
 			},
 		},
-		// send_and_wait_for_response is disabled for now: session replies reach
-		// the user through the relay channel, so the agent has no display
-		// reason to block its turn. The executeTool case + AgentAPI method are
-		// kept — re-add a tool definition here to give the model an explicit
-		// "wait because MY next step needs the reply content" chaining tool.
 		{
 			Type: "function",
 			Function: ChatFunction{
 				Name: "read_session_transcript",
 				Description: `Read one page of user/assistant turns from a session's transcript. Tool uses inside the session are inlined as ` + "`tool: Name`" + ` annotations. Returns {turns: [{role, content, ts}, ...], offset, total, has_more} — offset is the absolute index of the first turn returned, total the whole transcript's turn count.
 
-USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives. ALSO the recovery path for excerpted replies: a chat message showing "[… N chars omitted …]" has its full text here — recent replies are in the default page; older ones, locate via search_session_transcript and jump with offset.
+USE FOR: any question about what was DONE or SAID inside a session — "what did session X say?", "summarize Y", "what's the latest output from Z?", "any update?", deeper dives. ALSO the recovery path for excerpted replies: a chat message showing "[… N chars omitted …]" has its full text here — recent replies are in the default page; older ones, locate via search_sessions with session_id and jump with offset.
 
-PAGING: with no offset you get the most recent ` + "`limit`" + ` turns. total tells you how many exist; if has_more is true there are older turns you haven't seen. To reach a specific spot — e.g. a turn_index from search_session_transcript, or the page before this one — pass offset (absolute, 0-based from the start). There is no depth limit; limit only bounds one page.
+PAGING: with no offset you get the most recent ` + "`limit`" + ` turns. total tells you how many exist; if has_more is true there are older turns you haven't seen. To reach a specific spot — e.g. a turn_index from search_sessions, or the page before this one — pass offset (absolute, 0-based from the start). There is no depth limit; limit only bounds one page.
 
-DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For "switch to session X" prefer send_to_session so a visible action confirms the switch.`,
+DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <current_state> already has that. For pure navigation such as "switch to session X", use focus_session.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"session_id": map[string]any{"type": "string"},
 						"limit":      map[string]any{"type": "integer", "description": "Optional. Page size (turns per call). Default 20, max 200."},
-						"offset":     map[string]any{"type": "integer", "description": "Optional. Absolute 0-based index of the first turn to return. Omit for the most recent page. Use a turn_index from search_session_transcript to jump to a hit."},
+						"offset":     map[string]any{"type": "integer", "description": "Optional. Absolute 0-based index of the first turn to return. Omit for the most recent page. Use a turn_index from search_sessions to jump to a hit."},
 					},
 					"required":             []string{"session_id"},
 					"additionalProperties": false,
@@ -664,42 +840,21 @@ DO NOT USE FOR: looking up session metadata (cwd, title, status, count) — <cur
 		{
 			Type: "function",
 			Function: ChatFunction{
-				Name: "search_session_transcript",
-				Description: `Find where a string appears in a session's transcript WITHOUT reading the whole thing. Scans every user/assistant turn (not just the recent window) and returns only the matching turns as [{role, ts, turn_index, occurrences, snippet}, ...] plus a "truncated" flag. Case-insensitive literal substring — not regex.
+				Name: "search_sessions",
+				Description: `Search user/assistant prose using a case-insensitive literal substring. With session_id, searches that one session and returns {scope:"session", session_id, hits, truncated}; without session_id, searches every session and returns {scope:"all", results, truncated}, ranked by hit count.
 
-USE FOR: locating something specific in a long session — "did session X mention the migration?", "where did we discuss the timeout bug?", "find the commit hash Y talked about". Use this INSTEAD of read_session_transcript when the answer could be buried past the last 20 turns.
+USE WITH session_id: locate something inside a known session, then call read_session_transcript with offset=<turn_index> for full context.
 
-THEN: to see the full context around a hit, call read_session_transcript with offset=<turn_index> (jumps to that turn at any depth), or send_to_session to ask the session directly.
+USE WITHOUT session_id: find which sessions discussed a topic, then focus, route to, or drill into a result.
 
-DO NOT USE FOR: reading the latest activity (use read_session_transcript) or matching tool/command/file names — search covers prose only, not tool annotations.`,
+DO NOT USE FOR: reading latest activity (use read_session_transcript), pure navigation (use focus_session), or matching tool/command/file names. Search covers prose only.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"session_id":    map[string]any{"type": "string"},
+						"session_id":    map[string]any{"type": "string", "description": "Optional session ID, unique ID prefix, or unique title substring. Omit to search all sessions."},
 						"query":         map[string]any{"type": "string", "description": "Literal substring to find (case-insensitive)."},
-						"max_hits":      map[string]any{"type": "integer", "description": "Optional. Max matching turns to return. Default 20, max 100."},
+						"limit":         map[string]any{"type": "integer", "description": "Optional. With session_id, max matching turns (default 20, max 100); without it, max matching sessions (default 20, max 50)."},
 						"context_chars": map[string]any{"type": "integer", "description": "Optional. Characters of context on each side of the match. Default 120, max 500."},
-					},
-					"required":             []string{"session_id", "query"},
-					"additionalProperties": false,
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ChatFunction{
-				Name: "search_all_sessions",
-				Description: `Search EVERY session at once for a string — the way to answer "which session mentioned X?" without knowing the id. Returns one row per matching session: {results: [{session_id, title, cwd, hit_count, turn_index, snippet}, ...], truncated}, ranked by hit_count (most matches first). Case-insensitive literal substring over user/assistant prose.
-
-USE FOR: locating the right session when you don't have its id — "which session was about the auth migration?", "who touched the deploy script?", "find the session discussing timeouts". Then route to the winner with send_to_session, or drill in with read_session_transcript (offset=turn_index) / search_session_transcript on that one id.
-
-DO NOT USE FOR: searching inside a session you already identified (use search_session_transcript with its id) or matching tool/command/file names — search covers prose only.`,
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"query":         map[string]any{"type": "string", "description": "Literal substring to find (case-insensitive)."},
-						"max_sessions":  map[string]any{"type": "integer", "description": "Optional. Max matching sessions to return. Default 20, max 50."},
-						"context_chars": map[string]any{"type": "integer", "description": "Optional. Characters of context on each side of the match snippet. Default 120, max 500."},
 					},
 					"required":             []string{"query"},
 					"additionalProperties": false,
@@ -728,48 +883,43 @@ DO NOT USE FOR: routing into an existing session that matches the work — use s
 				},
 			},
 		},
-		// Permission tools disabled for now: requests are resolved by the global
-		// web modal, so the agent never gets a turn to act on them. executeTool
-		// cases + AgentAPI methods are kept — uncomment to re-enable.
-		/*
-				{
-					Type: "function",
-					Function: ChatFunction{
-						Name: "list_pending_interactions",
-						Description: `List permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name: "list_pending_interactions",
+				Description: `List permission requests across all sessions waiting for a user decision. Returns [{id, session_id, tool_name, tool_input, cwd, created_at}, ...].
 
-			USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
+USE FOR: "any pending approvals?", "what's waiting", "show me the queue".
 
-			DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. The count alone is in <current_state>.pending_permission_requests.`,
-						Parameters: map[string]any{
-							"type":                 "object",
-							"properties":           map[string]any{},
-							"additionalProperties": false,
-						},
-					},
+DO NOT USE FOR: deciding to approve or deny — that's respond_to_interaction. The count alone is in <current_state>.pending_permission_requests.`,
+				Parameters: map[string]any{
+					"type":                 "object",
+					"properties":           map[string]any{},
+					"additionalProperties": false,
 				},
-				{
-					Type: "function",
-					Function: ChatFunction{
-						Name: "respond_to_interaction",
-						Description: `Approve or deny a single pending permission request by id.
+			},
+		},
+		{
+			Type: "function",
+			Function: ChatFunction{
+				Name: "respond_to_interaction",
+				Description: `Approve or deny a single pending permission request by id.
 
-			USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
+USE FOR: explicit user authorization — "approve the bash one", "deny X", "let it run", "block the rm".
 
-			DO NOT blanket-approve anything dangerous-looking (mass deletes, sending sensitive data, broad access) without confirming with the user first.`,
-						Parameters: map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"id":       map[string]any{"type": "string"},
-								"behavior": map[string]any{"type": "string", "enum": []string{"allow", "deny"}},
-								"reason":   map[string]any{"type": "string"},
-							},
-							"required":             []string{"id", "behavior"},
-							"additionalProperties": false,
-						},
+DO NOT blanket-approve anything dangerous-looking (mass deletes, sending sensitive data, broad access) without confirming with the user first.`,
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":       map[string]any{"type": "string"},
+						"behavior": map[string]any{"type": "string", "enum": []string{"allow", "deny"}},
+						"reason":   map[string]any{"type": "string"},
 					},
+					"required":             []string{"id", "behavior"},
+					"additionalProperties": false,
 				},
-		*/
+			},
+		},
 		{
 			Type: "function",
 			Function: ChatFunction{

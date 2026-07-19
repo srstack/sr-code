@@ -18,7 +18,7 @@ import (
 )
 
 type Message struct {
-	// Role is "user" | "agent" | "relay". A relay message is a session's
+	// Role is "user" | "agent" | "relay" | "tool". A relay message is a session's
 	// completed reply delivered verbatim into the chat by the server (the
 	// agent routes; it does not restate session output).
 	Role    string    `json:"role"`
@@ -37,6 +37,16 @@ type Message struct {
 	// this field is how the derivation knows to keep messages newer than the
 	// fold while dropping the folded ones.
 	CoveredThrough time.Time `json:"covered_through,omitzero"`
+	// Tool is an internal main-chat tool invocation. It is persisted for the
+	// model's next turn but omitted from the user-facing messages endpoint.
+	Tool *ToolEvent `json:"tool,omitempty"`
+}
+
+type ToolEvent struct {
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Result    string `json:"result"`
 }
 
 type Chat struct {

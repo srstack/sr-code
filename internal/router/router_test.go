@@ -558,37 +558,6 @@ func TestSendQueueSerializesAndAttributesReplies(t *testing.T) {
 	}
 }
 
-// TestSendQueueWaitCorrelatesAcrossQueue: SendToSessionAndWait issued while a
-// turn is in flight must return the QUEUED send's reply, not the in-flight
-// turn's.
-func TestSendQueueWaitCorrelatesAcrossQueue(t *testing.T) {
-	r := newQueueTestRouter(t)
-
-	// Occupy the session: a manual active token makes send #2 queue. Finish
-	// the fake turn after a short delay, publishing its own exit.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_ = ctx
-	tok := &sendToken{cancel: func() {}}
-	r.sendMu.Lock()
-	r.activeSend["abc12345"] = tok
-	r.sendMu.Unlock()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		r.broker.Publish(partEvent("abc12345", "assistant", "text", "stale turn tail"))
-		r.broker.Publish(broker.Event{SessionID: "abc12345", Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
-		r.releaseSend("abc12345", tok)
-	}()
-
-	reply, err := r.SendToSessionAndWait(context.Background(), "abc12345", "fresh question", 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reply != "re: fresh question" {
-		t.Errorf("reply = %q, want the queued turn's own reply", reply)
-	}
-}
-
 func TestFlushSendQueueAborts(t *testing.T) {
 	r := newQueueTestRouter(t)
 	r.sendMu.Lock()

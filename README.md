@@ -111,9 +111,12 @@ a few slash commands:
 
 ```
 /list                          list sessions (shows auto-approve / archived flags)
+/focus <prefix>                switch focus without sending or reading
 /send <prefix> <text>          send to the matching session (by id prefix or title)
-/ask <prefix> <text>           send and wait inline for the session's reply
-/read <prefix> [n]             show the last n turns of a session (default 20)
+/read <prefix> [n] [offset]    show n turns of a session (default 20), from offset (default: most recent)
+/search <query>                find sessions whose transcripts contain query
+/search --session <prefix> <query>
+                               find matching turns inside one session
 /new <cwd> <text>              start a new session in <cwd> with an initial message
 /pending                       list pending permission requests
 /approve | /deny <id>          resolve a pending request

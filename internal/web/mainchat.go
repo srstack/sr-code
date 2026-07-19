@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
+	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/mainchat"
 )
 
@@ -60,7 +61,9 @@ func (s *Server) handleListMainChatMessages(w http.ResponseWriter, r *http.Reque
 			limit = n
 		}
 	}
-	msgs, err := s.main.Read(id, limit)
+	// Apply the public limit after internal tool events are filtered, so a
+	// tool-heavy turn cannot make visible messages disappear from the page.
+	msgs, err := s.main.Read(id, 0)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -68,7 +71,16 @@ func (s *Server) handleListMainChatMessages(w http.ResponseWriter, r *http.Reque
 	if msgs == nil {
 		msgs = []mainchat.Message{}
 	}
-	writeJSON(w, http.StatusOK, msgs)
+	visible := msgs[:0]
+	for _, m := range msgs {
+		if m.Role != "tool" {
+			visible = append(visible, m)
+		}
+	}
+	if limit > 0 && len(visible) > limit {
+		visible = visible[len(visible)-limit:]
+	}
+	writeJSON(w, http.StatusOK, visible)
 }
 
 type focusDetail struct {
@@ -82,9 +94,7 @@ type mainChatInfo struct {
 	Focus *focusDetail `json:"focus,omitempty"`
 }
 
-const (
-	stateBlockMaxRows = 30 // session rows in the rendered <current_state> preamble
-)
+const stateBlockRecentIdle = 10
 
 // renderStateBlock produces a compact ground-truth dump of the router's
 // current view of sessions + the active focus. We append it to the user's
@@ -94,7 +104,14 @@ const (
 // per-turn state injection — kept off the system prompt so cache hits
 // still happen on the static prefix.
 func (s *Server) renderStateBlock(focusID string) string {
-	sessions := s.router.ListSessions()
+	allSessions := s.router.ListSessions()
+	sessions := make([]core.Session, 0, len(allSessions))
+	for _, sess := range allSessions {
+		if sess.ID != focusID && s.router.IsArchived(sess.ID) {
+			continue
+		}
+		sessions = append(sessions, sess)
+	}
 	pending := s.router.ListPendingInteractions()
 
 	now := time.Now().UTC()
@@ -119,11 +136,11 @@ func (s *Server) renderStateBlock(focusID string) string {
 	} else {
 		b.WriteString("focus: (none yet)\n")
 	}
-	b.WriteString("sessions (id  cwd  status  last_input  last_event  title):\n")
-	rows := sessions
-	if len(rows) > stateBlockMaxRows {
-		rows = rows[:stateBlockMaxRows]
+	rows := stateBlockSessions(sessions, focusID)
+	if len(sessions) > len(rows) {
+		fmt.Fprintf(&b, "sessions shown: focus + all running/live/awaiting_permission + %d recent idle; unshown sessions remain available via tools\n", stateBlockRecentIdle)
 	}
+	b.WriteString("sessions (id  cwd  status  last_input  last_event  title):\n")
 	for _, sess := range rows {
 		mark := ""
 		if sess.ID == focusID {
@@ -141,11 +158,34 @@ func (s *Server) renderStateBlock(focusID string) string {
 			truncateRunes(sess.Title, 50),
 			mark)
 	}
-	if len(sessions) > stateBlockMaxRows {
-		fmt.Fprintf(&b, "  … %d more (truncated)\n", len(sessions)-stateBlockMaxRows)
+	if len(sessions) > len(rows) {
+		fmt.Fprintf(&b, "  … %d more not shown; absence above does not mean missing\n", len(sessions)-len(rows))
 	}
 	b.WriteString("</current_state>")
 	return b.String()
+}
+
+// stateBlockSessions keeps the state preamble useful without feeding every
+// historical session to the model: active sessions and the current focus are
+// always present, plus a small recent-idle window. Input order is preserved
+// (Router.ListSessions orders by latest user input).
+func stateBlockSessions(sessions []core.Session, focusID string) []core.Session {
+	rows := make([]core.Session, 0, stateBlockRecentIdle+1)
+	idle := 0
+	for _, sess := range sessions {
+		active := sess.Status == core.StatusRunning ||
+			sess.Status == core.StatusLive ||
+			sess.Status == core.StatusAwaitingPermission
+		focused := sess.ID == focusID
+		if !active && !focused {
+			if idle >= stateBlockRecentIdle {
+				continue
+			}
+			idle++
+		}
+		rows = append(rows, sess)
+	}
+	return rows
 }
 
 // humanizeAge renders how long ago last happened relative to now as a compact
@@ -356,7 +396,22 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 	// claiming a switch.
 	enrichedUserMsg := userMsg.Content + "\n\n" + s.renderStateBlock(prevFocus)
 
+	type pendingRelay struct {
+		sessionID string
+		reply     string
+		err       error
+	}
+	var relayMu sync.Mutex
+	var queuedRelays []pendingRelay
+	relaysReleased := false
 	relay := func(sessionID, reply string, err error) {
+		relayMu.Lock()
+		if !relaysReleased {
+			queuedRelays = append(queuedRelays, pendingRelay{sessionID: sessionID, reply: reply, err: err})
+			relayMu.Unlock()
+			return
+		}
+		relayMu.Unlock()
 		s.relaySessionReply(chatID, sessionID, reply, err)
 	}
 
@@ -368,6 +423,28 @@ func (s *Server) runMainChatTurn(chatID string, userMsg mainchat.Message) {
 		// Keep res.FocusSession: Handle returns the focus accumulated before
 		// the failure, so routing that already happened isn't forgotten.
 		res.Reply = "agent error: " + err.Error()
+	}
+	// Persist tool evidence before the final agent message, preserving the
+	// order in which the model observed this turn. These records are internal
+	// history and are filtered from the messages API.
+	for _, event := range res.ToolEvents {
+		if appendErr := s.main.Append(chatID, mainchat.Message{
+			Role: "tool",
+			Tool: &mainchat.ToolEvent{CallID: event.CallID, Name: event.Name, Arguments: event.Arguments, Result: event.Result},
+		}); appendErr != nil {
+			s.logger.Warn("main chat append tool", "chat", chatID, "tool", event.Name, "err", appendErr)
+		}
+	}
+	// A very fast session can reply before Handle returns. Release relays only
+	// after their triggering tool events are durable, so JSONL chronology
+	// matches the causal order.
+	relayMu.Lock()
+	relaysReleased = true
+	pending := queuedRelays
+	queuedRelays = nil
+	relayMu.Unlock()
+	for _, completed := range pending {
+		s.relaySessionReply(chatID, completed.sessionID, completed.reply, completed.err)
 	}
 	// Carry forward focus when this turn didn't touch any session.
 	newFocus := res.FocusSession
@@ -433,14 +510,24 @@ func deriveChatHistory(msgs []mainchat.Message) []usheragent.HistoryMessage {
 	total := 0
 	for _, m := range msgs {
 		h := deriveHistoryMessage(m)
+		if h.Role == "" && h.Tool == nil {
+			continue
+		}
 		out = append(out, h)
-		total += utf8.RuneCountInString(h.Content)
+		total += historyMessageRunes(h)
 	}
 	for len(out) > 1 && total > historyHardCapRunes {
-		total -= utf8.RuneCountInString(out[0].Content)
+		total -= historyMessageRunes(out[0])
 		out = out[1:]
 	}
 	return out
+}
+
+func historyMessageRunes(h usheragent.HistoryMessage) int {
+	if h.Tool != nil {
+		return utf8.RuneCountInString(h.Tool.Name) + utf8.RuneCountInString(h.Tool.Arguments) + utf8.RuneCountInString(h.Tool.Result) + 16
+	}
+	return utf8.RuneCountInString(h.Content)
 }
 
 // sinceLastSummary returns the summary (first) plus every message it does
@@ -477,6 +564,13 @@ func sinceLastSummary(msgs []mainchat.Message) []mainchat.Message {
 // nature — information shown to the user, not the agent's own words.
 func deriveHistoryMessage(m mainchat.Message) usheragent.HistoryMessage {
 	switch m.Role {
+	case "tool":
+		if m.Tool == nil {
+			return usheragent.HistoryMessage{}
+		}
+		return usheragent.HistoryMessage{Role: "tool", Tool: &usheragent.ToolEvent{
+			CallID: m.Tool.CallID, Name: m.Tool.Name, Arguments: m.Tool.Arguments, Result: m.Tool.Result,
+		}}
 	case "relay":
 		sid := shortID(m.SourceSession)
 		return usheragent.HistoryMessage{Role: "user", Content: usheragent.RelayTag(sid) + relayBirthForm(m.Content, sid)}
@@ -519,13 +613,20 @@ func (s *Server) maybeCompactChat(chatID string) {
 		return
 	}
 	msgs = sinceLastSummary(msgs)
+	valid := msgs[:0]
+	for _, m := range msgs {
+		if m.Role != "tool" || m.Tool != nil {
+			valid = append(valid, m)
+		}
+	}
+	msgs = valid
 
 	derived := make([]usheragent.HistoryMessage, len(msgs))
 	sizes := make([]int, len(msgs))
 	total := 0
 	for i, m := range msgs {
 		derived[i] = deriveHistoryMessage(m)
-		sizes[i] = utf8.RuneCountInString(derived[i].Content)
+		sizes[i] = historyMessageRunes(derived[i])
 		total += sizes[i]
 	}
 	if total <= historyBudgetRunes {

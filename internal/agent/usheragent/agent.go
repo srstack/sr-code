@@ -2,12 +2,11 @@
 // Claude Code sessions and resolves permission requests.
 //
 // AgentAPI is intentionally a strict subset of router.Router's surface: the
-// agent can read sessions, peek at transcripts, send to a session (with or
-// without waiting for a response), and respond to a pending interaction —
-// but it cannot subscribe to event streams, receive raw hook payloads, or
-// talk to broker / discovery / hook managers directly. This boundary is
-// what prevents future LLM agents from looping on themselves or escalating
-// their own privileges.
+// agent can read sessions, peek at transcripts, send to a session, and
+// respond to a pending interaction — but it cannot subscribe to event
+// streams, receive raw hook payloads, or talk to broker / discovery / hook
+// managers directly. This boundary is what prevents future LLM agents from
+// looping on themselves or escalating their own privileges.
 package usheragent
 
 import (
@@ -72,11 +71,6 @@ type AgentAPI interface {
 	// session mentioned X?" primitive — one call instead of per-session fan-out.
 	SearchAllSessions(query string, maxSessions, contextChars int) ([]core.SessionSearchResult, bool, error)
 
-	// SendToSessionAndWait spawns the same fire-and-forget claude subprocess
-	// as SendToSession but blocks until the assistant turn completes (or
-	// timeout/ctx cancel), returning the accumulated assistant text.
-	SendToSessionAndWait(ctx context.Context, id, text string, timeout time.Duration) (string, error)
-
 	// CreateSession starts a brand-new session in cwd with the given initial
 	// message and waits for the first assistant response. Returns the new
 	// session id and the assistant text.
@@ -114,8 +108,19 @@ type RelaySink func(sessionID, reply string, err error)
 // responsible for converting these into its own backend's message shape
 // (e.g. the LLM agent maps Role="agent" to OpenAI's "assistant").
 type HistoryMessage struct {
-	Role    string // "user" | "agent"
+	Role    string // "user" | "agent" | "tool"
 	Content string
+	Tool    *ToolEvent
+}
+
+// ToolEvent is the durable evidence for one main-chat tool invocation. The
+// web layer stores it as one atomic record; LLMAgent expands it back into the
+// assistant tool_call + tool result pair required by chat-completions APIs.
+type ToolEvent struct {
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Result    string `json:"result"`
 }
 
 // AgentResult is what Agent.Handle returns. FocusSession is the session id
@@ -125,6 +130,7 @@ type HistoryMessage struct {
 type AgentResult struct {
 	Reply        string
 	FocusSession string
+	ToolEvents   []ToolEvent
 }
 
 // HistorySummarizer is the optional compaction hook: an Agent that also
@@ -158,8 +164,8 @@ const strictModeAddendum = `
 ## Strict mode (small-model enforcement)
 
 Every user message ends with a <current_state> block: the current time
-(now), a status legend, all sessions (full id, cwd, status, last_input,
-last_event, title), and the current focus with cwd + title. This block is
+(now), a status legend, a useful subset of sessions (full id, cwd, status,
+last_input, last_event, title), and the current focus with cwd + title. This block is
 the ground truth. last_input is how long ago the user last talked to that
 session and last_event how long ago its transcript changed — both already
 computed against now; read recency straight off them, never do timestamp
@@ -203,7 +209,8 @@ You only answer locally when ALL of the following hold:
 - Never narrate a tool outcome you did not invoke this turn. If you
   say "I created session X", "I sent your message to Y", "I switched
   to Z", "I read the transcript of W", the corresponding tool
-  (create_session, send_to_session, read_session_transcript) MUST
+  (create_session, focus_session, send_to_session,
+  read_session_transcript) MUST
   have actually been called this turn.
   Do NOT manufacture session ids, fabricate tool results, or describe
   outputs that "would have" happened. When the user confirms a

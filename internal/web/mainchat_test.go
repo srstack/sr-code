@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/nexustar/usher/internal/agent/usheragent"
 	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
+	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
@@ -31,13 +33,14 @@ import (
 // fixed reply/focus. With echo set, the reply is "re: <first line of the
 // user message>" so ordering across turns is observable.
 type scriptedAgent struct {
-	mu        sync.Mutex
-	reply     string
-	echo      bool
-	focus     string
-	delay     time.Duration
-	useRelay  func(relay usheragent.RelaySink)
-	histories [][]usheragent.HistoryMessage
+	mu         sync.Mutex
+	reply      string
+	echo       bool
+	focus      string
+	delay      time.Duration
+	useRelay   func(relay usheragent.RelaySink)
+	toolEvents []usheragent.ToolEvent
+	histories  [][]usheragent.HistoryMessage
 }
 
 func (f *scriptedAgent) Handle(_ context.Context, history []usheragent.HistoryMessage, _, userMsg string, relay usheragent.RelaySink) (usheragent.AgentResult, error) {
@@ -55,7 +58,7 @@ func (f *scriptedAgent) Handle(_ context.Context, history []usheragent.HistoryMe
 		text, _, _ := strings.Cut(userMsg, "\n\n<current_state>")
 		reply = "re: " + text
 	}
-	return usheragent.AgentResult{Reply: reply, FocusSession: f.focus}, nil
+	return usheragent.AgentResult{Reply: reply, FocusSession: f.focus, ToolEvents: f.toolEvents}, nil
 }
 
 func newChatTestServer(t *testing.T, agent usheragent.Agent) *Server {
@@ -168,6 +171,36 @@ func TestMainChatSendAsyncRelayAndHistory(t *testing.T) {
 	}
 	if !sawRelay {
 		t.Errorf("second turn's history missing relayed reply: %+v", agent.histories[1])
+	}
+}
+
+func TestMainChatToolEventPrecedesFastRelay(t *testing.T) {
+	agent := &scriptedAgent{
+		reply:      "routed",
+		focus:      "sess-1",
+		toolEvents: []usheragent.ToolEvent{{CallID: "c1", Name: "send_to_session", Arguments: `{"session_id":"sess-1","text":"hi"}`, Result: `{"status":"sent"}`}},
+		useRelay: func(relay usheragent.RelaySink) {
+			relay("sess-1", "fast reply", nil)
+		},
+	}
+	s := newChatTestServer(t, agent)
+	user := mainchat.Message{Role: "user", Content: "send hi", Time: time.Now().UTC()}
+	if err := s.main.Append("chat1", user); err != nil {
+		t.Fatal(err)
+	}
+	s.runMainChatTurn("chat1", user)
+	msgs, err := s.main.Read("chat1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"user", "tool", "relay", "agent"}
+	if len(msgs) != len(want) {
+		t.Fatalf("messages = %+v", msgs)
+	}
+	for i, role := range want {
+		if msgs[i].Role != role {
+			t.Fatalf("role[%d] = %q, want %q; messages=%+v", i, msgs[i].Role, role, msgs)
+		}
 	}
 }
 
@@ -384,6 +417,30 @@ func TestDeriveChatHistoryRelayForms(t *testing.T) {
 	}
 	if got := utf8.RuneCountInString(ex); got > relayExcerptHead+relayExcerptTail+200 {
 		t.Errorf("excerpt too large: %d runes", got)
+	}
+}
+
+func TestDeriveChatHistoryToolEvent(t *testing.T) {
+	in := []mainchat.Message{{Role: "tool", Tool: &mainchat.ToolEvent{
+		CallID: "call_1", Name: "focus_session", Arguments: `{"session_id":"abc"}`, Result: `{"focused_session":"abc-full"}`,
+	}}}
+	out := deriveChatHistory(in)
+	if len(out) != 1 || out[0].Tool == nil {
+		t.Fatalf("derived tool history = %+v", out)
+	}
+	if out[0].Tool.Name != "focus_session" || out[0].Tool.Result != `{"focused_session":"abc-full"}` {
+		t.Fatalf("derived event = %+v", out[0].Tool)
+	}
+}
+
+func TestDeriveChatHistorySkipsMalformedToolEvent(t *testing.T) {
+	out := deriveChatHistory([]mainchat.Message{
+		{Role: "user", Content: "before"},
+		{Role: "tool"},
+		{Role: "agent", Content: "after"},
+	})
+	if len(out) != 2 || out[0].Content != "before" || out[1].Content != "after" {
+		t.Fatalf("malformed tool record was not skipped: %+v", out)
 	}
 }
 
@@ -625,5 +682,30 @@ func TestStateBlockLegendAndLastEvent(t *testing.T) {
 	}
 	if !strings.Contains(block, "last_event") {
 		t.Errorf("missing last_event column: %q", block)
+	}
+}
+
+func TestStateBlockSessionsIncludesFocusActiveAndRecentIdle(t *testing.T) {
+	var sessions []core.Session
+	for i := 0; i < 12; i++ {
+		sessions = append(sessions, core.Session{ID: fmt.Sprintf("idle-%02d", i), Status: core.StatusIdle})
+	}
+	sessions = append(sessions,
+		core.Session{ID: "running", Status: core.StatusRunning},
+		core.Session{ID: "live", Status: core.StatusLive},
+		core.Session{ID: "waiting", Status: core.StatusAwaitingPermission},
+	)
+	rows := stateBlockSessions(sessions, "idle-11")
+	got := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		got[row.ID] = true
+	}
+	for _, id := range []string{"idle-00", "idle-09", "idle-11", "running", "live", "waiting"} {
+		if !got[id] {
+			t.Errorf("missing %s from selected rows: %+v", id, rows)
+		}
+	}
+	if got["idle-10"] {
+		t.Errorf("included idle session outside recent window: %+v", rows)
 	}
 }

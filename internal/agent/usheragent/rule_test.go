@@ -24,7 +24,6 @@ type fakeAPI struct {
 	transcripts map[string][]core.TranscriptTurn
 	waitReplies map[string]string
 	waitErrs    map[string]error
-	waitedFor   []string
 
 	archived    map[string]bool
 	autoApprove map[string]bool
@@ -135,17 +134,6 @@ func (f *fakeAPI) SearchAllSessions(query string, maxSessions, _ int) ([]core.Se
 		out, truncated = out[:maxSessions], true
 	}
 	return out, truncated, nil
-}
-func (f *fakeAPI) SendToSessionAndWait(_ context.Context, id, text string, _ time.Duration) (string, error) {
-	f.waitedFor = append(f.waitedFor, id)
-	_ = text
-	if err, ok := f.waitErrs[id]; ok && err != nil {
-		return f.waitReplies[id], err
-	}
-	if reply, ok := f.waitReplies[id]; ok {
-		return reply, nil
-	}
-	return "", nil
 }
 func (f *fakeAPI) CreateSessionWithBackend(_ context.Context, cwd, msg, _, _ string, _ time.Duration) (string, string, error) {
 	f.created = append(f.created, createCall{Cwd: cwd, Msg: msg})
@@ -331,10 +319,41 @@ func TestRule_SendError(t *testing.T) {
 	}
 }
 
-// Permission commands (/pending, /approve, /deny) are disabled while
-// permissions are handled by the global web modal — see rule.go. Re-enable
-// these tests when the commands come back.
-/*
+func TestRule_FocusDoesNotSendOrRead(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "main chat work"}}
+	a := NewRule(api)
+
+	res := handleFull(t, a, "/focus abc")
+	if res.FocusSession != "abc12345" {
+		t.Fatalf("FocusSession = %q, want abc12345", res.FocusSession)
+	}
+	if len(api.sentTo) != 0 || len(api.sentText) != 0 {
+		t.Fatalf("focus sent a message: ids=%+v texts=%+v", api.sentTo, api.sentText)
+	}
+	if !strings.Contains(res.Reply, "focused abc12345") {
+		t.Errorf("Reply = %q", res.Reply)
+	}
+}
+
+func TestRule_FocusUsageAndResolutionErrors(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{
+		{ID: "abc12345", Title: "one"},
+		{ID: "abc67890", Title: "two"},
+	}
+	a := NewRule(api)
+	if got := handle(t, a, "/focus"); !strings.Contains(got, "usage:") {
+		t.Errorf("empty focus = %q", got)
+	}
+	if got := handle(t, a, "/focus missing"); !strings.Contains(got, "no sessions match") {
+		t.Errorf("missing focus = %q", got)
+	}
+	if got := handle(t, a, "/focus abc"); !strings.Contains(got, "ambiguous") {
+		t.Errorf("ambiguous focus = %q", got)
+	}
+}
+
 func TestRule_PendingAndRespond(t *testing.T) {
 	api := newFakeAPI()
 	api.pending = []hook.Pending{
@@ -375,7 +394,6 @@ func TestRule_ApproveNoMatch(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
-*/
 
 func TestRule_ArchiveAndUnarchive(t *testing.T) {
 	api := newFakeAPI()
@@ -435,23 +453,6 @@ func TestRule_ListShowsFlags(t *testing.T) {
 	}
 }
 
-func TestRule_Ask(t *testing.T) {
-	api := newFakeAPI()
-	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
-	api.waitReplies["abc12345"] = "the answer is 42"
-	a := NewRule(api)
-	res := handleFull(t, a, "/ask abc what is the answer")
-	if !strings.Contains(res.Reply, "42") {
-		t.Errorf("got %q", res.Reply)
-	}
-	if res.FocusSession != "abc12345" {
-		t.Errorf("ask should set focus, got %q", res.FocusSession)
-	}
-	if len(api.waitedFor) != 1 || api.waitedFor[0] != "abc12345" {
-		t.Errorf("waitedFor = %v", api.waitedFor)
-	}
-}
-
 func TestRule_Read(t *testing.T) {
 	api := newFakeAPI()
 	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
@@ -466,6 +467,45 @@ func TestRule_Read(t *testing.T) {
 	}
 	if res.FocusSession != "abc12345" {
 		t.Errorf("read should set focus, got %q", res.FocusSession)
+	}
+}
+
+func TestRule_ReadOffset(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
+	api.transcripts["abc12345"] = []core.TranscriptTurn{
+		{Role: "user", Content: "turn0"},
+		{Role: "assistant", Content: "turn1"},
+		{Role: "user", Content: "turn2"},
+	}
+	a := NewRule(api)
+	res := handleFull(t, a, "/read abc 1 0")
+	if !strings.Contains(res.Reply, "turn0") || strings.Contains(res.Reply, "turn1") {
+		t.Errorf("got %q, want only the turn at offset 0", res.Reply)
+	}
+}
+
+func TestRule_Search(t *testing.T) {
+	api := newFakeAPI()
+	api.sessions = []core.Session{{ID: "abc12345", Title: "x"}}
+	api.transcripts["abc12345"] = []core.TranscriptTurn{
+		{Role: "user", Content: "what's the migration status"},
+		{Role: "assistant", Content: "unrelated"},
+	}
+	a := NewRule(api)
+	res := handleFull(t, a, "/search --session abc migration")
+	if !strings.Contains(res.Reply, "migration status") {
+		t.Errorf("got %q", res.Reply)
+	}
+	if res.FocusSession != "abc12345" {
+		t.Errorf("search should set focus, got %q", res.FocusSession)
+	}
+	if got := handle(t, a, "/search --session abc nomatch"); !strings.Contains(got, "no matches") {
+		t.Errorf("got %q", got)
+	}
+	global := handleFull(t, a, "/search migration")
+	if !strings.Contains(global.Reply, "abc12345") || global.FocusSession != "" {
+		t.Errorf("global search = %+v", global)
 	}
 }
 

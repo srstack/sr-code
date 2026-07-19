@@ -218,7 +218,7 @@ func serve(args []string) error {
 		return fmt.Errorf("init main chat store: %w", err)
 	}
 
-	agent, err := buildAgent(r, *agentMode, *llmBaseURL, *llmModel, *llmAPIKeyEnv, *llmStrict)
+	agent, err := buildAgent(r, *agentMode, *llmBaseURL, *llmModel, *llmAPIKeyEnv, *llmStrict, logger)
 	if err != nil {
 		return err
 	}
@@ -378,7 +378,7 @@ func hookSockPath(dataDir string) string {
 	return filepath.Join(dataDir, "hook.sock")
 }
 
-func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string, strict bool) (usheragent.Agent, error) {
+func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string, strict bool, logger *slog.Logger) (usheragent.Agent, error) {
 	switch mode {
 	case "", "rule":
 		return usheragent.NewRule(r), nil
@@ -391,7 +391,7 @@ func buildAgent(r *router.Router, mode, baseURL, model, apiKeyEnv string, strict
 			apiKey = os.Getenv(apiKeyEnv)
 		}
 		client := usheragent.NewChatClient(baseURL, apiKey)
-		return usheragent.NewLLM(r, usheragent.LLMConfig{Client: client, Model: model, Strict: strict})
+		return usheragent.NewLLM(r, usheragent.LLMConfig{Client: client, Model: model, Strict: strict, Logger: logger})
 	default:
 		return nil, fmt.Errorf("unknown --agent-mode: %q (want rule | llm)", mode)
 	}
