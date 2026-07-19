@@ -1,7 +1,5 @@
 // Package codexrollout parses OpenAI Codex CLI "rollout" session logs into the
-// same display model usher already uses for Claude Code sessions
-// (jsonl.SessionMeta / jsonl.Turn), so the router, web, and agent layers can
-// consume both backends through one contract.
+// the backend-neutral core display model consumed by router, web, and agents.
 //
 // A rollout lives at ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl,
 // one JSON object per line: {"timestamp","type","payload":{...}}. The first
@@ -12,10 +10,8 @@
 // function_call_output, linked by call_id). A turn is finished by an event_msg
 // task_complete, the analog of Claude Code's system/turn_duration marker.
 //
-// The shared display types (jsonl.Turn, jsonl.TurnPart, jsonl.SessionMeta) live
-// in package jsonl today for historical reasons; they are backend-neutral and a
-// later refactor may move them to package core. codexrollout imports them so the
-// rendered transcript shape is byte-for-byte the contract router/web expect.
+// Shared display and metadata types live in package core; this package owns
+// only the Codex wire format and its projection into that contract.
 package codexrollout
 
 import (
@@ -28,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/core"
 )
 
 // line is the uniform envelope of every rollout record.
@@ -143,14 +139,14 @@ func IsTurnActivity(raw []byte) bool {
 // ReadSessionMeta reads the lightweight descriptor: id/cwd/start from the
 // session_meta header, last-activity from the final timestamped line, and a
 // title from the first real user prompt.
-func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
+func ReadSessionMeta(path string) (core.SessionMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return jsonl.SessionMeta{}, err
+		return core.SessionMeta{}, err
 	}
 	defer f.Close()
 
-	meta := jsonl.SessionMeta{ID: SessionIDFromPath(path)}
+	meta := core.SessionMeta{ID: SessionIDFromPath(path)}
 	sc := newScanner(f)
 	var firstPrompt string
 	for sc.Scan() {
@@ -207,7 +203,7 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 					firstPrompt = msg
 				}
 				// user_message is codex's clean typed prompt — the sort key
-				// (jsonl.SessionMeta.LastInputAt).
+				// (core.SessionMeta.LastInputAt).
 				if !l.Timestamp.IsZero() {
 					meta.LastInputAt = l.Timestamp
 				}
@@ -236,7 +232,7 @@ func ReadSessionMeta(path string) (jsonl.SessionMeta, error) {
 // ReadTurns returns the grouped user/assistant turns of the rollout at path,
 // matching jsonl.ReadTurns' contract (limit>0 keeps the most recent N; total is
 // the count before trimming).
-func ReadTurns(path string, limit int) (turns []jsonl.Turn, total int, err error) {
+func ReadTurns(path string, limit int) (turns []core.Turn, total int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, err
@@ -266,7 +262,7 @@ func ReadTurns(path string, limit int) (turns []jsonl.Turn, total int, err error
 // streamed live and the same turn re-read from /transcript never disagree. Feed
 // it raw lines in file order.
 type Assembler struct {
-	cur     *jsonl.Turn
+	cur     *core.Turn
 	pending map[string]toolStash // call_id -> tool call awaiting its output
 	seenMCP map[string]struct{}  // canonical/legacy/response-item deduplication
 	model   string               // last model seen on a turn_context line (sticky)
@@ -286,7 +282,7 @@ func NewAssembler() *Assembler {
 // real user prompt flushes the in-progress assistant turn, then commits itself);
 // part is set when the line appended a part to the in-progress assistant turn
 // (the per-event increment a live stream publishes — a copy, not mutated later).
-func (a *Assembler) Feed(raw []byte) (completed []jsonl.Turn, part *jsonl.TurnPart) {
+func (a *Assembler) Feed(raw []byte) (completed []core.Turn, part *core.TurnPart) {
 	// Parse the timestamp independently. A new or malformed timestamp format
 	// must not make us discard the event type/payload (especially turn_complete).
 	var wire struct {
@@ -328,7 +324,7 @@ func (a *Assembler) feedTurnContext(l line) {
 	}
 }
 
-func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnPart) {
+func (a *Assembler) feedEvent(l line) (completed []core.Turn, part *core.TurnPart) {
 	var p struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
@@ -342,7 +338,7 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 		if t := a.Flush(); t != nil {
 			completed = append(completed, *t)
 		}
-		return append(completed, jsonl.Turn{
+		return append(completed, core.Turn{
 			Role:    "system",
 			Content: "Context compacted",
 			Time:    l.Timestamp,
@@ -353,7 +349,7 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 			completed = append(completed, *t)
 		}
 		if p.Message != "" {
-			completed = append(completed, jsonl.Turn{
+			completed = append(completed, core.Turn{
 				Role:    "user",
 				Content: p.Message,
 				Time:    l.Timestamp,
@@ -365,7 +361,7 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 			return nil, nil
 		}
 		a.ensureTurn(l.Timestamp)
-		tp := jsonl.TurnPart{Type: "text", Content: p.Message}
+		tp := core.TurnPart{Type: "text", Content: p.Message}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return nil, &tp
 	case "mcp_tool_call_end":
@@ -402,9 +398,9 @@ func (a *Assembler) feedEvent(l line) (completed []jsonl.Turn, part *jsonl.TurnP
 	return nil, nil
 }
 
-func (a *Assembler) appendTool(ts time.Time, name, target, body string) *jsonl.TurnPart {
+func (a *Assembler) appendTool(ts time.Time, name, target, body string) *core.TurnPart {
 	a.ensureTurn(ts)
-	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+	tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
 	if body != "" {
 		tp.Content = fence(clampBody(body))
 	}
@@ -412,7 +408,7 @@ func (a *Assembler) appendTool(ts time.Time, name, target, body string) *jsonl.T
 	return &tp
 }
 
-func (a *Assembler) patchApplyPart(l line) *jsonl.TurnPart {
+func (a *Assembler) patchApplyPart(l line) *core.TurnPart {
 	var p struct {
 		Stdout  string `json:"stdout"`
 		Stderr  string `json:"stderr"`
@@ -446,7 +442,7 @@ func (a *Assembler) patchApplyPart(l line) *jsonl.TurnPart {
 	return a.appendTool(l.Timestamp, "Edit", strings.Join(paths, ", "), strings.Join(body, "\n"))
 }
 
-func (a *Assembler) execCommandPart(l line) *jsonl.TurnPart {
+func (a *Assembler) execCommandPart(l line) *core.TurnPart {
 	var p struct {
 		Command          []string `json:"command"`
 		AggregatedOutput string   `json:"aggregated_output"`
@@ -463,7 +459,7 @@ func (a *Assembler) execCommandPart(l line) *jsonl.TurnPart {
 	return a.appendTool(l.Timestamp, "Shell", strings.Join(p.Command, " "), body)
 }
 
-func (a *Assembler) simpleEventToolPart(l line, name string) *jsonl.TurnPart {
+func (a *Assembler) simpleEventToolPart(l line, name string) *core.TurnPart {
 	var p struct {
 		Query  string          `json:"query"`
 		Path   string          `json:"path"`
@@ -483,7 +479,7 @@ func (a *Assembler) simpleEventToolPart(l line, name string) *jsonl.TurnPart {
 	return a.appendTool(l.Timestamp, name, target, body)
 }
 
-func (a *Assembler) imageGenerationPart(l line) *jsonl.TurnPart {
+func (a *Assembler) imageGenerationPart(l line) *core.TurnPart {
 	var p struct {
 		Status        string `json:"status"`
 		RevisedPrompt string `json:"revised_prompt"`
@@ -499,7 +495,7 @@ func (a *Assembler) imageGenerationPart(l line) *jsonl.TurnPart {
 	return a.appendTool(l.Timestamp, "ImageGeneration", p.SavedPath, body)
 }
 
-func (a *Assembler) dynamicToolPart(l line) *jsonl.TurnPart {
+func (a *Assembler) dynamicToolPart(l line) *core.TurnPart {
 	var p struct {
 		Namespace    string                     `json:"namespace"`
 		Tool         string                     `json:"tool"`
@@ -529,7 +525,7 @@ func (a *Assembler) dynamicToolPart(l line) *jsonl.TurnPart {
 	return a.appendTool(l.Timestamp, name, toolTargetMap(p.Arguments), strings.Join(body, "\n"))
 }
 
-func (a *Assembler) mcpToolPart(l line) *jsonl.TurnPart {
+func (a *Assembler) mcpToolPart(l line) *core.TurnPart {
 	var p struct {
 		CallID     string `json:"call_id"`
 		Invocation struct {
@@ -566,7 +562,7 @@ func (a *Assembler) mcpToolPart(l line) *jsonl.TurnPart {
 		}
 	}
 	a.ensureTurn(l.Timestamp)
-	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+	tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
 	if len(texts) > 0 {
 		tp.Content = fence(clampBody(strings.Join(texts, "\n")))
 	}
@@ -574,7 +570,7 @@ func (a *Assembler) mcpToolPart(l line) *jsonl.TurnPart {
 	return &tp
 }
 
-func (a *Assembler) completedMCPToolPart(l line) *jsonl.TurnPart {
+func (a *Assembler) completedMCPToolPart(l line) *core.TurnPart {
 	var p struct {
 		Item struct {
 			Type      string                     `json:"type"`
@@ -624,13 +620,13 @@ func (a *Assembler) markMCP(callID string) bool {
 	return true
 }
 
-func (a *Assembler) appendMCPPart(ts time.Time, server, tool string, arguments map[string]json.RawMessage, texts []string) *jsonl.TurnPart {
+func (a *Assembler) appendMCPPart(ts time.Time, server, tool string, arguments map[string]json.RawMessage, texts []string) *core.TurnPart {
 	name := tool
 	if server != "" {
 		name = "mcp__" + server + "__" + tool
 	}
 	a.ensureTurn(ts)
-	tp := jsonl.TurnPart{Type: "tool", ToolName: name, ToolTarget: toolTargetMap(arguments)}
+	tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: toolTargetMap(arguments)}
 	if len(texts) > 0 {
 		tp.Content = fence(clampBody(strings.Join(texts, "\n")))
 	}
@@ -640,7 +636,7 @@ func (a *Assembler) appendMCPPart(ts time.Time, server, tool string, arguments m
 
 // feedResponseItem handles the model-item stream. Only tool calls/outputs are
 // taken from here; message text is sourced from the cleaner event_msg stream.
-func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
+func (a *Assembler) feedResponseItem(l line) (part *core.TurnPart) {
 	var p struct {
 		Type      string          `json:"type"`
 		Name      string          `json:"name"`
@@ -668,7 +664,7 @@ func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
 			return nil
 		}
 		a.ensureTurn(l.Timestamp)
-		tp := jsonl.TurnPart{
+		tp := core.TurnPart{
 			Type:       "tool",
 			Content:    renderOutput(p.Output),
 			ToolName:   stash.name,
@@ -696,7 +692,7 @@ func (a *Assembler) feedResponseItem(l line) (part *jsonl.TurnPart) {
 
 // FeedLine is Feed under the name the cross-backend assembler interface expects
 // (jsonl.Assembler exposes the same method), so the router can drive either.
-func (a *Assembler) FeedLine(raw []byte) (completed []jsonl.Turn, part *jsonl.TurnPart) {
+func (a *Assembler) FeedLine(raw []byte) (completed []core.Turn, part *core.TurnPart) {
 	return a.Feed(raw)
 }
 
@@ -706,7 +702,7 @@ func (a *Assembler) Model() string { return a.model }
 
 func (a *Assembler) ensureTurn(ts time.Time) {
 	if a.cur == nil {
-		a.cur = &jsonl.Turn{Role: "assistant", Time: ts, Model: a.model}
+		a.cur = &core.Turn{Role: "assistant", Time: ts, Model: a.model}
 	}
 	a.cur.Touch(ts)
 }
@@ -714,7 +710,7 @@ func (a *Assembler) ensureTurn(ts time.Time) {
 // Flush commits and returns the in-progress assistant turn, or nil when there is
 // none (or it gathered no parts). Call at end-of-input; a user prompt or
 // task_complete flushes implicitly via Feed.
-func (a *Assembler) Flush() *jsonl.Turn {
+func (a *Assembler) Flush() *core.Turn {
 	t := a.cur
 	a.cur = nil
 	if t == nil || len(t.Parts) == 0 {

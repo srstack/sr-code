@@ -19,7 +19,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/nexustar/usher/internal/core"
-	"github.com/nexustar/usher/internal/jsonl"
 )
 
 type Discovery struct {
@@ -223,7 +222,7 @@ func (d *Discovery) upsert(path string) {
 
 // applySubagentMeta fills structural metadata that may arrive after the file's
 // Create event. Never clear an already-known relationship on a partial read.
-func applySubagentMeta(sess *core.Session, meta jsonl.SessionMeta) {
+func applySubagentMeta(sess *core.Session, meta core.SessionMeta) {
 	if !meta.IsSubagent {
 		return
 	}

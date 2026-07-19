@@ -32,6 +32,7 @@ type fakeRouter struct {
 }
 
 type startCall struct {
+	backend string
 	cwd     string
 	initial string
 	model   string
@@ -68,14 +69,14 @@ func (f *fakeRouter) SendToSession(id, text string) error {
 	return nil
 }
 
-func (f *fakeRouter) StartSession(cwd, initialMsg, model string) (string, error) {
+func (f *fakeRouter) StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
 		return "", f.startErr
 	}
 	id := "s_new"
-	f.started = append(f.started, startCall{cwd: cwd, initial: initialMsg, model: model})
+	f.started = append(f.started, startCall{backend: backend, cwd: cwd, initial: initialMsg, model: model})
 	f.sessions[id] = core.Session{ID: id, Cwd: cwd}
 	return id, nil
 }
@@ -179,7 +180,7 @@ func TestStartSessionRoundTrip(t *testing.T) {
 	f := newFakeRouter()
 	c := startServer(t, f)
 
-	id, err := c.StartSession("/tmp/work", "hello", "codex-test")
+	id, err := c.StartSessionWithBackend("codex", "/tmp/work", "hello", "codex-test")
 	if err != nil {
 		t.Fatalf("StartSession: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestStartSessionRoundTrip(t *testing.T) {
 	started := append([]startCall(nil), f.started...)
 	f.startErr = errors.New("bad cwd")
 	f.mu.Unlock()
-	if len(started) != 1 || started[0].cwd != "/tmp/work" || started[0].initial != "hello" || started[0].model != "codex-test" {
+	if len(started) != 1 || started[0].backend != "codex" || started[0].cwd != "/tmp/work" || started[0].initial != "hello" || started[0].model != "codex-test" {
 		t.Fatalf("started = %+v", started)
 	}
 

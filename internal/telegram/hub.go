@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/hook"
@@ -424,13 +425,13 @@ func (h *Hub) notifyTopic(thread int64, text string) {
 // completion — and, elsewhere, permission prompts — notify audibly.
 func (h *Hub) handleEvent(ctx context.Context, ev broker.Event) {
 	switch ev.Type {
-	case "turn.user":
+	case backend.EventTurnUser:
 		h.mirrorPrompt(ctx, ev)
-	case "part":
+	case backend.EventPart:
 		h.mirrorAssistant(ctx, ev)
-	case "subprocess.exit":
+	case backend.EventProcessExit:
 		h.notifyTurnComplete(ctx, ev)
-	case "error":
+	case backend.EventError:
 		h.notifyTurnError(ctx, ev)
 	}
 }

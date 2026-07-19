@@ -25,8 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
-	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/jsonl"
 )
 
@@ -93,7 +93,8 @@ func (r *Router) checkForeignTurn(id string) {
 	// The file grew outside any usher send. The turn is only DONE when the
 	// last line is the end-of-turn marker; otherwise check again next tick.
 	line, err := lastFileLine(path, size)
-	if err != nil || !turnCompleteMarker(r.backendOf(id), line) {
+	format, formatErr := r.transcriptForBackend(r.backendOf(id))
+	if err != nil || formatErr != nil || !format.IsTurnComplete(line) {
 		return
 	}
 
@@ -109,7 +110,7 @@ func (r *Router) checkForeignTurn(id string) {
 	r.setForeignBaseLocked(id, size)
 	r.sendMu.Unlock()
 
-	turns := foreignTurnsBetween(path, r.backendOf(id), base, size)
+	turns := foreignTurnsBetweenWith(path, format.NewAssembler(), base, size)
 	sess, _ := r.discovery.Get(id)
 	if !sess.IsSubagent {
 		r.publishForeignTurnEvents(id, turns)
@@ -127,7 +128,7 @@ func (r *Router) checkForeignTurn(id string) {
 	if err != nil {
 		exitRaw = json.RawMessage(`{}`)
 	}
-	r.broker.Publish(broker.Event{SessionID: id, Type: "subprocess.exit", Raw: exitRaw})
+	r.broker.Publish(broker.Event{SessionID: id, Type: backend.EventProcessExit, Raw: exitRaw})
 
 	// Subagents are read-only transcript children, not independent foreign
 	// conversations. The exit above only wakes their open detail view; never
@@ -157,7 +158,7 @@ func (r *Router) publishForeignTurnEvents(sessionID string, turns []jsonl.Turn) 
 		case "user":
 			raw, err := json.Marshal(map[string]any{"role": "user", "content": tn.Content, "ts": tn.Time})
 			if err == nil {
-				r.broker.Publish(broker.Event{SessionID: sessionID, Type: "turn.user", Raw: raw})
+				r.broker.Publish(broker.Event{SessionID: sessionID, Type: backend.EventTurnUser, Raw: raw})
 			}
 		case "assistant":
 			for _, p := range tn.Parts {
@@ -165,7 +166,7 @@ func (r *Router) publishForeignTurnEvents(sessionID string, turns []jsonl.Turn) 
 					"role": "assistant", "ts": tn.Time, "model": tn.Model, "part": p,
 				})
 				if err == nil {
-					r.broker.Publish(broker.Event{SessionID: sessionID, Type: "part", Raw: raw})
+					r.broker.Publish(broker.Event{SessionID: sessionID, Type: backend.EventPart, Raw: raw})
 				}
 			}
 		}
@@ -177,7 +178,7 @@ func (r *Router) publishForeignTurnEvents(sessionID string, turns []jsonl.Turn) 
 // live path uses. base always sits at a line boundary in practice (it is
 // captured at turn ends / first sight); if a write ever races the capture,
 // the torn first line fails to parse and is skipped, never mis-grouped.
-func foreignTurnsBetween(path, backend string, base, size int64) []jsonl.Turn {
+func foreignTurnsBetweenWith(path string, asm backend.Assembler, base, size int64) []jsonl.Turn {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -187,7 +188,6 @@ func foreignTurnsBetween(path, backend string, base, size int64) []jsonl.Turn {
 	if _, err := f.ReadAt(buf, base); err != nil && err != io.EOF {
 		return nil
 	}
-	asm := newStreamAssembler(backend)
 	var out []jsonl.Turn
 	for _, line := range bytes.Split(buf, []byte("\n")) {
 		line = bytes.TrimRight(line, "\r")
@@ -251,14 +251,4 @@ func lastFileLine(path string, size int64) ([]byte, error) {
 		buf = buf[i+1:]
 	}
 	return buf, nil
-}
-
-// turnCompleteMarker reports whether line is the backend's end-of-turn log
-// marker — the same predicates the send tailer keys on (Claude Code:
-// system/turn_duration; Codex: event_msg/task_complete).
-func turnCompleteMarker(backend string, line []byte) bool {
-	if backend == "codex" {
-		return codexrollout.IsTurnComplete(line)
-	}
-	return jsonl.IsTurnComplete(line)
 }

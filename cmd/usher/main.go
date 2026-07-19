@@ -17,10 +17,12 @@ import (
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
 	"github.com/nexustar/usher/internal/auth"
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
+	"github.com/nexustar/usher/internal/modelcatalog"
 	"github.com/nexustar/usher/internal/pluginapi"
 	"github.com/nexustar/usher/internal/push"
 	"github.com/nexustar/usher/internal/router"
@@ -28,6 +30,7 @@ import (
 	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/telegram"
 	"github.com/nexustar/usher/internal/terminal"
+	"github.com/nexustar/usher/internal/transcript"
 	"github.com/nexustar/usher/internal/web"
 )
 
@@ -171,29 +174,28 @@ func serve(args []string) error {
 	// CLI has run). usher works with either or both; at least one is required.
 	// defaultBackend (new-session/fallback) prefers Claude.
 	sources := []discovery.Source{}
-	senders := map[string]*sender.Sender{}
+	backends := map[string]backend.Backend{}
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	defaultBackend := ""
-	var codexModelsPath string
 
 	if dir := *projectsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewClaudeSource(dir))
-		senders["claude"] = sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, h, logger)
+		backends["claude"] = backend.Backend{Runtime: sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Claude{}, Forker: transcript.ClaudeForker{}, Models: modelcatalog.Claude{}}
 		defaultBackend = "claude"
 		logger.Info("claude backend enabled", "projects_dir", dir)
 	}
 	if dir := *codexSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewCodexSource(dir))
-		senders["codex"] = sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger)
+		modelsPath := filepath.Join(filepath.Dir(dir), "models_cache.json")
+		backends["codex"] = backend.Backend{Runtime: sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Codex{}, Forker: transcript.CodexForker{}, Models: modelcatalog.Codex{Path: modelsPath}}
 		// codex's per-account model catalog sits next to the sessions dir.
-		codexModelsPath = filepath.Join(filepath.Dir(dir), "models_cache.json")
 		if defaultBackend == "" {
 			defaultBackend = "codex"
 		}
 		logger.Info("codex backend enabled", "sessions_dir", dir)
 	}
 
-	if len(senders) == 0 {
+	if len(backends) == 0 {
 		return fmt.Errorf("no backend found: neither %q (Claude Code) nor %q (Codex) exists.\n"+
 			"  run claude or codex once first, or pass --projects-dir / --codex-sessions-dir.",
 			*projectsDir, *codexSessionsDir)
@@ -209,7 +211,7 @@ func serve(args []string) error {
 		time.Duration(*autoArchiveDays)*24*time.Hour,
 	)
 	term := terminal.New("tmux", *tmuxSocket+"-terminal", *terminalShell, logger)
-	r := router.New(d, senders, defaultBackend, b, h, meta, term)
+	r := router.New(d, backends, defaultBackend, b, h, meta, term)
 
 	mainStore, err := mainchat.NewStore(filepath.Join(*dataDir, "mainchats"))
 	if err != nil {
@@ -282,7 +284,7 @@ func serve(args []string) error {
 		}
 	}()
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, codexModelsPath, *editorURL, *uiDir, logger)
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, *editorURL, *uiDir, logger)
 
 	// Foreign-turn watcher: turns usher didn't start (background workflow
 	// continuations, pane-typed prompts) get relayed to the chats that

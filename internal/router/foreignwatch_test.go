@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/backend"
+	"github.com/nexustar/usher/internal/transcript"
 )
 
 func appendFile(t *testing.T, path, content string) {
@@ -191,7 +194,11 @@ func TestTurnCompleteMarker(t *testing.T) {
 		{"claude", `not json`, false},
 	}
 	for _, c := range cases {
-		if got := turnCompleteMarker(c.backend, []byte(c.line)); got != c.want {
+		var format backend.Transcript = transcript.Claude{}
+		if c.backend == "codex" {
+			format = transcript.Codex{}
+		}
+		if got := format.IsTurnComplete([]byte(c.line)); got != c.want {
 			t.Errorf("turnCompleteMarker(%s, %s) = %v, want %v", c.backend, c.line, got, c.want)
 		}
 	}

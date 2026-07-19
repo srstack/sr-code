@@ -6,8 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -170,36 +168,6 @@ func TestGzipMiddleware(t *testing.T) {
 			t.Errorf("body = %q", rec.Body.String())
 		}
 	})
-}
-
-func TestCodexModels(t *testing.T) {
-	// codex disabled → nil
-	if got := (&Server{codexModelsPath: ""}).codexModels(); got != nil {
-		t.Errorf("disabled → nil, got %v", got)
-	}
-	// codex enabled but cache missing → fallback to the current named models.
-	got := (&Server{codexModelsPath: "/no/such/models_cache.json"}).codexModels()
-	if len(got) != 2 || got[0].Value != "gpt-5.5" {
-		t.Fatalf("missing-cache fallback = %v, want gpt-5.5 then mini", got)
-	}
-	// a real catalog → list-visible only, sorted by priority
-	p := filepath.Join(t.TempDir(), "models_cache.json")
-	os.WriteFile(p, []byte(`{"models":[
-		{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","priority":2,"default_reasoning_level":"low"},
-		{"slug":"auto-review","display_name":"x","visibility":"hide","priority":1,"default_reasoning_level":"high"},
-		{"slug":"gpt-5.4-mini","display_name":"GPT-5.4 Mini","visibility":"list","priority":1}
-	]}`), 0o644)
-	got = (&Server{codexModelsPath: p}).codexModels()
-	if len(got) != 2 || got[0].Value != "gpt-5.4-mini" || got[1].Value != "gpt-5.5" {
-		t.Fatalf("catalog parse/sort = %v (want mini then 5.5, hide excluded)", got)
-	}
-	s := &Server{codexModelsPath: p}
-	if effort := s.codexDefaultEffort("gpt-5.5"); effort != "low" {
-		t.Errorf("default effort = %q, want low", effort)
-	}
-	if effort := s.codexDefaultEffort("auto-review"); effort != "high" {
-		t.Errorf("hidden model default effort = %q, want high", effort)
-	}
 }
 
 func TestHumanizeAge(t *testing.T) {

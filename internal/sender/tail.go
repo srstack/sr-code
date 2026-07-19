@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/jsonl"
 )
 
@@ -68,15 +69,15 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 		// logs turn_duration. Emit subprocess.exit for both so the web UI finalizes
 		// the turn instead of waiting forever on a marker that isn't coming.
 		emitExit := func() {
-			sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
+			sendEvent(context.Background(), out, StreamEvent{Type: backend.EventProcessExit, Raw: json.RawMessage(`{}`)})
 		}
 		emitExitReason := func(reason string) {
 			raw, _ := json.Marshal(map[string]string{"reason": reason})
-			sendEvent(context.Background(), out, StreamEvent{Type: "subprocess.exit", Raw: raw})
+			sendEvent(context.Background(), out, StreamEvent{Type: backend.EventProcessExit, Raw: raw})
 		}
 		emitIOError := func(msg string) {
 			raw, _ := json.Marshal(map[string]string{"message": msg})
-			sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: raw})
+			sendEvent(context.Background(), out, StreamEvent{Type: backend.EventError, Raw: raw})
 			emitExitReason("tail_error")
 		}
 
@@ -143,7 +144,7 @@ func tailTurn(ctx context.Context, path string, byteOffset int64, logger *slog.L
 					ev := StreamEvent{Type: lineType(line), Raw: append(json.RawMessage(nil), line...)}
 					_ = sendEvent(context.Background(), out, ev)
 					errRaw, _ := json.Marshal(map[string]string{"message": "turn aborted before completion"})
-					_ = sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: errRaw})
+					_ = sendEvent(context.Background(), out, StreamEvent{Type: backend.EventError, Raw: errRaw})
 					emitExitReason("turn_aborted")
 					return
 				}
@@ -184,7 +185,7 @@ func openWhenReady(ctx context.Context, path string, cfg tailConfig, out chan<- 
 			return nil, false
 		case <-deadline.C:
 			errMsg, _ := json.Marshal(map[string]string{"message": "session jsonl did not appear: " + path})
-			sendEvent(context.Background(), out, StreamEvent{Type: "error", Raw: errMsg})
+			sendEvent(context.Background(), out, StreamEvent{Type: backend.EventError, Raw: errMsg})
 			return nil, false
 		case <-ticker.C:
 		}

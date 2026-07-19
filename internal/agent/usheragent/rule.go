@@ -20,7 +20,7 @@ type RuleAgent struct {
 func NewRule(api AgentAPI) *RuleAgent { return &RuleAgent{api: api} }
 
 const helpText = `commands:
-  /list                          list all Claude Code sessions
+  /list                          list all coding-agent sessions
   /send <prefix> <text>          send <text>; the session's reply is relayed here when done
   /ask <prefix> <text>           send <text> and wait for the session's reply
   /read <prefix> [n]             show the last n turns of a session (default 20)
@@ -205,7 +205,7 @@ func (a *RuleAgent) create(ctx context.Context, args string) (string, string) {
 	if cwd == "" || initial == "" {
 		return "usage: /new <cwd> <initial message>", ""
 	}
-	newID, reply, err := a.api.CreateSession(ctx, cwd, initial, defaultCreateTimeout)
+	newID, reply, err := a.api.CreateSessionWithBackend(ctx, cwd, initial, "", "", defaultCreateTimeout)
 	if err != nil {
 		if newID != "" {
 			return fmt.Sprintf("created %s but: %s", shortID(newID), err.Error()), newID

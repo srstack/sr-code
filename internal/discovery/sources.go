@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/nexustar/usher/internal/codexrollout"
+	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/jsonl"
 )
 
@@ -25,7 +26,7 @@ type Source interface {
 	// SessionID extracts the session id from a session file path, or "" if none.
 	SessionID(path string) string
 	// ReadMeta reads the lightweight descriptor used for listing.
-	ReadMeta(path string) (jsonl.SessionMeta, error)
+	ReadMeta(path string) (core.SessionMeta, error)
 }
 
 // ClaudeSource scans Claude Code's projects tree:
@@ -80,7 +81,7 @@ func (s ClaudeSource) SessionID(path string) string {
 	return id
 }
 
-func (s ClaudeSource) ReadMeta(path string) (jsonl.SessionMeta, error) {
+func (s ClaudeSource) ReadMeta(path string) (core.SessionMeta, error) {
 	meta, err := jsonl.ReadSessionMeta(path)
 	if err != nil {
 		return meta, err
@@ -127,6 +128,6 @@ func (s CodexSource) SessionID(path string) string {
 	return codexrollout.SessionIDFromPath(path)
 }
 
-func (s CodexSource) ReadMeta(path string) (jsonl.SessionMeta, error) {
+func (s CodexSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return codexrollout.ReadSessionMeta(path)
 }

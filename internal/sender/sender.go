@@ -4,8 +4,10 @@ package sender
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nexustar/usher/internal/appserver"
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/claudestream"
 	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/hook"
@@ -24,23 +27,19 @@ import (
 // the headless era so the broker/web layer needs minimal change; the payloads
 // are now whole jsonl lines (message granularity), not stream-json token
 // deltas.
-type StreamEvent struct {
-	Type string
-	Raw  json.RawMessage
-}
+type StreamEvent = backend.Event
 
 // timing groups the tunable delays for driving the TUI. Defaults are set in
 // New; tests override them for speed.
 type timing struct{ confirm, poll time.Duration }
 
 type Sender struct {
-	app          *appserver.Manager // non-nil for the headless Codex backend
-	claude       *claudestream.Manager
-	preAssignsID bool
-	locateFn     func(string) string
-	logger       *slog.Logger
-	t            timing
-	tail         tailConfig
+	app      *appserver.Manager // non-nil for the headless Codex backend
+	claude   *claudestream.Manager
+	locateFn func(string) string
+	logger   *slog.Logger
+	t        timing
+	tail     tailConfig
 }
 
 // claudeMCPConfigArgs writes an MCP config registering `usher mcp-stdio` next to
@@ -100,12 +99,11 @@ func New(claudeCmd, permissionMode, projectsDir, socket, hookSock string, maxLiv
 	}
 	t := timing{confirm: 8 * time.Second, poll: 150 * time.Millisecond}
 	return &Sender{
-		claude:       claudestream.New(claudeCmd, claudeHookSettings(hookSock, logger), hookSock, extra, maxLive, hooks, logger),
-		preAssignsID: true,
-		locateFn:     func(id string) string { return locateClaude(projectsDir, id) },
-		logger:       logger,
-		t:            t,
-		tail:         tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: isTurnComplete},
+		claude:   claudestream.New(claudeCmd, claudeHookSettings(hookSock, logger), hookSock, extra, maxLive, hooks, logger),
+		locateFn: func(id string) string { return locateClaude(projectsDir, id) },
+		logger:   logger,
+		t:        t,
+		tail:     tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: isTurnComplete},
 	}
 }
 
@@ -187,12 +185,11 @@ func NewCodex(codexCmd, sessionsDir, socket, hookSock string, sandboxArgs []stri
 		config[k] = v
 	}
 	return &Sender{
-		app:          appserver.NewManager(codexCmd, hooks, sandbox, config, env, maxLive, logger),
-		preAssignsID: false,
-		locateFn:     func(id string) string { return locateCodex(sessionsDir, id) },
-		logger:       logger,
-		t:            t,
-		tail:         tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: codexrollout.IsTurnComplete, turnAborted: codexrollout.IsTurnAborted},
+		app:      appserver.NewManager(codexCmd, hooks, sandbox, config, env, maxLive, logger),
+		locateFn: func(id string) string { return locateCodex(sessionsDir, id) },
+		logger:   logger,
+		t:        t,
+		tail:     tailConfig{poll: 150 * time.Millisecond, appearWait: 20 * time.Second, turnComplete: codexrollout.IsTurnComplete, turnAborted: codexrollout.IsTurnAborted},
 	}
 }
 
@@ -243,40 +240,35 @@ func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-cha
 	return nil, errors.New("sender has no headless backend")
 }
 
-// SendNew is like Send but starts a brand-new session with the given id
-// (`--session-id`). The jsonl is created lazily once claude writes the first
-// turn; the tailer waits for it to appear.
-func (s *Sender) SendNew(ctx context.Context, sessionID, prompt, cwd, model string) (<-chan StreamEvent, error) {
+// Start creates a new backend session and starts its first turn. The concrete
+// backend owns ID assignment: Claude accepts a caller-generated UUID while
+// Codex returns the thread ID assigned by app-server.
+func (s *Sender) Start(ctx context.Context, req backend.StartRequest) (string, <-chan StreamEvent, error) {
 	if s.claude != nil {
-		return s.claudeTurn(ctx, sessionID, prompt, cwd, model, false)
+		id := newSessionID()
+		ch, err := s.claudeTurn(ctx, id, req.Prompt, req.Cwd, req.Model, false)
+		return id, ch, err
 	}
-	return nil, errors.New("new sessions are unsupported by this backend")
+	if s.app != nil {
+		id, err := s.app.StartThread(ctx, req.Cwd, req.Model)
+		if err != nil {
+			return "", nil, err
+		}
+		ch, err := s.appTurn(ctx, id, req.Prompt, req.Cwd, true)
+		return id, ch, err
+	}
+	return "", nil, errors.New("sender has no headless backend")
 }
 
-// PreAssignsID reports whether usher picks a new session's id up front (Claude,
-// via --session-id) or the backend assigns its own to be discovered after spawn
-// (Codex). The router uses it to choose the new-session path.
-func (s *Sender) PreAssignsID() bool { return s.preAssignsID }
-
-// StartCodexSession spawns a brand-new session whose id the backend assigns
-// itself (Codex has no --session-id flag). It spawns under the temporary window
-// handle tempID, gets the TUI ready, injects prompt, discovers the id the
-// backend just wrote, renames the window to it, and returns that real id with
-// the turn's event stream. It blocks only until the id is known (the session log
-// is flushed at start, so this is quick); the turn then streams in the returned
-// channel. Callers gate on PreAssignsID()==false.
-func (s *Sender) StartCodexSession(ctx context.Context, tempID, prompt, cwd, model string, discoverTimeout time.Duration) (string, <-chan StreamEvent, error) {
-	_ = tempID
-	_ = discoverTimeout
-	if s.app == nil {
-		return "", nil, errors.New("Codex app-server is unavailable")
+func newSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
 	}
-	id, err := s.app.StartThread(ctx, cwd, model)
-	if err != nil {
-		return "", nil, err
-	}
-	ch, err := s.appTurn(ctx, id, prompt, cwd, true)
-	return id, ch, err
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // Has reports whether usher currently holds a live interactive process for
@@ -352,69 +344,20 @@ func (s *Sender) claudeTurn(ctx context.Context, id, prompt, cwd, model string, 
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan StreamEvent, 64)
-	go func() {
-		defer close(out)
-		started, _ := json.Marshal(map[string]any{"cwd": cwd, "fresh": fresh})
-		if !sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started}) {
-			return
-		}
-		if path == "" {
-			path = s.locateWait(ctx, id, s.t.confirm)
-		}
-		if path == "" {
-			emitError(ctx, out, "claude session jsonl did not appear after prompt")
-			return
-		}
-		tailCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		cfg := s.tail
-		cfg.skipCompletions = queuedAhead
-		events := tailTurn(tailCtx, path, offset, s.logger, cfg)
-		for {
-			select {
-			case delta, ok := <-deltas:
-				if !ok {
-					deltas = nil
-					continue
-				}
-				if !emitLiveDelta(ctx, out, "text", delta.Text) {
-					return
-				}
-			case ev, ok := <-events:
-				if !ok {
-					select {
-					case result := <-done:
-						emitClaudeRuntime(ctx, out, result)
-						if result.IsError && result.Subtype != "error_during_execution" {
-							emitError(ctx, out, "claude turn failed: "+result.Subtype)
-						}
-					case <-time.After(3 * time.Second):
-						s.logger.Warn("claude turn finalized from jsonl backstop", "session_id", id)
-					case <-ctx.Done():
-					}
-					return
-				}
-				if !sendEvent(ctx, out, ev) {
-					return
-				}
-			case result := <-done:
-				if result.IsError && result.Subtype != "error_during_execution" {
-					emitError(ctx, out, "claude turn failed: "+result.Subtype)
-				}
-				// The protocol result can beat the tailer's next file poll even
-				// though the final assistant/tool lines are already on disk. Let
-				// the log reach its completion marker before cancelling it.
-				drainTail(ctx, out, events, cancel, 3*time.Second, s.logger,
-					"claude rollout drain timed out", "session_id", id)
-				emitClaudeRuntime(ctx, out, result)
-				return
-			case <-ctx.Done():
-				return
+	tail := s.tail
+	tail.skipCompletions = queuedAhead
+	return mergeLoggedTurn(ctx, loggedTurnConfig[claudestream.Result, claudestream.Delta]{
+		backend: "claude", idKey: "session_id", id: id, cwd: cwd, fresh: fresh,
+		path: path, offset: offset, locate: func() string { return s.locateWait(ctx, id, s.t.confirm) },
+		drainWait: 3 * time.Second, tail: tail, done: done, deltas: deltas, logger: s.logger,
+		delta: func(d claudestream.Delta) (string, string, bool) { return "text", d.Text, true },
+		result: func(ctx context.Context, out chan<- StreamEvent, result claudestream.Result) {
+			if result.IsError && result.Subtype != "error_during_execution" {
+				emitError(ctx, out, "claude turn failed: "+result.Subtype)
 			}
-		}
-	}()
-	return out, nil
+			emitClaudeRuntime(ctx, out, result)
+		},
+	}), nil
 }
 
 func emitClaudeRuntime(ctx context.Context, out chan<- StreamEvent, result claudestream.Result) bool {
@@ -425,7 +368,7 @@ func emitClaudeRuntime(ctx context.Context, out chan<- StreamEvent, result claud
 		"model":          result.Model,
 		"context_window": result.ContextWindow,
 	})
-	return sendEvent(ctx, out, StreamEvent{Type: "session.runtime", Raw: raw})
+	return sendEvent(ctx, out, StreamEvent{Type: backend.EventRuntime, Raw: raw})
 }
 
 // appTurn keeps rollout jsonl as the content plane while app-server supplies
@@ -442,78 +385,33 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan StreamEvent, 64)
-	go func() {
-		defer close(out)
-		started, _ := json.Marshal(map[string]any{"cwd": cwd, "fresh": fresh})
-		if !sendEvent(ctx, out, StreamEvent{Type: "subprocess.started", Raw: started}) {
-			return
-		}
-		if path == "" {
-			path = s.locateWait(ctx, id, s.t.confirm)
-		}
-		if path == "" {
-			emitError(ctx, out, "codex session log did not appear after prompt")
-			return
-		}
-		tailCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		events := tailTurn(tailCtx, path, offset, s.logger, s.tail)
-		lastKind := ""
-		for {
-			select {
-			case delta, ok := <-deltas:
-				if !ok {
-					deltas = nil
-					continue
-				}
-				if delta.Kind == "reasoning" && lastKind == "reasoning" {
-					continue // emit "thinking" once per reasoning stretch
-				}
-				lastKind = delta.Kind
-				if !emitLiveDelta(ctx, out, delta.Kind, delta.Text) {
-					return
-				}
-			case ev, ok := <-events:
-				if !ok {
-					// File completion is only a straggler backstop. Give the
-					// protocol event a grace period before finalizing without it.
-					select {
-					case result := <-done:
-						if result.Status == "failed" {
-							emitError(ctx, out, "codex turn failed")
-						}
-					case <-time.After(5 * time.Second):
-						s.logger.Warn("codex turn finalized from rollout backstop", "thread_id", id)
-					case <-ctx.Done():
-					}
-					return
-				}
-				if !sendEvent(ctx, out, ev) {
-					return
-				}
-			case result := <-done:
-				if result.Status == "failed" {
-					emitError(ctx, out, "codex turn failed")
-				}
-				drainTail(ctx, out, events, cancel, 5*time.Second, s.logger,
-					"codex rollout drain timed out", "thread_id", id)
-				return
-			case <-ctx.Done():
-				return
+	lastKind := ""
+	return mergeLoggedTurn(ctx, loggedTurnConfig[appserver.TurnResult, appserver.Delta]{
+		backend: "codex", idKey: "thread_id", id: id, cwd: cwd, fresh: fresh,
+		path: path, offset: offset, locate: func() string { return s.locateWait(ctx, id, s.t.confirm) },
+		drainWait: 5 * time.Second, tail: s.tail, done: done, deltas: deltas, logger: s.logger,
+		delta: func(d appserver.Delta) (string, string, bool) {
+			if d.Kind == "reasoning" && lastKind == "reasoning" {
+				return "", "", false
 			}
-		}
-	}()
-	return out, nil
+			lastKind = d.Kind
+			return d.Kind, d.Text, true
+		},
+		result: func(ctx context.Context, out chan<- StreamEvent, result appserver.TurnResult) {
+			if result.Status == "failed" {
+				emitError(ctx, out, "codex turn failed")
+			}
+		},
+	}), nil
 }
 
 func emitLiveDelta(ctx context.Context, out chan<- StreamEvent, kind, delta string) bool {
 	if delta == "" {
 		return true
 	}
-	typ, payload := "part.delta", map[string]string{"delta": delta}
+	typ, payload := backend.EventPartDelta, any(backend.PartDeltaPayload{Delta: delta})
 	if kind == "reasoning" {
-		typ, payload = "turn.status", map[string]string{"status": "thinking"}
+		typ, payload = backend.EventTurnStatus, backend.TurnStatusPayload{Status: "thinking"}
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -610,6 +508,6 @@ func sendEvent(ctx context.Context, ch chan<- StreamEvent, ev StreamEvent) bool 
 }
 
 func emitError(ctx context.Context, out chan<- StreamEvent, msg string) {
-	raw, _ := json.Marshal(map[string]string{"message": msg})
-	sendEvent(ctx, out, StreamEvent{Type: "error", Raw: raw})
+	raw, _ := json.Marshal(backend.ErrorPayload{Message: msg})
+	sendEvent(ctx, out, StreamEvent{Type: backend.EventError, Raw: raw})
 }

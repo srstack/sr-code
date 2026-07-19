@@ -55,7 +55,7 @@ When `--allowed-user-ids` is non-empty, an allowlisted user can mention the
 bot in any Lark group where the bot is present:
 
 ```text
-@bot [--cwd /path] [--model model-name] instruction
+@bot [--cwd /path] [--backend backend-name] [--model model-name] instruction
 ```
 
 The first mention creates a new usher session rooted at that Lark message.
@@ -75,7 +75,7 @@ the session attachment directory and passed to the agent by absolute path.
 Feishu does not allow downloading resources inside cards or merged-forward
 child messages, so those remain textual placeholders.
 
-`--cwd` and `--model` are accepted only on the creation mention. The default
+`--cwd`, `--backend`, and `--model` are accepted only on the creation mention. The default
 cwd is `--default-cwd` (default `/tmp`). An empty allowlist disables guest
 sessions entirely; the canonical mirror chat keeps its existing empty
 allowlist behavior.

@@ -35,7 +35,7 @@ import (
 // the plugin socket.
 type RouterAPI interface {
 	GetSession(id string) (core.Session, bool)
-	StartSession(cwd, initialMsg, model string) (string, error)
+	StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error)
 	SubscribeAllSessions() (<-chan broker.Event, func())
 	SendToSession(id, text string) error
 	UploadAttachment(id, filename string, src io.Reader) (string, error)
@@ -759,7 +759,7 @@ func (h *Hub) guestCreate(ctx context.Context, chat string, msg guestMeta, text 
 	// while StartSession sends this initial prompt as part of creating it.
 	// Keep resource placeholders in the prompt; attachment transfer is only a
 	// supported future path for later turns on an already-bound session.
-	cwd, model, instruction, err := parseGuestFlags(text, h.defaultCwd)
+	cwd, backendName, model, instruction, err := parseGuestFlags(text, h.defaultCwd)
 	if err != nil {
 		_, _ = h.lark.ReplyText(ctx, msg.id, "⚠️ "+err.Error())
 		return
@@ -777,7 +777,7 @@ func (h *Hub) guestCreate(ctx context.Context, chat string, msg guestMeta, text 
 	}
 	initial := buildGuestPrompt(transcript, instruction, truncated)
 	h.createMu.Lock()
-	sessionID, err := h.router.StartSession(cwd, initial, model)
+	sessionID, err := h.router.StartSessionWithBackend(backendName, cwd, initial, model)
 	if err == nil {
 		err = h.store.putGuest(sessionID, binding{
 			Root:   msg.id,
@@ -1471,38 +1471,40 @@ func buildGuestPrompt(transcript []guestLine, instruction string, truncated bool
 	return b.String()
 }
 
-// parseGuestFlags consumes leading --cwd/--model tokens; the rest is the
+// parseGuestFlags consumes leading --cwd/--backend/--model tokens; the rest is the
 // instruction, kept verbatim (newlines in pasted logs must survive).
-func parseGuestFlags(text, defaultCwd string) (cwd, model, instruction string, err error) {
+func parseGuestFlags(text, defaultCwd string) (cwd, backendName, model, instruction string, err error) {
 	cwd = defaultCwd
 	rest := strings.TrimSpace(text)
 	for strings.HasPrefix(rest, "--") {
 		var flag string
 		flag, rest = cutToken(rest)
 		switch flag {
-		case "--cwd", "--model":
+		case "--cwd", "--backend", "--model":
 			var val string
 			val, rest = cutToken(rest)
 			if val == "" || strings.HasPrefix(val, "--") {
-				return "", "", "", fmt.Errorf("%s requires a value", flag)
+				return "", "", "", "", fmt.Errorf("%s requires a value", flag)
 			}
 			if flag == "--cwd" {
 				cwd, err = expandGuestCwd(val)
 				if err != nil {
-					return "", "", "", err
+					return "", "", "", "", err
 				}
+			} else if flag == "--backend" {
+				backendName = val
 			} else {
 				model = val
 			}
 		default:
-			return "", "", "", fmt.Errorf("unknown flag %s", flag)
+			return "", "", "", "", fmt.Errorf("unknown flag %s", flag)
 		}
 	}
 	instruction = strings.TrimSpace(rest)
 	if instruction == "" {
-		return "", "", "", fmt.Errorf("instruction is required")
+		return "", "", "", "", fmt.Errorf("instruction is required")
 	}
-	return cwd, model, instruction, nil
+	return cwd, backendName, model, instruction, nil
 }
 
 // cutToken splits the first whitespace-delimited token off s.

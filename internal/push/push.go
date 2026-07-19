@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/hook"
 )
@@ -164,7 +165,7 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 			// subprocess.exit is the broker-level turn-end signal (the tailer
 			// emits it once the turn's turn_duration line lands).
-			if ev.Type == "subprocess.exit" {
+			if ev.Type == backend.EventProcessExit {
 				m.notifyTurnDone(ev.SessionID)
 			}
 		case p, ok := <-pendCh:

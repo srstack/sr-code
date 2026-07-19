@@ -99,12 +99,19 @@ func (c *Client) SendToSession(id, text string) error {
 
 // StartSession asks the router to spawn a brand-new session.
 func (c *Client) StartSession(cwd, initialMsg, model string) (string, error) {
+	return c.StartSessionWithBackend("", cwd, initialMsg, model)
+}
+
+// StartSessionWithBackend asks the router to spawn a session on an explicitly
+// selected backend. Empty backend preserves model inference/default behavior.
+func (c *Client) StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
 	var out struct {
 		ID string `json:"id"`
 	}
 	err := c.postJSON(ctx, "/v1/sessions", startSessionReq{
+		Backend:        backend,
 		Cwd:            cwd,
 		InitialMessage: initialMsg,
 		Model:          model,

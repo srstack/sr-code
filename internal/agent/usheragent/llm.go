@@ -406,6 +406,8 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 		var args struct {
 			Cwd            string `json:"cwd"`
 			InitialMessage string `json:"initial_message"`
+			Backend        string `json:"backend"`
+			Model          string `json:"model"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
 		}
 		if err := json.Unmarshal([]byte(repairJSONArgs(argsJSON)), &args); err != nil {
@@ -423,7 +425,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 				}
 				timeout = t
 			}
-			newID, text, err := a.api.CreateSession(ctx, args.Cwd, args.InitialMessage, timeout)
+			newID, text, err := a.api.CreateSessionWithBackend(ctx, args.Cwd, args.InitialMessage, args.Backend, args.Model, timeout)
 			if err != nil {
 				payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text, "error": err.Error()})
 				return string(payload), newID
@@ -431,7 +433,7 @@ func (a *LLMAgent) executeTool(ctx context.Context, name, argsJSON string, relay
 			payload, _ := json.Marshal(map[string]any{"session_id": newID, "response": text})
 			return string(payload), newID
 		}
-		newID, err := a.api.CreateSessionRelayed(args.Cwd, args.InitialMessage, relay)
+		newID, err := a.api.CreateSessionRelayedWithBackend(args.Cwd, args.InitialMessage, args.Backend, args.Model, relay)
 		if err != nil {
 			return errResult(err.Error()), ""
 		}
@@ -593,7 +595,7 @@ func defaultTools() []ChatTool {
 			Type: "function",
 			Function: ChatFunction{
 				Name: "list_sessions",
-				Description: `Refresh the full list of Claude Code sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at, archived, auto_approve for each.
+				Description: `Refresh the full list of coding-agent sessions discovered on this machine. Returns id, cwd, title, status, started_at, last_event_at, archived, auto_approve for each.
 
 USE FOR: questions you can't answer from <current_state> — exact timestamps, status that may have changed in the last few seconds.
 
@@ -708,16 +710,18 @@ DO NOT USE FOR: searching inside a session you already identified (use search_se
 			Type: "function",
 			Function: ChatFunction{
 				Name: "create_session",
-				Description: `Start a brand-new Claude Code session in cwd and send it an initial message. Returns {session_id, status} immediately; the session's first reply is automatically shown to the user in this chat, verbatim — do not wait for it or restate it. New id becomes focus.
+				Description: `Start a brand-new coding-agent session in cwd and send it an initial message. Returns {session_id, status} immediately; the session's first reply is automatically shown to the user in this chat, verbatim — do not wait for it or restate it. New id becomes focus.
 
 USE FOR: the user wants fresh context that doesn't fit any session in <current_state> — scratch experiments, a new project, isolated debugging.
 
-DO NOT USE FOR: routing into an existing session that matches the work — use send_to_session on that one. cwd must already exist; do not invent paths. /tmp is a safe default for ephemeral / scratch work when the user gives no hint.`,
+DO NOT USE FOR: routing into an existing session that matches the work — use send_to_session on that one. cwd must already exist; do not invent paths. /tmp is a safe default for ephemeral / scratch work when the user gives no hint. Leave backend and model empty unless the user requests one or the task needs a backend-specific capability.`,
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"cwd":             map[string]any{"type": "string", "description": "Working directory for the new session. Must exist."},
 						"initial_message": map[string]any{"type": "string", "description": "First message sent to the new session."},
+						"backend":         map[string]any{"type": "string", "description": "Optional backend name. Empty uses model inference or the configured default."},
+						"model":           map[string]any{"type": "string", "description": "Optional model from the selected backend's model catalog."},
 					},
 					"required":             []string{"cwd", "initial_message"},
 					"additionalProperties": false,

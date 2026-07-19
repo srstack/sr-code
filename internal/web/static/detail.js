@@ -111,18 +111,7 @@ export async function showNewSession(prefillCwd) {
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
             <div class="composer-tools">
-              <select id="new-model" class="composer-model" aria-label="model">
-                <optgroup label="Claude">
-                  <option value="opus" selected>Opus</option>
-                  <option value="claude-opus-4-6">Opus 4.6</option>
-                  <option value="sonnet">Sonnet</option>
-                  <option value="sonnet[1m]">Sonnet [1m]</option>
-                  <option value="haiku">Haiku</option>
-                  <option value="fable">Fable</option>
-                  <option value="opusplan">Opus Plan</option>
-                </optgroup>
-                <optgroup label="Codex" id="codex-modelgroup"></optgroup>
-              </select>
+              <select id="new-model" class="composer-model" aria-label="model"></select>
             </div>
             <div class="composer-send"><button id="send">send</button></div>
           </div>
@@ -153,7 +142,7 @@ export async function showNewSession(prefillCwd) {
   // keyed off the chosen option's optgroup so it tracks whichever group it's in.
   const syncModelColor = () => {
     const og = modelEl.selectedOptions[0] && modelEl.selectedOptions[0].closest('optgroup');
-    modelEl.classList.toggle('codex', !!og && og.label === 'Codex');
+    modelEl.classList.toggle('codex', !!og && og.dataset.backend === 'codex');
   };
   const applySavedModel = () => {
     try {
@@ -166,29 +155,25 @@ export async function showNewSession(prefillCwd) {
     syncModelColor();
     try { localStorage.setItem('usher.newModel', modelEl.value); } catch {/* private mode */}
   });
-  // Show only installed backends. Drop the Claude group if Claude isn't present
-  // (so the default lands on an available model), and populate Codex's group from
-  // its per-account catalog (or drop it if empty). The browser then selects the
-  // first remaining option as the default.
+  // Build every model group from its backend-owned catalog. The first model of
+  // the first enabled backend is the default when no saved choice exists.
   fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
     const backends = (data && data.backends) || ['claude'];
-    if (!backends.includes('claude')) {
-      const cg = modelEl.querySelector('optgroup[label="Claude"]');
-      if (cg) cg.remove();
-    }
-    const grp = document.getElementById('codex-modelgroup');
-    if (grp) {
-      const models = (data && data.codex) || [];
-      if (!models.length) {
-        grp.remove();
-      } else {
-        for (const m of models) {
-          const o = document.createElement('option');
-          o.value = m.value;
-          o.textContent = m.label;
-          grp.appendChild(o);
-        }
+    const catalogs = (data && data.models) || {};
+    modelEl.replaceChildren();
+    for (const name of backends) {
+      const models = catalogs[name] || [];
+      if (!models.length) continue;
+      const grp = document.createElement('optgroup');
+      grp.label = name.charAt(0).toUpperCase() + name.slice(1);
+      grp.dataset.backend = name;
+      for (const m of models) {
+        const o = document.createElement('option');
+        o.value = m.id;
+        o.textContent = m.display_name || m.id;
+        grp.appendChild(o);
       }
+      modelEl.appendChild(grp);
     }
     applySavedModel();
   }).catch(applySavedModel);
@@ -206,6 +191,7 @@ export async function showNewSession(prefillCwd) {
         body: JSON.stringify({
           cwd: cwdEl.value.trim(),
           initial_message: promptEl.value,
+          backend: modelEl.selectedOptions[0]?.closest('optgroup')?.dataset.backend || '',
           model: modelEl.value,
         }),
       });

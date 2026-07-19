@@ -68,7 +68,7 @@ type fakeAgentAPI struct {
 	autoApprove map[string]bool
 }
 type sendCall struct{ ID, Text string }
-type createCall struct{ Cwd, Msg string }
+type createCall struct{ Cwd, Msg, Backend, Model string }
 
 func newFakeAgentAPI() *fakeAgentAPI {
 	return &fakeAgentAPI{
@@ -179,8 +179,8 @@ func (f *fakeAgentAPI) SendToSessionAndWait(_ context.Context, id, text string, 
 	}
 	return "", nil
 }
-func (f *fakeAgentAPI) CreateSession(_ context.Context, cwd, msg string, _ time.Duration) (string, string, error) {
-	f.created = append(f.created, createCall{cwd, msg})
+func (f *fakeAgentAPI) CreateSessionWithBackend(_ context.Context, cwd, msg, backend, model string, _ time.Duration) (string, string, error) {
+	f.created = append(f.created, createCall{Cwd: cwd, Msg: msg, Backend: backend, Model: model})
 	if f.createErr != nil {
 		return f.createNewID, f.createReply, f.createErr
 	}
@@ -198,8 +198,8 @@ func (f *fakeAgentAPI) SendToSessionRelayed(id, text string, onDone func(session
 	return nil
 }
 
-func (f *fakeAgentAPI) CreateSessionRelayed(cwd, msg string, onDone func(sessionID, reply string, err error)) (string, error) {
-	f.created = append(f.created, createCall{cwd, msg})
+func (f *fakeAgentAPI) CreateSessionRelayedWithBackend(cwd, msg, backend, model string, onDone func(sessionID, reply string, err error)) (string, error) {
+	f.created = append(f.created, createCall{Cwd: cwd, Msg: msg, Backend: backend, Model: model})
 	if f.createErr != nil {
 		return "", f.createErr
 	}
@@ -536,7 +536,7 @@ func TestLLMAgent_CreateSession(t *testing.T) {
 	api.createReply = "Hi! I'm ready to help."
 
 	srv, _ := newMockChatServer(t, []ChatResponse{
-		chatToolCallResp("c", "create_session", `{"cwd":"/tmp","initial_message":"hello there"}`),
+		chatToolCallResp("c", "create_session", `{"cwd":"/tmp","initial_message":"hello there","backend":"codex","model":"gpt-5.5"}`),
 		chatTextResp("created session new-uuid (assistant said hi)"),
 	})
 	defer srv.Close()
@@ -548,6 +548,9 @@ func TestLLMAgent_CreateSession(t *testing.T) {
 	}
 	if len(api.created) != 1 || api.created[0].Cwd != "/tmp" || api.created[0].Msg != "hello there" {
 		t.Errorf("created = %+v", api.created)
+	}
+	if api.created[0].Backend != "codex" || api.created[0].Model != "gpt-5.5" {
+		t.Errorf("backend/model not forwarded: %+v", api.created[0])
 	}
 }
 

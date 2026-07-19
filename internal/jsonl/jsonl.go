@@ -61,22 +61,9 @@ func ParseLine(line []byte) (Event, error) {
 	return ev, nil
 }
 
-// SessionMeta is the lightweight descriptor of a session, suitable for listing.
-type SessionMeta struct {
-	ID          string
-	ParentID    string
-	IsSubagent  bool
-	AgentName   string
-	Cwd         string
-	Title       string // from ai-title events only
-	Prompt      string // truncated first user prompt (fallback when Title is empty)
-	StartedAt   time.Time
-	LastEventAt time.Time
-	// LastInputAt is the time of the last genuine user prompt (see
-	// core.Session.LastInputAt); skips tool_result lines and interrupt markers.
-	LastInputAt time.Time
-	Runtime     core.SessionRuntime
-}
+// Compatibility aliases keep parser callers source-compatible while the
+// backend-neutral transcript contract lives in core.
+type SessionMeta = core.SessionMeta
 
 // ReadSessionMeta scans the file at path and produces a SessionMeta. It walks
 // every line because cwd, title, and the first-prompt fallback can each appear
@@ -219,41 +206,8 @@ type toolInfo struct {
 	target string
 }
 
-// TurnPart is one segment within a grouped assistant turn.
-type TurnPart struct {
-	Type       string `json:"type"`                 // "text" | "tool"
-	Content    string `json:"content"`              // rendered markdown (text) or tool output
-	ToolName   string `json:"toolName,omitempty"`   // for type=="tool": Edit, Bash, Read, …
-	ToolTarget string `json:"toolTarget,omitempty"` // file path, command, or pattern
-
-	toolUseID string // internal: matches isMeta follow-ups to their tool part
-}
-
-// Turn is a grouped, display-ready timeline entry. User turns carry Content;
-// assistant turns carry Parts (text interleaved with tool calls/results), and
-// selected system lifecycle events are projected as lightweight system turns.
-type Turn struct {
-	Role    string     `json:"role"`              // "user" | "assistant" | "system"
-	Content string     `json:"content,omitempty"` // user turns only
-	Parts   []TurnPart `json:"parts,omitempty"`   // assistant turns only
-	Time    time.Time  `json:"ts"`
-	Model   string     `json:"model,omitempty"` // assistant turns: model id
-
-	// UUID is the uuid of the last jsonl event folded into an assistant
-	// turn — the fork point ForkCopy expects. User turns carry none.
-	UUID string `json:"uuid,omitempty"`
-
-	// EndTime is the timestamp of the last event folded into an assistant
-	// turn (Time is its first). Server-side only, for turn timing.
-	EndTime time.Time `json:"-"`
-}
-
-// Touch advances the server-side end timestamp when ts is usable.
-func (t *Turn) Touch(ts time.Time) {
-	if t != nil && !ts.IsZero() {
-		t.EndTime = ts
-	}
-}
+type TurnPart = core.TurnPart
+type Turn = core.Turn
 
 // IsTurnComplete reports Claude Code's persisted end-of-turn marker.
 func IsTurnComplete(raw []byte) bool {
@@ -330,7 +284,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		a.cur.Touch(ev.Timestamp)
 		if ev.SourceToolUseID != "" {
 			for i := len(a.cur.Parts) - 1; i >= 0; i-- {
-				if a.cur.Parts[i].Type == "tool" && a.cur.Parts[i].toolUseID == ev.SourceToolUseID {
+				if a.cur.Parts[i].Type == "tool" && a.cur.Parts[i].ToolUseID == ev.SourceToolUseID {
 					a.cur.Parts[i].Content += "\n" + text
 					return nil, &a.cur.Parts[i]
 				}
@@ -342,7 +296,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 			Content:    text,
 			ToolName:   ti.name,
 			ToolTarget: ti.target,
-			toolUseID:  ev.SourceToolUseID,
+			ToolUseID:  ev.SourceToolUseID,
 		}
 		a.cur.Parts = append(a.cur.Parts, p)
 		return nil, &p
@@ -389,7 +343,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		Content:    content,
 		ToolName:   ti.name,
 		ToolTarget: ti.target,
-		toolUseID:  tuID,
+		ToolUseID:  tuID,
 	}
 	a.cur.Parts = append(a.cur.Parts, p)
 	return nil, &p

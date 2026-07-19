@@ -202,6 +202,7 @@ type fakeRouter struct {
 }
 
 type startCall struct {
+	backend string
 	cwd     string
 	initial string
 	model   string
@@ -254,14 +255,14 @@ func (f *fakeRouter) UploadAttachment(id, filename string, src io.Reader) (strin
 	return path, nil
 }
 
-func (f *fakeRouter) StartSession(cwd, initialMsg, model string) (string, error) {
+func (f *fakeRouter) StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
 		return "", f.startErr
 	}
 	id := "guest_" + strconv.Itoa(len(f.started)+1)
-	f.started = append(f.started, startCall{cwd: cwd, initial: initialMsg, model: model})
+	f.started = append(f.started, startCall{backend: backend, cwd: cwd, initial: initialMsg, model: model})
 	f.sessions[id] = core.Session{ID: id, Cwd: cwd}
 	return id, nil
 }
@@ -534,31 +535,32 @@ func TestGuestDisabledOrUnauthorizedIgnored(t *testing.T) {
 func TestParseGuestFlags(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	cases := []struct {
-		text        string
-		cwd, model  string
-		instruction string
-		err         string
+		text                string
+		cwd, backend, model string
+		instruction         string
+		err                 string
 	}{
-		{"do it", "/tmp", "", "do it", ""},
-		{"--cwd /w do it", "/w", "", "do it", ""},
-		{"--model gpt-5 do it", "/tmp", "gpt-5", "do it", ""},
-		{"--cwd ~/proj --model sonnet do it", filepath.Join(home, "proj"), "sonnet", "do it", ""},
+		{"do it", "/tmp", "", "", "do it", ""},
+		{"--cwd /w do it", "/w", "", "", "do it", ""},
+		{"--model gpt-5 do it", "/tmp", "", "gpt-5", "do it", ""},
+		{"--backend codex --model gpt-5 do it", "/tmp", "codex", "gpt-5", "do it", ""},
+		{"--cwd ~/proj --model sonnet do it", filepath.Join(home, "proj"), "", "sonnet", "do it", ""},
 		// Multi-line instructions keep their formatting (pasted logs, code).
-		{"--cwd /w analyze this\nline2  spaced\n\tindented", "/w", "", "analyze this\nline2  spaced\n\tindented", ""},
-		{"--bad x", "", "", "", "unknown flag --bad"},
-		{"--cwd", "", "", "", "--cwd requires a value"},
-		{"--model m", "", "", "", "instruction is required"},
+		{"--cwd /w analyze this\nline2  spaced\n\tindented", "/w", "", "", "analyze this\nline2  spaced\n\tindented", ""},
+		{"--bad x", "", "", "", "", "unknown flag --bad"},
+		{"--cwd", "", "", "", "", "--cwd requires a value"},
+		{"--model m", "", "", "", "", "instruction is required"},
 	}
 	for _, c := range cases {
-		cwd, model, instruction, err := parseGuestFlags(c.text, "/tmp")
+		cwd, backendName, model, instruction, err := parseGuestFlags(c.text, "/tmp")
 		if c.err != "" {
 			if err == nil || err.Error() != c.err {
 				t.Errorf("parseGuestFlags(%q) err = %v, want %q", c.text, err, c.err)
 			}
 			continue
 		}
-		if err != nil || cwd != c.cwd || model != c.model || instruction != c.instruction {
-			t.Errorf("parseGuestFlags(%q) = %q %q %q %v", c.text, cwd, model, instruction, err)
+		if err != nil || cwd != c.cwd || backendName != c.backend || model != c.model || instruction != c.instruction {
+			t.Errorf("parseGuestFlags(%q) = %q %q %q %q %v", c.text, cwd, backendName, model, instruction, err)
 		}
 	}
 }
@@ -567,12 +569,12 @@ func TestGuestFreshMessageCreate(t *testing.T) {
 	f, r := &fakeLark{}, newFakeRouter()
 	h := newTestHub(t, f, r, testUser)
 
-	h.HandleMessage(context.Background(), guestMentionMessage("oc_foreign", testUser, "", "", "", "@_user_1 build it", 2000, true))
+	h.HandleMessage(context.Background(), guestMentionMessage("oc_foreign", testUser, "", "", "", "@_user_1 --backend codex --model gpt-5.5 build it", 2000, true))
 
 	if len(r.started) != 1 {
 		t.Fatalf("started = %+v", r.started)
 	}
-	if got := r.started[0]; got.cwd != "/tmp" || got.initial != "build it" || got.model != "" {
+	if got := r.started[0]; got.backend != "codex" || got.cwd != "/tmp" || got.initial != "build it" || got.model != "gpt-5.5" {
 		t.Fatalf("start call = %+v", got)
 	}
 	if b, ok := h.store.guestBinding("guest_1"); !ok || b.Root == "" || b.WMTime != 2000 || b.WMID != b.Root || !b.Guest || b.Chat != "oc_foreign" {

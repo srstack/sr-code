@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/transcript"
 )
 
 // The assistant text lives in Parts, not Content — the pre-fix mapping dropped
@@ -39,7 +40,7 @@ func TestFlattenTurnText(t *testing.T) {
 // text ("hi") must survive parsing, where mapping Turn.Content alone lost it.
 func TestFlattenRecoversAssistantTextFromLog(t *testing.T) {
 	path := writeTemp(t, "claude.jsonl", claudeLog)
-	turns, _, err := readTurnsForBackend(path, "claude", 0)
+	turns, _, err := (transcript.Claude{}).ReadTurns(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

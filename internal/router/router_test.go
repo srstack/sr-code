@@ -11,10 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/sender"
+	"github.com/nexustar/usher/internal/transcript"
 )
 
 // TestPublishStreamDerivesCodexTurns proves the live path: fed Codex rollout
@@ -26,7 +28,7 @@ func TestPublishStreamDerivesCodexTurns(t *testing.T) {
 	sub, unsub := b.Subscribe("s1")
 	defer unsub()
 
-	asm := newStreamAssembler("codex")
+	asm := transcript.Codex{}.NewAssembler()
 	lines := []string{
 		`{"timestamp":"2026-06-14T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello codex"}}`,
 		`{"timestamp":"2026-06-14T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"hi there"}}`,
@@ -84,7 +86,7 @@ func TestReadTurnsForBackend(t *testing.T) {
 	codexPath := writeTemp(t, "rollout.jsonl", codexLog)
 	claudePath := writeTemp(t, "claude.jsonl", claudeLog)
 
-	turns, _, err := readTurnsForBackend(codexPath, "codex", 0)
+	turns, _, err := (transcript.Codex{}).ReadTurns(codexPath, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,18 +95,18 @@ func TestReadTurnsForBackend(t *testing.T) {
 	}
 	// The Claude parser must not understand a Codex rollout (event_msg lines are
 	// not user/assistant) — proving the dispatch matters.
-	if wrong, _, _ := readTurnsForBackend(codexPath, "claude", 0); len(wrong) != 0 {
+	if wrong, _, _ := (transcript.Claude{}).ReadTurns(codexPath, 0); len(wrong) != 0 {
 		t.Errorf("claude parser should yield nothing from a codex log; got %+v", wrong)
 	}
 
-	turns, _, err = readTurnsForBackend(claudePath, "claude", 0)
+	turns, _, err = (transcript.Claude{}).ReadTurns(claudePath, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(turns) == 0 || turns[0].Content != "hello claude" {
 		t.Fatalf("claude parser: got %+v", turns)
 	}
-	if wrong, _, _ := readTurnsForBackend(claudePath, "codex", 0); len(wrong) != 0 {
+	if wrong, _, _ := (transcript.Codex{}).ReadTurns(claudePath, 0); len(wrong) != 0 {
 		t.Errorf("codex parser should yield nothing from a claude log; got %+v", wrong)
 	}
 }
@@ -136,20 +138,114 @@ func TestBackendForModel(t *testing.T) {
 
 func TestSenderForBackendFallsBackToDefault(t *testing.T) {
 	r := &Router{
-		senders:        map[string]*sender.Sender{"claude": nil},
+		backends:       map[string]backend.Backend{"claude": {Transcript: transcript.Claude{}}},
 		defaultBackend: "claude",
 	}
 	// An unregistered backend falls back to the default (here the claude entry).
-	if _, ok := r.senders["codex"]; ok {
+	if _, ok := r.backends["codex"]; ok {
 		t.Fatal("precondition: codex should be unregistered")
 	}
 	// senderForBackend returns the default entry for an unknown backend; we only
 	// assert it does not panic and returns the same (nil) default value.
-	if got := r.senderForBackend("codex"); got != r.senders["claude"] {
+	if got := r.senderForBackend("codex"); got != r.backends["claude"].Runtime {
 		t.Errorf("unknown backend did not fall back to default")
 	}
-	if got := r.senderForBackend("claude"); got != r.senders["claude"] {
+	if got := r.senderForBackend("claude"); got != r.backends["claude"].Runtime {
 		t.Errorf("registered backend not returned")
+	}
+}
+
+type staticModels struct {
+	models []backend.Model
+}
+
+func (s staticModels) Models(context.Context) ([]backend.Model, error) {
+	return s.models, nil
+}
+
+func (s staticModels) ValidateModel(_ context.Context, model string) error {
+	for _, candidate := range s.models {
+		if candidate.ID == model {
+			return nil
+		}
+	}
+	return errors.New("unknown model")
+}
+
+func (staticModels) DefaultEffort(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func TestTranscriptForBackendReturnsCapabilityError(t *testing.T) {
+	r := &Router{backends: map[string]backend.Backend{
+		"incomplete": {},
+	}}
+
+	if _, err := r.transcriptForBackend("incomplete"); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("transcriptForBackend error = %v, want ErrBackendUnavailable", err)
+	}
+	if _, err := r.transcriptForBackend("missing"); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("unknown backend error = %v, want ErrBackendUnavailable", err)
+	}
+}
+
+func TestValidateModelFailsClosed(t *testing.T) {
+	r := &Router{backends: map[string]backend.Backend{
+		"catalogued":   {Models: staticModels{models: []backend.Model{{ID: "known"}}}},
+		"uncatalogued": {},
+	}}
+
+	tests := []struct {
+		name        string
+		backendName string
+		model       string
+		wantErr     bool
+	}{
+		{name: "known model", backendName: "catalogued", model: "known"},
+		{name: "cli default", backendName: "catalogued", model: "default"},
+		{name: "empty means cli default", backendName: "uncatalogued"},
+		{name: "unknown model", backendName: "catalogued", model: "unknown", wantErr: true},
+		{name: "missing catalog", backendName: "uncatalogued", model: "anything", wantErr: true},
+		{name: "missing backend explicit model", backendName: "missing", model: "anything", wantErr: true},
+		{name: "missing backend default", backendName: "missing", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := r.ValidateModel(context.Background(), tt.backendName, tt.model)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateModel(%q, %q) error = %v, wantErr %v", tt.backendName, tt.model, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestResolveCreateBackend(t *testing.T) {
+	r := &Router{
+		defaultBackend: "claude",
+		backends: map[string]backend.Backend{
+			"claude": {Models: staticModels{models: []backend.Model{{ID: "sonnet"}}}},
+			"codex":  {Models: staticModels{models: []backend.Model{{ID: "gpt-5.5"}}}},
+		},
+	}
+
+	tests := []struct {
+		name, backendName, model, want string
+		wantErr                        bool
+	}{
+		{name: "both omitted", want: "claude"},
+		{name: "model inference", model: "gpt-5.5", want: "codex"},
+		{name: "explicit backend default model", backendName: "codex", want: "codex"},
+		{name: "explicit matching pair", backendName: "claude", model: "sonnet", want: "claude"},
+		{name: "explicit mismatch", backendName: "claude", model: "gpt-5.5", wantErr: true},
+		{name: "unknown backend", backendName: "pi", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := r.resolveCreateBackend(context.Background(), tt.backendName, tt.model)
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("resolveCreateBackend(%q, %q) = %q, %v; want %q, wantErr %v", tt.backendName, tt.model, got, err, tt.want, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -351,11 +447,13 @@ func newQueueTestRouter(t *testing.T) *Router {
 		t.Fatal(err)
 	}
 	r := &Router{
-		discovery:  d,
-		broker:     broker.New(),
-		activeSend: map[string]*sendToken{},
-		sendQueue:  map[string][]pendingSend{},
-		creating:   map[string]core.Session{},
+		discovery:      d,
+		backends:       map[string]backend.Backend{"claude": {Transcript: transcript.Claude{}}},
+		defaultBackend: "claude",
+		broker:         broker.New(),
+		activeSend:     map[string]*sendToken{},
+		sendQueue:      map[string][]pendingSend{},
+		creating:       map[string]core.Session{},
 	}
 	r.runTurn = func(_ context.Context, sessionID, prompt, _ string, tok *sendToken) {
 		r.broker.Publish(partEvent(sessionID, "assistant", "text", "re: "+prompt))

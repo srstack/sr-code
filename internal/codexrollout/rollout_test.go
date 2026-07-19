@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/core"
 )
 
 const toolFixture = "testdata/rollout-tool.jsonl"
@@ -171,7 +171,7 @@ func TestAssemblerModelFromTurnContext(t *testing.T) {
 
 func TestAssemblerTurnEndTime(t *testing.T) {
 	asm := NewAssembler()
-	var done []jsonl.Turn
+	var done []core.Turn
 	for _, ln := range []string{
 		`{"timestamp":"2026-06-15T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}`,
 		`{"timestamp":"2026-06-15T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":\"ls\"}"}}`,
@@ -197,7 +197,7 @@ func TestAssemblerTurnEndTime(t *testing.T) {
 // anchor) and EndTime and flushes the turn — not just task_complete.
 func TestAssemblerTurnCompleteV2Rename(t *testing.T) {
 	asm := NewAssembler()
-	var done []jsonl.Turn
+	var done []core.Turn
 	for _, ln := range []string{
 		`{"timestamp":"2026-06-15T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}`,
 		`{"timestamp":"2026-06-15T00:00:05Z","type":"event_msg","payload":{"type":"turn_complete","turn_id":"t9"}}`,

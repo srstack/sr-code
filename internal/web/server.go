@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +34,7 @@ import (
 	"github.com/nexustar/usher/internal/agent/usheragent"
 	"github.com/nexustar/usher/internal/attachment"
 	"github.com/nexustar/usher/internal/auth"
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/jsonl"
@@ -74,10 +74,6 @@ type Server struct {
 	agent          usheragent.Agent
 	push           *push.Manager
 	logger         *slog.Logger
-	// codexModelsPath is ~/.codex/models_cache.json (codex's per-account model
-	// catalog). "" when codex isn't enabled. Read per request so a plan change
-	// (cache refetch) shows up without restarting usher.
-	codexModelsPath string
 	// editorURL is the --editor-url template for the "Open in editor" entry
 	// in the session actions menu; "" hides the entry.
 	editorURL string
@@ -105,7 +101,6 @@ func NewServer(
 	main *mainchat.Store,
 	agent usheragent.Agent,
 	pushMgr *push.Manager,
-	codexModelsPath string,
 	editorURL string,
 	uiDir string,
 	logger *slog.Logger,
@@ -114,141 +109,40 @@ func NewServer(
 		logger = slog.Default()
 	}
 	return &Server{
-		addr:            addr,
-		hookSockPath:    hookSockPath,
-		attachmentsDir:  attachmentsDir,
-		auth:            authStore,
-		router:          r,
-		main:            main,
-		agent:           agent,
-		push:            pushMgr,
-		logger:          logger,
-		codexModelsPath: codexModelsPath,
-		editorURL:       editorURL,
-		uiDir:           uiDir,
-		chatSubs:        map[string]map[chan chatFrame]func(){},
-		chatQueues:      map[string]chan mainchat.Message{},
-		chatPending:     map[string]int{},
+		addr:           addr,
+		hookSockPath:   hookSockPath,
+		attachmentsDir: attachmentsDir,
+		auth:           authStore,
+		router:         r,
+		main:           main,
+		agent:          agent,
+		push:           pushMgr,
+		logger:         logger,
+		editorURL:      editorURL,
+		uiDir:          uiDir,
+		chatSubs:       map[string]map[chan chatFrame]func(){},
+		chatQueues:     map[string]chan mainchat.Message{},
+		chatPending:    map[string]int{},
 	}
 }
 
-// modelOption is one entry for the new-session model picker.
-type modelOption struct {
-	Value string `json:"value"`
-	Label string `json:"label"`
-}
-
-// codexModels returns the user-selectable Codex models from codex's own
-// per-account catalog (models_cache.json) — so the picker matches whatever the
-// account's plan (free/Plus/Pro) actually offers, with no hardcoded list.
-// Empty when codex isn't enabled or the cache is unreadable. Ordered as codex's
-// own picker (lowest priority number first).
-func (s *Server) codexModels() []modelOption {
-	if s.codexModelsPath == "" {
-		return nil // codex backend not enabled
-	}
-	out := s.codexCatalog()
-	if len(out) == 0 {
-		// Codex is enabled but its catalog is missing/unreadable (cache not yet
-		// written, deleted, …). Fall back to the current named models so a session
-		// can still be created; codex retires old models slowly, so these stay
-		// valid well past any new release, and a present cache supersedes them.
-		return []modelOption{
-			{Value: "gpt-5.5", Label: "GPT-5.5"},
-			{Value: "gpt-5.4-mini", Label: "GPT-5.4 Mini"},
-		}
-	}
-	return out
-}
-
-// codexCatalog reads codex's per-account model catalog (models_cache.json),
-// returning the user-listable models ordered as codex's own picker. Empty when
-// the cache is unreadable or has no listable models.
-func (s *Server) codexCatalog() []modelOption {
-	raw, err := os.ReadFile(s.codexModelsPath)
-	if err != nil {
-		return nil
-	}
-	var doc struct {
-		Models []struct {
-			Slug        string `json:"slug"`
-			DisplayName string `json:"display_name"`
-			Visibility  string `json:"visibility"`
-			Priority    int    `json:"priority"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil
-	}
-	picks := doc.Models[:0:0]
-	for _, m := range doc.Models {
-		if m.Visibility == "list" && m.Slug != "" { // "hide" = internal (e.g. auto-review)
-			picks = append(picks, m)
-		}
-	}
-	// Lower priority number = higher up in codex's own picker.
-	sort.SliceStable(picks, func(i, j int) bool { return picks[i].Priority < picks[j].Priority })
-	out := make([]modelOption, 0, len(picks))
-	for _, m := range picks {
-		label := m.DisplayName
-		if label == "" {
-			label = m.Slug
-		}
-		out = append(out, modelOption{Value: m.Slug, Label: label})
-	}
-	return out
-}
-
-// codexDefaultEffort resolves an omitted turn_context.effort the same way
-// Codex core does: fall back to the selected model's default_reasoning_level.
-// Search every catalog entry, including hidden models that may own an existing
-// session even though they are absent from the new-session picker.
-func (s *Server) codexDefaultEffort(slug string) string {
-	if slug == "" || s.codexModelsPath == "" {
-		return ""
-	}
-	raw, err := os.ReadFile(s.codexModelsPath)
-	if err != nil {
-		return ""
-	}
-	var doc struct {
-		Models []struct {
-			Slug                  string `json:"slug"`
-			DefaultReasoningLevel string `json:"default_reasoning_level"`
-		} `json:"models"`
-	}
-	if json.Unmarshal(raw, &doc) != nil {
-		return ""
-	}
-	for _, m := range doc.Models {
-		if m.Slug == slug {
-			return m.DefaultReasoningLevel
-		}
-	}
-	return ""
-}
-
-// handleModels feeds the new-session model picker: which backends are installed
-// (so it drops an unavailable one) and Codex's per-account model catalog (Claude's
-// list is static in the page markup).
+// handleModels feeds the new-session picker from each backend's model catalog.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, struct {
-		Backends []string      `json:"backends"`
-		Codex    []modelOption `json:"codex"`
-	}{
-		Backends: s.router.Backends(),
-		Codex:    s.codexModels(),
-	})
-}
-
-// codexModelAllowed reports whether slug is in the account's Codex catalog.
-func (s *Server) codexModelAllowed(slug string) bool {
-	for _, m := range s.codexModels() {
-		if m.Value == slug {
-			return true
+	backends := s.router.Backends()
+	models := make(map[string][]backend.Model, len(backends))
+	for _, name := range backends {
+		catalog, err := s.router.Models(r.Context(), name)
+		if err == nil {
+			models[name] = catalog
 		}
 	}
-	return false
+	writeJSON(w, http.StatusOK, struct {
+		Backends []string                   `json:"backends"`
+		Models   map[string][]backend.Model `json:"models"`
+	}{
+		Backends: backends,
+		Models:   models,
+	})
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -559,27 +453,8 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 type createSessionRequest struct {
 	Cwd            string `json:"cwd"`
 	InitialMessage string `json:"initial_message"`
+	Backend        string `json:"backend"`
 	Model          string `json:"model"`
-}
-
-// allowedModels gates the --model the create form may request, keeping
-// arbitrary values out of the spawned claude command. The keys mirror the
-// dropdown in app.js; "" and "default" both mean "no --model flag" (claude's
-// own default). Resumes are unaffected — they keep their original model.
-var allowedModels = map[string]bool{
-	"": true, "default": true,
-	"opus": true, "sonnet": true, "haiku": true,
-	"opusplan": true,
-	// sonnet[1m] is meaningful: plain sonnet defaults to 200K, the suffix opts
-	// into Sonnet's 1M context. No opus[1m] — Opus is already natively 1M, so
-	// the suffix is a no-op there.
-	"sonnet[1m]": true,
-	"fable":      true,
-	// Version-pinned full ID (no short alias; plain "opus" resolves to 4.8).
-	"claude-opus-4-6": true,
-	// Codex models are NOT listed here — they're validated per request against
-	// the account's live catalog (see codexModelAllowed), so the picker supports
-	// whatever the plan offers without a hardcoded list.
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -588,23 +463,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	// Codex models are validated against the account's live catalog (no hardcoded
-	// list — supports whatever the plan offers); Claude models against the static
-	// allowlist.
-	if router.BackendForModel(req.Model) == "codex" {
-		if !s.codexModelAllowed(req.Model) {
-			writeErr(w, http.StatusBadRequest, "invalid model: "+req.Model)
-			return
-		}
-	} else if !allowedModels[req.Model] {
-		writeErr(w, http.StatusBadRequest, "invalid model: "+req.Model)
-		return
-	}
 	model := req.Model
 	if model == "default" {
 		model = ""
 	}
-	id, err := s.router.StartSession(req.Cwd, req.InitialMessage, model)
+	id, err := s.router.StartSessionWithBackend(req.Backend, req.Cwd, req.InitialMessage, model)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -625,8 +488,8 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	if sess.Backend == "codex" && sess.Runtime.Effort == "" {
-		sess.Runtime.Effort = s.codexDefaultEffort(sess.Runtime.Model)
+	if sess.Runtime.Effort == "" {
+		sess.Runtime.Effort = s.router.DefaultEffort(r.Context(), sess.Backend, sess.Runtime.Model)
 	}
 	writeJSON(w, http.StatusOK, sessionDTO{
 		Session:           sess,
@@ -934,14 +797,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 // the raw lines — thinking blocks, usage stats, file-history snapshots —
 // would only burn mobile bandwidth.
 var sseForward = map[string]bool{
-	"subprocess.started": true,
-	"subprocess.exit":    true,
-	"error":              true,
-	"part":               true,
-	"part.delta":         true,
-	"turn.status":        true,
-	"turn.user":          true,
-	"session.runtime":    true,
+	backend.EventProcessStarted: true,
+	backend.EventProcessExit:    true,
+	backend.EventError:          true,
+	backend.EventPart:           true,
+	backend.EventPartDelta:      true,
+	backend.EventTurnStatus:     true,
+	backend.EventTurnUser:       true,
+	backend.EventRuntime:        true,
 }
 
 // sseStart asserts streaming support and writes the SSE preamble (headers +

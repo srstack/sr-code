@@ -17,12 +17,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/nexustar/usher/internal/agent/usheragent"
+	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/router"
-	"github.com/nexustar/usher/internal/sender"
 	"github.com/nexustar/usher/internal/sessionmeta"
 )
 
@@ -69,9 +69,9 @@ func newChatTestServer(t *testing.T, agent usheragent.Agent) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := router.New(d, map[string]*sender.Sender{}, "claude", broker.New(),
+	r := router.New(d, map[string]backend.Backend{}, "claude", broker.New(),
 		hook.New(filepath.Join(dir, "auto.json")), sessionmeta.New(filepath.Join(dir, "sessions.json"), 0), nil)
-	return NewServer("", "", "", nil, r, store, agent, nil, "", "", "", slog.Default())
+	return NewServer("", "", "", nil, r, store, agent, nil, "", "", slog.Default())
 }
 
 func chatMux(s *Server) *http.ServeMux {

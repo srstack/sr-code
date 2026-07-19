@@ -34,7 +34,7 @@ import (
 // list so a (re)connecting plugin can catch up on prompts it missed.
 type RouterAPI interface {
 	GetSession(id string) (core.Session, bool)
-	StartSession(cwd, initialMsg, model string) (string, error)
+	StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error)
 	SubscribeAllSessions() (<-chan broker.Event, func())
 	SendToSession(id, text string) error
 	ListPendingInteractions() []hook.Pending
@@ -132,6 +132,7 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 }
 
 type startSessionReq struct {
+	Backend        string `json:"backend,omitempty"`
 	Cwd            string `json:"cwd"`
 	InitialMessage string `json:"initial_message"`
 	Model          string `json:"model"`
@@ -143,7 +144,7 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
 		return
 	}
-	id, err := s.router.StartSession(req.Cwd, req.InitialMessage, req.Model)
+	id, err := s.router.StartSessionWithBackend(req.Backend, req.Cwd, req.InitialMessage, req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
