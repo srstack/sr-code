@@ -256,7 +256,7 @@ func (c *Client) dispatch(m rpcMessage) {
 		return
 	}
 	if len(m.ID) > 0 && m.Method != "" {
-		go c.approval(m)
+		go c.handleServerRequest(m)
 		return
 	}
 	if m.Method == "turn/started" {
@@ -311,6 +311,126 @@ func (c *Client) dispatch(m rpcMessage) {
 	}
 }
 
+func (c *Client) handleServerRequest(m rpcMessage) {
+	switch m.Method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+		"execCommandApproval", "applyPatchApproval":
+		c.approval(m)
+	case "item/permissions/requestApproval":
+		c.permissionsApproval(m)
+	case "mcpServer/elicitation/request":
+		c.mcpElicitation(m)
+	case "item/tool/requestUserInput":
+		c.replyError(m.ID, -32000, "request_user_input is not supported by this usher client")
+	case "item/tool/call":
+		c.replyError(m.ID, -32000, "dynamic client tools are not supported by this usher client")
+	case "currentTime/read":
+		c.replyResult(m.ID, map[string]any{"currentTimeAt": time.Now().Unix()})
+	case "account/chatgptAuthTokens/refresh":
+		c.replyError(m.ID, -32000, "ChatGPT token refresh is not supported by this usher client")
+	case "attestation/generate":
+		c.replyError(m.ID, -32000, "client attestation is not supported by this usher client")
+	default:
+		c.logger.Warn("rejecting unknown app-server request", "method", m.Method)
+		c.replyError(m.ID, -32601, "unsupported app-server request: "+m.Method)
+	}
+}
+
+// mcpElicitation handles confirmation forms; forms requiring input are declined.
+func (c *Client) mcpElicitation(m rpcMessage) {
+	var p struct {
+		ThreadID        string `json:"threadId"`
+		ServerName      string `json:"serverName"`
+		Mode            string `json:"mode"`
+		RequestedSchema struct {
+			Required []string `json:"required"`
+		} `json:"requestedSchema"`
+	}
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		c.replyError(m.ID, -32602, "invalid MCP elicitation parameters")
+		return
+	}
+
+	c.mu.Lock()
+	h := c.hooks
+	cwd := c.threads[p.ThreadID]
+	c.mu.Unlock()
+
+	action := "decline"
+	var content any
+	confirmation := (p.Mode == "form" || p.Mode == "openai/form") && len(p.RequestedSchema.Required) == 0
+	if confirmation && h != nil {
+		tool := "MCP"
+		if p.ServerName != "" {
+			tool += ": " + p.ServerName
+		}
+		r, err := h.Submit(context.Background(), hook.Event{
+			SessionID: p.ThreadID,
+			Event:     "PermissionRequest",
+			ToolName:  tool,
+			ToolInput: json.RawMessage(m.Params),
+			Cwd:       cwd,
+		})
+		if err == nil && r.Behavior == "allow" {
+			action = "accept"
+			content = map[string]any{}
+		}
+	}
+	c.replyResult(m.ID, map[string]any{"action": action, "content": content})
+}
+
+func (c *Client) replyResult(id json.RawMessage, result any) {
+	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+func (c *Client) replyError(id json.RawMessage, code int, message string) {
+	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}})
+}
+
+// permissionsApproval returns a granted profile rather than a decision field.
+func (c *Client) permissionsApproval(m rpcMessage) {
+	var p struct {
+		ThreadID    string          `json:"threadId"`
+		Cwd         string          `json:"cwd"`
+		Permissions json.RawMessage `json:"permissions"`
+	}
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		c.replyError(m.ID, -32602, "invalid permissions approval parameters")
+		return
+	}
+
+	c.mu.Lock()
+	h := c.hooks
+	if p.Cwd == "" {
+		p.Cwd = c.threads[p.ThreadID]
+	}
+	c.mu.Unlock()
+
+	result := map[string]any{"permissions": map[string]any{}}
+	if h != nil {
+		r, err := h.Submit(context.Background(), hook.Event{
+			SessionID:   p.ThreadID,
+			Event:       "PermissionRequest",
+			ToolName:    "Permissions",
+			ToolInput:   json.RawMessage(m.Params),
+			Cwd:         p.Cwd,
+			AllowAlways: true,
+		})
+		if err == nil && r.Behavior == "allow" {
+			var granted map[string]any
+			if json.Unmarshal(p.Permissions, &granted) == nil && granted != nil {
+				result["permissions"] = granted
+			}
+			if r.Scope == "session" {
+				result["scope"] = "session"
+			} else {
+				result["scope"] = "turn"
+			}
+		}
+	}
+	c.replyResult(m.ID, result)
+}
+
 func (c *Client) approval(m rpcMessage) {
 	var p map[string]json.RawMessage
 	_ = json.Unmarshal(m.Params, &p)
@@ -329,14 +449,11 @@ func (c *Client) approval(m rpcMessage) {
 	}
 	c.mu.Unlock()
 	input := json.RawMessage(m.Params)
-	if tool == "Bash" {
+	if tool == "Bash" && command != "" {
 		input, _ = json.Marshal(map[string]any{"command": command})
 	}
 	decision := "decline"
-	known := m.Method == "item/commandExecution/requestApproval" ||
-		m.Method == "item/fileChange/requestApproval" ||
-		m.Method == "execCommandApproval" || m.Method == "applyPatchApproval"
-	if known && h != nil {
+	if h != nil {
 		allowAlways := supportsAllowAlways(m.Method, p["availableDecisions"])
 		if r, err := h.Submit(context.Background(), hook.Event{SessionID: sid, Event: "PermissionRequest", ToolName: tool, ToolInput: input, Cwd: cwd, AllowAlways: allowAlways}); err == nil && r.Behavior == "allow" {
 			if r.Scope == "session" && allowAlways {
@@ -356,10 +473,7 @@ func (c *Client) approval(m rpcMessage) {
 			decision = "denied"
 		}
 	}
-	if !known {
-		c.logger.Warn("declining unknown app-server request", "method", m.Method)
-	}
-	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(m.ID), "result": map[string]any{"decision": decision}})
+	c.replyResult(m.ID, map[string]any{"decision": decision})
 }
 
 func supportsAllowAlways(method string, availableDecisions json.RawMessage) bool {

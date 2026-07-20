@@ -155,11 +155,15 @@ function renderInteractions() {
   }
   setPendingPermissionCounts(counts);
 
-  // Show this session's permissions beside its composer, one at a time.
-  document.getElementById('session-permission')?.remove();
+  // Preserve an unchanged node so polling does not reset its scroll position.
   const here = permissions.filter(p => p.session_id === currentDetailId);
   const composer = document.querySelector('.send-anchor > .composer');
-  if (here.length && composer) {
+  const existing = document.getElementById('session-permission');
+  const shownID = existing?.querySelector('.interaction')?.dataset.id;
+  if (!here.length || !composer) {
+    existing?.remove();
+  } else if (shownID !== here[0].id) {
+    existing?.remove();
     const bar = document.createElement('div');
     bar.id = 'session-permission';
     bar.className = 'session-permission';
@@ -180,6 +184,9 @@ function renderInteractions() {
     modal.id = 'modal';
     document.body.appendChild(modal);
   }
+  const askKey = asks.map(p => p.id).join(',');
+  if (modal.dataset.interactions === askKey) return;
+  modal.dataset.interactions = askKey;
   const items = asks.map(p => {
     const sid = (p.session_id || '').slice(0, 8) || '(unknown)';
     return renderAskQuestion(p, sid);

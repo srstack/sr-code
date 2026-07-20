@@ -29,6 +29,23 @@ window.marked.use({
   silent: true,
   renderer: {
     html(token) { return esc(typeof token === 'string' ? token : token.text); },
+    image(token) {
+      const href = String(token.href || '');
+      const alt = String(token.text || '');
+      const title = token.title ? ' title="' + esc(String(token.title)) + '"' : '';
+      // A relative/absolute filesystem path in a session transcript is served
+      // through the same authenticated, contained endpoint as show_image.
+      // URLs and hash references retain normal Markdown behavior.
+      const external = /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(href);
+      if (currentDetailId && href && !external) {
+        const src = '/api/sessions/' + encodeURIComponent(currentDetailId) +
+          '/image?path=' + encodeURIComponent(href);
+        return '<span class="markdown-image"><a href="' + esc(src) +
+          '" target="_blank" rel="noopener"><img loading="lazy" decoding="async" alt="' +
+          esc(alt) + '" src="' + esc(src) + '"' + title + '></a></span>';
+      }
+      return '<img src="' + esc(href) + '" alt="' + esc(alt) + '"' + title + '>';
+    },
   },
 });
 
@@ -260,7 +277,7 @@ export function backendMark(backend) {
   return `<svg class="backend-mark backend-mark--${b}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${BACKEND_MARKS[b]}</svg>`;
 }
 
-// ---------- show_image lightbox ----------
+// ---------- inline image lightbox ----------
 // Click an inline image to view it full-size in an overlay. The <a href> stays
 // as the fallback: ctrl/cmd/shift-click (and no-JS) opens it in a new tab.
 function openLightbox(src) {
@@ -277,7 +294,7 @@ function openLightbox(src) {
 }
 
 document.addEventListener('click', (e) => {
-  const a = e.target.closest('.tool-image a');
+  const a = e.target.closest('.tool-image a, .markdown-image a');
   if (!a) return;
   if (e.metaKey || e.ctrlKey || e.shiftKey) return; // let the new-tab default win
   e.preventDefault();

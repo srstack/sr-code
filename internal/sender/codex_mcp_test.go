@@ -13,7 +13,10 @@ func TestCodexMCPConfigUsesNativeValues(t *testing.T) {
 	if args, ok := cfg["mcp_servers.usher.args"].([]string); !ok || len(args) != 1 || args[0] != "mcp-stdio" {
 		t.Fatalf("args must be a native string array: %#v", cfg["mcp_servers.usher.args"])
 	}
-	direct, ok := cfg["code_mode.direct_only_tool_namespaces"].([]string)
+	if cfg["mcp_servers.usher.default_tools_approval_mode"] != "approve" {
+		t.Fatalf("usher MCP tools must be pre-approved: %#v", cfg["mcp_servers.usher.default_tools_approval_mode"])
+	}
+	direct, ok := cfg["features.code_mode.direct_only_tool_namespaces"].([]string)
 	if !ok || len(direct) != 2 || direct[0] != "mcp__usher" || direct[1] != "usher" {
 		t.Fatalf("usher namespace must bypass deferred loading: %#v", direct)
 	}

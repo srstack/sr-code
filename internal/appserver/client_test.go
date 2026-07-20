@@ -1,6 +1,7 @@
 package appserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -13,12 +14,17 @@ import (
 	"github.com/nexustar/usher/internal/hook"
 )
 
+type testWriteCloser struct{ bytes.Buffer }
+
+func (*testWriteCloser) Close() error { return nil }
+
 func TestThreadParamsCarryPolicySandboxAndNativeMCP(t *testing.T) {
 	c := New("codex", hook.New(""), map[string]any{"sandbox": "workspace-write"}, map[string]any{
-		"mcp_servers.usher.command":             "/usr/bin/usher",
-		"mcp_servers.usher.args":                []string{"mcp-stdio"},
-		"mcp_servers.usher.env_vars":            []string{"USHER_HOOK_SOCK"},
-		"code_mode.direct_only_tool_namespaces": []string{"usher"},
+		"mcp_servers.usher.command":                      "/usr/bin/usher",
+		"mcp_servers.usher.args":                         []string{"mcp-stdio"},
+		"mcp_servers.usher.env_vars":                     []string{"USHER_HOOK_SOCK"},
+		"mcp_servers.usher.default_tools_approval_mode":  "approve",
+		"features.code_mode.direct_only_tool_namespaces": []string{"usher"},
 	}, nil, nil)
 	p := c.threadParams("/work/project", "gpt-test")
 	if p["approvalPolicy"] != "on-request" || p["sandbox"] != "workspace-write" || p["cwd"] != "/work/project" {
@@ -28,11 +34,14 @@ func TestThreadParamsCarryPolicySandboxAndNativeMCP(t *testing.T) {
 	if cfg["mcp_servers.usher.cwd"] != "/work/project" || cfg["model"] != "gpt-test" {
 		t.Fatalf("missing per-thread config: %#v", cfg)
 	}
+	if cfg["mcp_servers.usher.default_tools_approval_mode"] != "approve" {
+		t.Fatalf("usher MCP approval mode was dropped: %#v", cfg)
+	}
 	args, ok := cfg["mcp_servers.usher.args"].([]string)
 	if !ok || len(args) != 1 || args[0] != "mcp-stdio" {
 		t.Fatalf("MCP args are not a native array: %#v", cfg["mcp_servers.usher.args"])
 	}
-	direct, ok := cfg["code_mode.direct_only_tool_namespaces"].([]string)
+	direct, ok := cfg["features.code_mode.direct_only_tool_namespaces"].([]string)
 	if !ok || len(direct) != 1 || direct[0] != "usher" {
 		t.Fatalf("usher namespace must be direct: %#v", direct)
 	}
@@ -142,5 +151,109 @@ func TestSupportsAllowAlways(t *testing.T) {
 	}
 	if supportsAllowAlways("item/commandExecution/requestApproval", json.RawMessage(`["accept","decline"]`)) {
 		t.Fatal("modern request without acceptForSession exposed allow always")
+	}
+}
+
+func TestPermissionsApprovalUsesPermissionProfileResponse(t *testing.T) {
+	hooks := hook.New("")
+	hooks.SetAutoApprove("thread-1", true)
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	c.permissionsApproval(rpcMessage{
+		ID:     json.RawMessage(`7`),
+		Method: "item/permissions/requestApproval",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","cwd":"/work","startedAtMs":1,"permissions":{"fileSystem":{"read":["/outside/image.png"]}}}`),
+	})
+
+	var response struct {
+		Result struct {
+			Permissions map[string]any `json:"permissions"`
+			Scope       string         `json:"scope"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Result.Scope != "turn" || response.Result.Permissions["fileSystem"] == nil {
+		t.Fatalf("unexpected permissions response: %s", out.Bytes())
+	}
+}
+
+func TestPermissionsApprovalDenialReturnsEmptyProfile(t *testing.T) {
+	out := new(testWriteCloser)
+	c := New("unused", nil, nil, nil, nil, nil)
+	c.in = out
+	c.permissionsApproval(rpcMessage{
+		ID:     json.RawMessage(`8`),
+		Method: "item/permissions/requestApproval",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","cwd":"/work","startedAtMs":1,"permissions":{"network":{"enabled":true}}}`),
+	})
+
+	var response struct {
+		Result struct {
+			Permissions map[string]any `json:"permissions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Result.Permissions) != 0 {
+		t.Fatalf("denial granted permissions: %s", out.Bytes())
+	}
+}
+
+func TestNewServerRequestsUseTheirOwnResponseShapes(t *testing.T) {
+	tests := []struct {
+		method string
+		want   string
+	}{
+		{"mcpServer/elicitation/request", `"action":"decline"`},
+		{"currentTime/read", `"currentTimeAt":`},
+		{"item/tool/requestUserInput", `"error":`},
+		{"unknown/newRequest", `"code":-32601`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			out := new(testWriteCloser)
+			c := New("unused", nil, nil, nil, nil, nil)
+			c.in = out
+			c.handleServerRequest(rpcMessage{ID: json.RawMessage(`9`), Method: tt.method, Params: json.RawMessage(`{}`)})
+			if !strings.Contains(out.String(), tt.want) {
+				t.Fatalf("response = %s, want %s", out.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestMcpConfirmationElicitationUsesPermissionDecision(t *testing.T) {
+	hooks := hook.New("")
+	hooks.SetAutoApprove("thread-1", true)
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	c.mcpElicitation(rpcMessage{
+		ID:     json.RawMessage(`10`),
+		Method: "mcpServer/elicitation/request",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","serverName":"other","mode":"form","message":"Allow this tool?","requestedSchema":{"type":"object","properties":{}}}`),
+	})
+	if !strings.Contains(out.String(), `"action":"accept"`) || !strings.Contains(out.String(), `"content":{}`) {
+		t.Fatalf("response = %s", out.String())
+	}
+}
+
+func TestMcpInputFormIsNotAcceptedWithoutAnswers(t *testing.T) {
+	hooks := hook.New("")
+	hooks.SetAutoApprove("thread-1", true)
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	c.mcpElicitation(rpcMessage{
+		ID:     json.RawMessage(`11`),
+		Method: "mcpServer/elicitation/request",
+		Params: json.RawMessage(`{"threadId":"thread-1","serverName":"other","mode":"form","message":"Enter a value","requestedSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}}}}`),
+	})
+	if !strings.Contains(out.String(), `"action":"decline"`) || !strings.Contains(out.String(), `"content":null`) {
+		t.Fatalf("response = %s", out.String())
 	}
 }

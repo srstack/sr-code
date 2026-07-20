@@ -671,10 +671,10 @@ td.cwd { font-size: 0.82rem; }
 .content li { margin: 0.15rem 0; }
 .content a { color: var(--accent); text-decoration: underline; }
 
-/* show_image inline image: fit the column, cap height, click to open full size. */
-.tool-image { margin: 0.5rem 0; }
-.tool-image a { display: inline-block; line-height: 0; text-decoration: none; }
-.tool-image img {
+/* Tool and local-Markdown images: fit the column and open full size on click. */
+.tool-image, .markdown-image { display: block; margin: 0.5rem 0; }
+.tool-image a, .markdown-image a { display: inline-block; line-height: 0; text-decoration: none; }
+.tool-image img, .markdown-image img {
   max-width: 100%;
   max-height: 480px;
   width: auto;
