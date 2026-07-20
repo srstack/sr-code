@@ -306,7 +306,8 @@ func serve(args []string) error {
 		}
 	}()
 
-	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, *editorURL, *uiDir, logger)
+	themePath := filepath.Join(*dataDir, "theme.css")
+	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, *editorURL, *uiDir, themePath, logger)
 
 	// Foreign-turn watcher: turns usher didn't start (background workflow
 	// continuations, pane-typed prompts) get relayed to the chats that

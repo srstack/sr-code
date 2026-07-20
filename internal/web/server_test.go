@@ -4,11 +4,52 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestHandleTheme(t *testing.T) {
+	t.Run("configured file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "custom.css")
+		if err := os.WriteFile(path, []byte(":root { --accent: red; }\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := &Server{themePath: path, logger: slog.Default()}
+		rec := httptest.NewRecorder()
+		s.handleTheme(rec, httptest.NewRequest(http.MethodGet, "/theme.css", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "text/css; charset=utf-8" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Errorf("Cache-Control = %q", got)
+		}
+		if got := rec.Body.String(); got != ":root { --accent: red; }\n" {
+			t.Errorf("body = %q", got)
+		}
+	})
+
+	t.Run("missing file is empty CSS", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		(&Server{}).handleTheme(rec, httptest.NewRequest(http.MethodGet, "/theme.css", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("body = %q, want empty", rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "text/css; charset=utf-8" {
+			t.Errorf("Content-Type = %q", got)
+		}
+	})
+}
 
 func TestTerminalControlsAreAllowListed(t *testing.T) {
 	want := map[string]string{

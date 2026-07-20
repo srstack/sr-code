@@ -78,6 +78,7 @@ type Server struct {
 	// in the session actions menu; "" hides the entry.
 	editorURL string
 	uiDir     string
+	themePath string
 
 	// Main-chat delivery. The user message is persisted in the POST handler
 	// (202 means durable); the agent turn then runs on the chat's single
@@ -103,6 +104,7 @@ func NewServer(
 	pushMgr *push.Manager,
 	editorURL string,
 	uiDir string,
+	themePath string,
 	logger *slog.Logger,
 ) *Server {
 	if logger == nil {
@@ -120,6 +122,7 @@ func NewServer(
 		logger:         logger,
 		editorURL:      editorURL,
 		uiDir:          uiDir,
+		themePath:      themePath,
 		chatSubs:       map[string]map[chan chatFrame]func(){},
 		chatQueues:     map[string]chan mainchat.Message{},
 		chatPending:    map[string]int{},
@@ -192,6 +195,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/interactions/{id}/respond", s.handleRespondInteraction)
 
 	webMux.HandleFunc("GET /api/config", s.handleConfig)
+	webMux.HandleFunc("GET /theme.css", s.handleTheme)
 
 	webMux.HandleFunc("GET /api/push/vapid-key", s.handlePushVAPIDKey)
 	webMux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
@@ -263,6 +267,31 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		return err
 	}
+}
+
+// handleTheme serves the operator-supplied CSS outside the embedded static
+// filesystem. Opening it per request lets edits take effect on page refresh.
+func (s *Server) handleTheme(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	f, err := os.Open(s.themePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || s.themePath == "" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		s.logger.Error("open theme", "path", s.themePath, "err", err)
+		http.Error(w, "theme unavailable", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		s.logger.Error("stat theme", "path", s.themePath, "err", err)
+		http.Error(w, "theme unavailable", http.StatusInternalServerError)
+		return
+	}
+	http.ServeContent(w, r, "theme.css", info.ModTime(), f)
 }
 
 // --- auth middleware + handlers -----------------------------------------
