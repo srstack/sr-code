@@ -1137,9 +1137,9 @@ pre.raw-markdown {
   align-items: center;
   gap: 0.75rem;
   margin-top: 0.4rem;
-  /* Indent so "cwd" lines up roughly with the model text inside the composer
-   * below: composer-bar pad (0.4) + composer-model pad (0.3) ≈ 0.7rem. */
-  padding-left: 0.7rem;
+  /* Indent so "cwd" lines up roughly with the backend text inside the composer
+   * below: composer-bar pad (0.4) + segment pad (0.55) ≈ 0.95rem. */
+  padding-left: 0.95rem;
 }
 /* Secondary controls — ghost style (no border/fill) so they recede beside the
  * accent send button. State shows via text color: muted off, amber when
@@ -1473,25 +1473,40 @@ pre.raw-markdown {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
-/* Model picker — ghost like the session toggles (no border/fill, Claude coral).
+/* Backend/model pickers — a row of ghost buttons split by a short divider,
+ * matching the form's other ghost controls (cwd field, session toggles).
+ * Labels are centered and the backend segment reserves the width of the
+ * longest backend name, so switching backends never moves the divider or the
+ * model text. The model segment stays auto-width: it only borders empty space
+ * on the right, so its length changes push nothing around.
  * Font stays 1rem: a <select> triggers iOS focus-zoom below 16px (unlike the
  * <button> toggles). appearance:none drops the native arrow — no caret at all;
- * the coral text carries the affordance. */
-.composer-model {
+ * the backend-colored text carries the affordance. */
+.composer-model-pickers { display: inline-flex; align-items: center; }
+.composer-picker {
   appearance: none;
   -webkit-appearance: none;
   border: none;
   background: transparent;
-  color: var(--claude);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 1rem;
-  padding: 0.25rem 0.3rem;
+  text-align: center;
+  padding: 0.3rem 0.55rem;
   border-radius: 4px;
   cursor: pointer;
+  /* Both segments wear the backend color (like the sidebar backend marks);
+   * JS mirrors the choice onto the wrapper's data-backend. */
+  color: var(--claude);
 }
-.composer-model.codex { color: var(--codex); }
-.composer-model:hover { background: var(--bg-subtle); }
-.composer-model:focus { outline: none; }
+.composer-model-pickers[data-backend="codex"] .composer-picker { color: var(--codex); }
+.composer-model-pickers[data-backend="pi"] .composer-picker { color: var(--pi); }
+.composer-backend { min-width: 5rem; /* fits "Claude", the longest backend */ }
+.picker-divider { width: 1px; height: 1.05em; background: var(--border); }
+/* Translucent gray tint: reads against the white composer in light mode and
+ * still lifts the segment in dark, with no per-scheme override. */
+.composer-picker:hover { background: rgba(110, 118, 129, 0.12); }
+.composer-picker:focus { outline: none; }
+.composer-picker:focus-visible { box-shadow: 0 0 0 2px var(--accent-border); }
 .new-cwd-field input {
   width: 18rem;
   max-width: 100%;  font-size: 1rem;

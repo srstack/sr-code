@@ -111,7 +111,11 @@ export async function showNewSession(prefillCwd) {
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
             <div class="composer-tools">
-              <select id="new-model" class="composer-model" aria-label="model"></select>
+              <div class="composer-model-pickers">
+                <select id="new-backend" class="composer-picker composer-backend" aria-label="backend"></select>
+                <span class="picker-divider" aria-hidden="true"></span>
+                <select id="new-model" class="composer-picker composer-model" aria-label="model"></select>
+              </div>
             </div>
             <div class="composer-send"><button id="send">send</button></div>
           </div>
@@ -124,6 +128,7 @@ export async function showNewSession(prefillCwd) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cwdEl = document.getElementById('new-cwd');
+  const backendEl = document.getElementById('new-backend');
   const modelEl = document.getElementById('new-model');
   const errEl = document.getElementById('new-session-err');
   // Prefilled from a sidebar cwd "+": cwd is known, so drop the cursor in the
@@ -135,51 +140,60 @@ export async function showNewSession(prefillCwd) {
     cwdEl.focus();
   }
 
-  // Restore the last-picked model (the <select> defaults to Opus in markup; an
-  // unknown stored value just leaves that default). Run AFTER codex models load
-  // so a saved codex pick can be restored once its option exists.
-  // Tint the picker by the selected model's backend (Claude coral / Codex green),
-  // keyed off the chosen option's optgroup so it tracks whichever group it's in.
-  const syncModelColor = () => {
-    const og = modelEl.selectedOptions[0] && modelEl.selectedOptions[0].closest('optgroup');
-    modelEl.classList.toggle('codex', !!og && og.dataset.backend === 'codex');
-  };
-  const applySavedModel = () => {
+  let modelCatalogs = {};
+  const renderModels = () => {
+    const backend = backendEl.value;
+    const models = modelCatalogs[backend] || [];
+    const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
+    modelEl.replaceChildren(...choices.map(m => {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.display_name || m.id;
+      return o;
+    }));
     try {
-      const saved = localStorage.getItem('usher.newModel');
-      if (saved && [...modelEl.options].some(o => o.value === saved)) modelEl.value = saved;
-    } catch {/* private mode → keep default */}
-    syncModelColor();
+      const key = 'usher.newModel.' + backend;
+      const saved = localStorage.getItem(key);
+      if (saved && [...modelEl.options].some(o => o.value === saved)) {
+        modelEl.value = saved;
+      }
+    } catch {/* private mode → keep first model */}
+    backendEl.parentElement.dataset.backend = backend || 'claude';
   };
-  modelEl.addEventListener('change', () => {
-    syncModelColor();
-    try { localStorage.setItem('usher.newModel', modelEl.value); } catch {/* private mode */}
+  backendEl.addEventListener('change', () => {
+    try { localStorage.setItem('usher.newBackend', backendEl.value); } catch {/* private mode */}
+    renderModels();
   });
-  // Build every model group from its backend-owned catalog. The first model of
-  // the first enabled backend is the default when no saved choice exists.
+  modelEl.addEventListener('change', () => {
+    try { localStorage.setItem('usher.newModel.' + backendEl.value, modelEl.value); } catch {/* private mode */}
+  });
+
+  // Build the backend picker once, then show only that backend's models.
   fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
     const backends = (data && data.backends) || ['claude'];
-    const catalogs = (data && data.models) || {};
-    modelEl.replaceChildren();
+    modelCatalogs = (data && data.models) || {};
+    backendEl.replaceChildren();
     for (const name of backends) {
-      const models = catalogs[name] || [];
-      const grp = document.createElement('optgroup');
-      grp.label = name.charAt(0).toUpperCase() + name.slice(1);
-      grp.dataset.backend = name;
-      // Keep an enabled backend selectable even when its account-aware model
-      // lookup temporarily fails. The CLI's own default remains a valid and
-      // useful fallback, and hiding the whole backend makes diagnosis opaque.
-      const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
-      for (const m of choices) {
-        const o = document.createElement('option');
-        o.value = m.id;
-        o.textContent = m.display_name || m.id;
-        grp.appendChild(o);
-      }
-      modelEl.appendChild(grp);
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+      backendEl.appendChild(o);
     }
-    applySavedModel();
-  }).catch(applySavedModel);
+    try {
+      const savedBackend = localStorage.getItem('usher.newBackend');
+      if (savedBackend && backends.includes(savedBackend)) {
+        backendEl.value = savedBackend;
+      }
+    } catch {/* private mode → keep first backend */}
+    renderModels();
+  }).catch(() => {
+    modelCatalogs = {};
+    const o = document.createElement('option');
+    o.value = 'claude';
+    o.textContent = 'Claude';
+    backendEl.replaceChildren(o);
+    renderModels();
+  });
 
   const submit = async () => {
     if (sendBtn.disabled) return; // re-entrancy guard during in-flight submit
@@ -194,7 +208,7 @@ export async function showNewSession(prefillCwd) {
         body: JSON.stringify({
           cwd: cwdEl.value.trim(),
           initial_message: promptEl.value,
-          backend: modelEl.selectedOptions[0]?.closest('optgroup')?.dataset.backend || '',
+          backend: backendEl.value,
           model: modelEl.value,
         }),
       });
