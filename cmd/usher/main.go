@@ -209,8 +209,9 @@ func serve(args []string) error {
 				extra = append(extra, "--extension", extensionPath)
 			}
 		}
-		piRuntime := piagent.NewRuntime(*piCmd, dir, extra, *maxLiveSessions, h, logger)
-		backends["pi"] = backend.Backend{Runtime: piRuntime, Transcript: piagent.Transcript{}, Forker: piRuntime, Models: piagent.Models{Bin: *piCmd, SessionsDir: dir, Extra: extra}}
+		piModels := piagent.Models{Path: filepath.Join(*dataDir, "pi-models.json")}
+		piRuntime := piagent.NewRuntime(*piCmd, dir, extra, *maxLiveSessions, piModels, h, logger)
+		backends["pi"] = backend.Backend{Runtime: piRuntime, Transcript: piagent.Transcript{}, Forker: piRuntime, Models: piModels}
 		if defaultBackend == "" {
 			defaultBackend = "pi"
 		}

@@ -182,28 +182,17 @@ func (c *client) send(v map[string]any) error {
 	return err
 }
 
-// Models queries pi's account-aware registry through an ephemeral RPC process.
+// Models reads the last account-aware catalog captured from a real pi worker.
 // IDs include the provider because model ids are not globally unique in pi.
 type Models struct {
-	Bin         string
-	SessionsDir string
-	Extra       []string
+	Path string
 }
 
-func (m Models) list(ctx context.Context) ([]backend.Model, error) {
-	bin := m.Bin
-	if bin == "" {
-		bin = "pi"
-	}
-	c, err := startClient(bin, ".", "", m.SessionsDir, "", append(append([]string(nil), m.Extra...), "--no-session"))
-	if err != nil {
-		return nil, err
-	}
-	defer c.stop()
-	data, err := c.request(ctx, "get_available_models", nil)
-	if err != nil {
-		return nil, err
-	}
+type modelsDocument struct {
+	Models []backend.Model `json:"models"`
+}
+
+func modelsFromRPC(data json.RawMessage) ([]backend.Model, error) {
 	var payload struct {
 		Models []struct {
 			ID, Name, Provider string
@@ -230,12 +219,76 @@ func (m Models) list(ctx context.Context) ([]backend.Model, error) {
 	}
 	return out, nil
 }
-func (m Models) Models(ctx context.Context) ([]backend.Model, error) { return m.list(ctx) }
+
+func (m Models) Models(context.Context) ([]backend.Model, error) {
+	raw, err := os.ReadFile(m.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var doc modelsDocument
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	return doc.Models, nil
+}
+
+func (m Models) refresh(ctx context.Context, c *client) error {
+	data, err := c.request(ctx, "get_available_models", nil)
+	if err != nil {
+		return err
+	}
+	models, err := modelsFromRPC(data)
+	if err != nil {
+		return err
+	}
+	return m.write(models)
+}
+
+func (m Models) write(models []backend.Model) error {
+	if err := os.MkdirAll(filepath.Dir(m.Path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(m.Path), ".pi-models-*.json")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(modelsDocument{Models: models}); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.Path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
+
 func (m Models) ValidateModel(ctx context.Context, id string) error {
 	if id == "" {
 		return nil
 	}
-	models, err := m.list(ctx)
+	models, err := m.Models(ctx)
 	if err != nil {
 		return err
 	}
@@ -271,20 +324,30 @@ type Runtime struct {
 	bin, sessionsDir string
 	extra            []string
 	max              int
+	models           Models
 	logger           *slog.Logger
 	hooks            *hook.Manager
 	mu               sync.Mutex
 	workers          map[string]*worker
 }
 
-func NewRuntime(bin, sessionsDir string, extra []string, max int, hooks *hook.Manager, logger *slog.Logger) *Runtime {
+func NewRuntime(bin, sessionsDir string, extra []string, max int, models Models, hooks *hook.Manager, logger *slog.Logger) *Runtime {
 	if max <= 0 {
 		max = 8
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Runtime{bin: bin, sessionsDir: sessionsDir, extra: append([]string(nil), extra...), max: max, hooks: hooks, logger: logger, workers: map[string]*worker{}}
+	return &Runtime{bin: bin, sessionsDir: sessionsDir, extra: append([]string(nil), extra...), max: max, models: models, hooks: hooks, logger: logger, workers: map[string]*worker{}}
+}
+
+func (r *Runtime) refreshModels(ctx context.Context, c *client) {
+	if r.models.Path == "" {
+		return
+	}
+	if err := r.models.refresh(ctx, c); err != nil {
+		r.logger.Debug("pi model catalog refresh failed", "err", err)
+	}
 }
 
 type extensionUIRequest struct {
@@ -377,6 +440,7 @@ func (r *Runtime) Start(ctx context.Context, req backend.StartRequest) (string, 
 		c.stop()
 		return "", nil, errors.New("pi get_state returned no session id")
 	}
+	r.refreshModels(ctx, c)
 	w := &worker{c: c, cwd: req.Cwd, path: state.SessionFile, last: time.Now()}
 	if err := r.add(state.SessionID, w); err != nil {
 		c.stop()
@@ -408,6 +472,7 @@ func (r *Runtime) Send(ctx context.Context, id, prompt, cwd string) (<-chan back
 		if err != nil {
 			return nil, err
 		}
+		r.refreshModels(ctx, c)
 		w = &worker{c: c, cwd: cwd, path: path, last: time.Now()}
 		if err = r.add(id, w); err != nil {
 			c.stop()
