@@ -299,7 +299,12 @@ function openKebabPopover(btn) {
     ? `<button type="button" class="kebab-item" data-action="subagents" data-id="${esc(id)}">${
         subagentExpanded.has(id) ? 'Hide' : 'Show'} subagents</button>`
     : '';
+  // Let standalone PWAs reload from the detail menu.
+  const reloadItem = btn.classList.contains('subtitle-menu')
+    ? `<button type="button" class="kebab-item" data-action="reload" data-id="${esc(id)}">Reload</button>`
+    : '';
   kebabPopover.innerHTML =
+    reloadItem +
     editorItem +
     subItem +
     `<button type="button" class="kebab-item" data-action="rename" data-id="${esc(id)}">Rename</button>` +
@@ -480,6 +485,10 @@ if (settingsBtn && settingsMenu) {
 
 async function handleKebabAction(action, id) {
   closeKebabPopover();
+  if (action === 'reload') {
+    location.reload();
+    return;
+  }
   if (action === 'subagents') {
     if (subagentExpanded.has(id)) subagentExpanded.delete(id);
     else subagentExpanded.add(id);
