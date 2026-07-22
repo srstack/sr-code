@@ -263,12 +263,12 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		return fmt.Errorf("refusing unexpected session id %q", s.ID)
 	}
 	messages, err := queryRows(ctx, rt.Cmd(),
-		"SELECT id, data FROM message WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC")
+		"SELECT id, data FROM message WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC LIMIT 100000")
 	if err != nil {
 		return err
 	}
 	partRows, err := queryRows(ctx, rt.Cmd(),
-		"SELECT message_id, data FROM part WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC")
+		"SELECT message_id, data FROM part WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC LIMIT 100000")
 	if err != nil {
 		return err
 	}
