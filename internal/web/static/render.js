@@ -212,16 +212,6 @@ export function renderToolPart(p) {
   }
   const expandByDefault = /^(Edit|Write)$/i.test(name);
   const openAttr = expandByDefault ? ' open' : '';
-  // Empty content = the call is still running (a placeholder card that the
-  // result replaces in place). Show a subtle running hint as the body.
-  const bodyHtml = p.content
-    ? `<div class="tool-body" data-raw="${esc(p.content)}">${renderMarkdown(p.content)}</div>`
-    : `<div class="tool-body tool-running"><span class="tool-running-dot"></span>running…</div>`;
-  return `<details class="tool-details${p.content ? '' : ' running'}"${openAttr}>` +
-    `<summary>${label}</summary>` +
-    bodyHtml +
-    `</details>`;
-}
   // Inline SVG, not a text glyph (⧉ renders as tofu on fonts without coverage).
   const copyIcon =
     '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
