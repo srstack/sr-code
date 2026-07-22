@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -117,20 +118,25 @@ type sessionEntry struct {
 }
 
 func syncOnce(ctx context.Context, rt *Runtime, logger *slog.Logger) {
-	out, err := exec.CommandContext(ctx, rt.Cmd(), "session", "list", "--format", "json", "-n", "200").Output()
+	// `opencode session list` only covers a slice of projects (observed: a
+	// few directories' worth); the session table is global. Query it directly
+	// so sessions from every project show up, not just recent ones.
+	rows, err := queryRows(ctx, rt.Cmd(),
+		"SELECT id, title, directory, time_created, time_updated FROM session WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT 500")
 	if err != nil {
-		logger.Warn("opencode sync: session list failed", "err", err)
+		logger.Warn("opencode sync: session query failed", "err", err)
 		return
 	}
-	var sessions []sessionEntry
-	if err := json.Unmarshal(out, &sessions); err != nil {
-		logger.Warn("opencode sync: session list parse failed", "err", err)
-		return
-	}
-	for _, s := range sessions {
+	for _, row := range rows {
 		if ctx.Err() != nil {
 			return
 		}
+		if len(row) < 5 {
+			continue
+		}
+		s := sessionEntry{ID: row[0], Title: row[1], Directory: row[2]}
+		s.Created, _ = strconv.ParseInt(row[3], 10, 64)
+		s.Updated, _ = strconv.ParseInt(row[4], 10, 64)
 		if s.ID == "" || s.Directory == "" {
 			continue
 		}
@@ -186,25 +192,21 @@ func failedSyncStore(id string, updated int64) {
 // keeps a malformed id out of the query string.
 var sessionIDPattern = regexp.MustCompile(`^ses_[A-Za-z0-9]+$`)
 
-// queryRows runs `opencode db <sql> --format tsv` and returns the rows as
-// [key, payload] pairs. TSV has a header line and tab-separated columns; the
-// payload column is single-line JSON (newlines/tabs stay escaped), so a naive
+// queryRows runs `opencode db <sql> --format tsv` and returns the rows with
+// all columns. TSV has a header line and tab-separated columns; JSON payload
+// columns are single-line blobs (newlines/tabs stay escaped), so a naive
 // split is safe.
-func queryRows(ctx context.Context, cmd, sql string) ([][2]string, error) {
+func queryRows(ctx context.Context, cmd, sql string) ([][]string, error) {
 	out, err := exec.CommandContext(ctx, cmd, "db", sql, "--format", "tsv").Output()
 	if err != nil {
 		return nil, err
 	}
-	var rows [][2]string
+	var rows [][]string
 	for i, line := range strings.Split(string(out), "\n") {
 		if line == "" || i == 0 {
 			continue // header / trailing blank
 		}
-		key, payload, ok := strings.Cut(line, "\t")
-		if !ok {
-			continue
-		}
-		rows = append(rows, [2]string{key, payload})
+		rows = append(rows, strings.Split(line, "\t"))
 	}
 	return rows, nil
 }
