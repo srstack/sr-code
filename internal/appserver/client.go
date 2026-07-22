@@ -637,10 +637,16 @@ func (c *Client) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan 
 }
 
 func (c *Client) ResumeThread(ctx context.Context, id, cwd string) error {
+	return c.ResumeThreadWithModel(ctx, id, cwd, "")
+}
+
+// ResumeThreadWithModel resumes the thread with a per-turn model override;
+// the app-server applies it as thread config for subsequent turns.
+func (c *Client) ResumeThreadWithModel(ctx context.Context, id, cwd, model string) error {
 	if err := c.ensure(ctx); err != nil {
 		return err
 	}
-	params := c.threadParams(cwd, "")
+	params := c.threadParams(cwd, model)
 	params["threadId"] = id
 	if err := c.call(ctx, "thread/resume", params, nil); err != nil {
 		return err

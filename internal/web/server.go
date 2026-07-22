@@ -658,7 +658,8 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 }
 
 type sendRequest struct {
-	Text string `json:"text"`
+	Text  string `json:"text"`
+	Model string `json:"model"`
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -672,7 +673,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "text is required")
 		return
 	}
-	if err := s.router.SendToSession(id, req.Text); err != nil {
+	model := req.Model
+	if model == "default" {
+		model = ""
+	}
+	if err := s.router.SendToSessionWithModel(id, req.Text, model); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}

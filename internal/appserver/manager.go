@@ -16,6 +16,7 @@ type worker struct {
 	err      error
 	busy     bool
 	lastUsed time.Time
+	model    string
 }
 
 // Manager owns one app-server worker per live root Codex session.
@@ -106,10 +107,21 @@ func (m *Manager) StartThread(ctx context.Context, cwd, model string) (string, e
 	return id, nil
 }
 
-func (m *Manager) getOrResume(ctx context.Context, id, cwd string) (*worker, error) {
+func (m *Manager) getOrResume(ctx context.Context, id, cwd, model string) (*worker, error) {
 	for {
 		m.mu.Lock()
 		if w := m.workers[id]; w != nil {
+			// A model override that differs from the thread's current model
+			// recreates the worker: codex binds the model at resume time.
+			if model != "" && w.model != "" && model != w.model {
+				delete(m.workers, id)
+				m.mu.Unlock()
+				w.client.Shutdown()
+				continue
+			}
+			if model != "" {
+				w.model = model
+			}
 			ready := w.ready
 			if ready == nil {
 				w.lastUsed = time.Now()
@@ -134,7 +146,7 @@ func (m *Manager) getOrResume(ctx context.Context, id, cwd string) (*worker, err
 			victim.Shutdown()
 		}
 		ready := make(chan struct{})
-		w := &worker{client: m.newClient(), ready: ready, lastUsed: time.Now()}
+		w := &worker{client: m.newClient(), ready: ready, lastUsed: time.Now(), model: model}
 		m.mu.Lock()
 		m.starting--
 		if existing := m.workers[id]; existing != nil {
@@ -145,7 +157,7 @@ func (m *Manager) getOrResume(ctx context.Context, id, cwd string) (*worker, err
 		m.workers[id] = w
 		m.mu.Unlock()
 
-		err = w.client.ResumeThread(ctx, id, cwd)
+		err = w.client.ResumeThreadWithModel(ctx, id, cwd, w.model)
 		m.mu.Lock()
 		owned := m.workers[id] == w
 		if !owned && err == nil {
@@ -167,7 +179,14 @@ func (m *Manager) getOrResume(ctx context.Context, id, cwd string) (*worker, err
 }
 
 func (m *Manager) StartTurn(ctx context.Context, id, prompt, cwd string) (<-chan TurnResult, <-chan Delta, error) {
-	w, err := m.getOrResume(ctx, id, cwd)
+	return m.StartTurnWithModel(ctx, id, prompt, cwd, "")
+}
+
+// StartTurnWithModel runs a turn with a per-turn model override. Codex binds
+// the model to the app-server thread, so a model change tears the worker
+// down and resumes the thread with the new model.
+func (m *Manager) StartTurnWithModel(ctx context.Context, id, prompt, cwd, model string) (<-chan TurnResult, <-chan Delta, error) {
+	w, err := m.getOrResume(ctx, id, cwd, model)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -408,6 +408,17 @@ func (a *Assembler) appendTool(ts time.Time, name, target, body string) *core.Tu
 	return &tp
 }
 
+// appendToolRaw is appendTool for bodies that already carry their own fences
+// (e.g. a patch body mixing ```diff fences with plain output fences) —
+// wrapping them again would nest code blocks and hide the diff from the
+// side-by-side renderer.
+func (a *Assembler) appendToolRaw(ts time.Time, name, target, body string) *core.TurnPart {
+	a.ensureTurn(ts)
+	tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: target, Content: body}
+	a.cur.Parts = append(a.cur.Parts, tp)
+	return &tp
+}
+
 func (a *Assembler) patchApplyPart(l line) *core.TurnPart {
 	var p struct {
 		Stdout  string `json:"stdout"`
@@ -422,24 +433,30 @@ func (a *Assembler) patchApplyPart(l line) *core.TurnPart {
 		return nil
 	}
 	paths := make([]string, 0, len(p.Changes))
-	var body []string
-	for path, change := range p.Changes {
+	for path := range p.Changes {
 		paths = append(paths, path)
-		if change.UnifiedDiff != "" {
-			body = append(body, change.UnifiedDiff)
-		}
 	}
 	sort.Strings(paths)
+	var out strings.Builder
+	for _, path := range paths {
+		if d := p.Changes[path].UnifiedDiff; d != "" {
+			out.WriteString(fenceLang("diff", clampBody(d)))
+			out.WriteByte('\n')
+		}
+	}
 	if p.Stdout != "" {
-		body = append(body, p.Stdout)
+		out.WriteString(fence(clampBody(p.Stdout)))
+		out.WriteByte('\n')
 	}
 	if p.Stderr != "" {
-		body = append(body, p.Stderr)
+		out.WriteString(fence(clampBody(p.Stderr)))
+		out.WriteByte('\n')
 	}
-	if len(body) == 0 && (!p.Success || p.Status != "") {
-		body = append(body, p.Status)
+	body := strings.TrimRight(out.String(), "\n")
+	if body == "" && (!p.Success || p.Status != "") {
+		body = fence(clampBody(p.Status))
 	}
-	return a.appendTool(l.Timestamp, "Edit", strings.Join(paths, ", "), strings.Join(body, "\n"))
+	return a.appendToolRaw(l.Timestamp, "Edit", strings.Join(paths, ", "), body)
 }
 
 func (a *Assembler) execCommandPart(l line) *core.TurnPart {
@@ -649,6 +666,31 @@ func (a *Assembler) feedResponseItem(l line) (part *core.TurnPart) {
 		return nil
 	}
 	switch p.Type {
+	case "reasoning":
+		// Reasoning summaries are the displayable trace of the model's
+		// intermediate thinking (the raw chain stays encrypted). Emit them as
+		// thinking parts, collapsed by default in the web UI.
+		var r struct {
+			Summary []struct {
+				Text string `json:"text"`
+			} `json:"summary"`
+		}
+		if json.Unmarshal(l.Payload, &r) != nil {
+			return nil
+		}
+		var texts []string
+		for _, s := range r.Summary {
+			if strings.TrimSpace(s.Text) != "" {
+				texts = append(texts, s.Text)
+			}
+		}
+		if len(texts) == 0 {
+			return nil
+		}
+		a.ensureTurn(l.Timestamp)
+		tp := core.TurnPart{Type: "thinking", Content: strings.Join(texts, "\n\n")}
+		a.cur.Parts = append(a.cur.Parts, tp)
+		return &tp
 	case "function_call":
 		// Stash until the output arrives; emit one combined tool part then, so a
 		// tool turn carries name + target + result like Claude's.
@@ -758,6 +800,20 @@ func toolTargetMap(m map[string]json.RawMessage) string {
 	return ""
 }
 
+// stripCommandEnvelope removes the metadata wrapper Codex puts around
+// function_call_output text (Command:/Chunk ID:/Wall time:/Process exited/
+// Original token count:/Output:), keeping only the command's real output.
+func stripCommandEnvelope(s string) string {
+	if !strings.HasPrefix(s, "Command: ") {
+		return s
+	}
+	idx := strings.Index(s, "\nOutput:\n")
+	if idx < 0 {
+		return s
+	}
+	return s[idx+len("\nOutput:\n"):]
+}
+
 // renderOutput renders a function_call_output's output (a JSON string for the
 // shapes seen so far) into a fenced block, clamped.
 func renderOutput(output json.RawMessage) string {
@@ -766,7 +822,7 @@ func renderOutput(output json.RawMessage) string {
 	}
 	var s string
 	if err := json.Unmarshal(output, &s); err == nil {
-		return fence(clampBody(s))
+		return fence(clampBody(stripCommandEnvelope(s)))
 	}
 	return fence(clampBody(string(output)))
 }
@@ -777,7 +833,7 @@ func renderOutputBody(output json.RawMessage) string {
 	}
 	var s string
 	if json.Unmarshal(output, &s) == nil {
-		return s
+		return stripCommandEnvelope(s)
 	}
 	var items []struct{ Type, Text string }
 	if json.Unmarshal(output, &items) == nil {
@@ -788,7 +844,7 @@ func renderOutputBody(output json.RawMessage) string {
 			}
 		}
 		if len(texts) > 0 {
-			return strings.Join(texts, "\n")
+			return stripCommandEnvelope(strings.Join(texts, "\n"))
 		}
 	}
 	return string(output)
@@ -860,6 +916,10 @@ func firstLine(s string) string {
 // fence wraps body in a markdown code fence widened past any backtick run inside
 // body, so a payload containing ``` cannot close the block early.
 func fence(body string) string {
+	return fenceLang("", body)
+}
+
+func fenceLang(lang, body string) string {
 	longest, run := 0, 0
 	for _, r := range body {
 		if r == '`' {
@@ -872,7 +932,7 @@ func fence(body string) string {
 		}
 	}
 	ticks := strings.Repeat("`", max(3, longest+1))
-	return ticks + "\n" + body + "\n" + ticks
+	return ticks + lang + "\n" + body + "\n" + ticks
 }
 
 // clampBody caps a tool body so one huge output cannot bloat the transcript.

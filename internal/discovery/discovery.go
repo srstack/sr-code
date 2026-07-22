@@ -29,6 +29,9 @@ type Discovery struct {
 	mu       sync.RWMutex
 	sessions map[string]core.Session // by id
 	paths    map[string]string       // id -> path
+
+	pendingMu      sync.Mutex
+	pendingUpserts map[string]*time.Timer // debounced write-burst coalescing
 }
 
 // NewMulti builds a Discovery that scans and watches several backend layouts at
@@ -48,8 +51,9 @@ func NewMulti(logger *slog.Logger, sources ...Source) (*Discovery, error) {
 		sources:  sources,
 		logger:   logger,
 		watcher:  w,
-		sessions: map[string]core.Session{},
-		paths:    map[string]string{},
+		sessions:       map[string]core.Session{},
+		paths:          map[string]string{},
+		pendingUpserts: map[string]*time.Timer{},
 	}, nil
 }
 
@@ -157,12 +161,54 @@ func (d *Discovery) upsert(path string) {
 		// while any is empty. Title is set once and never cleared, so this
 		// self-limits. Codex has no ai-title, so exclude it from the title re-read.
 		needTitle := existing.Title == "" && existing.Backend != "codex"
+		// Fully-known sessions need only the file's TAIL on each burst: last
+		// activity + the latest usage. A full re-parse of a large transcript
+		// on every write burst is what made the UI feel slow.
+		if !needTitle && existing.Cwd != "" && existing.Prompt != "" {
+			if tr, ok := src.(TailMetaReader); ok {
+				if meta, err := tr.ReadMetaTail(path); err == nil {
+					if meta.LastEventAt.After(existing.LastEventAt) {
+						existing.LastEventAt = meta.LastEventAt
+					}
+					if meta.Runtime.Model != "" {
+						existing.Runtime.Model = meta.Runtime.Model
+					}
+					if meta.Runtime.Effort != "" {
+						existing.Runtime.Effort = meta.Runtime.Effort
+					}
+					if meta.Runtime.ContextTokens > 0 {
+						existing.Runtime.ContextTokens = meta.Runtime.ContextTokens
+					}
+					if meta.Runtime.ContextWindow > 0 {
+						existing.Runtime.ContextWindow = meta.Runtime.ContextWindow
+					}
+					d.mu.Lock()
+					d.sessions[id] = existing
+					d.mu.Unlock()
+					return
+				}
+			}
+		}
 		if meta, err := src.ReadMeta(path); err == nil {
 			// Claude's status-line callback is the authoritative source because
 			// it includes the effective max window. Transcript usage is only a
 			// fallback; never let a later fsnotify scan erase a captured window.
+			// MERGE rather than replace: a runtime event (e.g. opencode's
+			// step_finish) carries fresher usage than a meta read taken before
+			// the turn settled, and wholesale replacement erased it.
 			if existing.Backend != "claude" || existing.Runtime.ContextWindow == 0 {
-				existing.Runtime = meta.Runtime
+				if meta.Runtime.Model != "" {
+					existing.Runtime.Model = meta.Runtime.Model
+				}
+				if meta.Runtime.Effort != "" {
+					existing.Runtime.Effort = meta.Runtime.Effort
+				}
+				if meta.Runtime.ContextTokens > 0 {
+					existing.Runtime.ContextTokens = meta.Runtime.ContextTokens
+				}
+				if meta.Runtime.ContextWindow > 0 {
+					existing.Runtime.ContextWindow = meta.Runtime.ContextWindow
+				}
 			}
 			if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 				applySubagentMeta(&existing, meta)
@@ -347,10 +393,30 @@ func (d *Discovery) handle(ev fsnotify.Event) {
 		}
 		d.upsert(ev.Name) // upsert resolves the owning source, no-ops if none
 	case ev.Op.Has(fsnotify.Write):
-		d.upsert(ev.Name)
+		// Writes arrive in bursts during streaming (every few hundred ms per
+		// active turn, and each append is one event). Re-reading the whole
+		// transcript per append is the hot path that makes the UI feel slow —
+		// coalesce each file's burst into a single upsert after it settles.
+		d.scheduleUpsert(ev.Name)
 	case ev.Op.Has(fsnotify.Remove), ev.Op.Has(fsnotify.Rename):
 		d.remove(ev.Name)
 	}
+}
+
+// scheduleUpsert debounces per-path upserts: resets a short timer on every
+// write so a stream of appends costs one re-read, not one per append.
+func (d *Discovery) scheduleUpsert(path string) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if t, ok := d.pendingUpserts[path]; ok {
+		t.Stop()
+	}
+	d.pendingUpserts[path] = time.AfterFunc(350*time.Millisecond, func() {
+		d.pendingMu.Lock()
+		delete(d.pendingUpserts, path)
+		d.pendingMu.Unlock()
+		d.upsert(path)
+	})
 }
 
 // List returns root sessions sorted by most recent user input. Subagents are

@@ -69,6 +69,52 @@ type SessionMeta = core.SessionMeta
 // every line because cwd, title, and the first-prompt fallback can each appear
 // at different positions; long sessions are read once at discovery and cached
 // by the discovery layer.
+// ReadSessionMetaTail refreshes the volatile tail-derived fields of a known
+// session (LastEventAt, latest usage) by scanning only the trailing window of
+// the file — the streaming hot path, where full re-parses dominated CPU.
+func ReadSessionMetaTail(path string) (SessionMeta, error) {
+	meta := SessionMeta{ID: strings.TrimSuffix(filepath.Base(path), ".jsonl")}
+	f, err := os.Open(path)
+	if err != nil {
+		return meta, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return meta, err
+	}
+	const window = 256 * 1024
+	start := int64(0)
+	if fi.Size() > window {
+		start = fi.Size() - window
+	}
+	if _, err := f.Seek(start, 0); err != nil {
+		return meta, err
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	if start > 0 {
+		sc.Scan() // discard the partial first line after a mid-line seek
+	}
+	for sc.Scan() {
+		ev, err := ParseLine(sc.Bytes())
+		if err != nil {
+			continue
+		}
+		if !ev.Timestamp.IsZero() {
+			meta.LastEventAt = ev.Timestamp
+		}
+		if ev.Type == "assistant" && len(ev.Message) > 0 {
+			updateClaudeRuntime(&meta.Runtime, ev.Message)
+		}
+	}
+	return meta, sc.Err()
+}
+
+// ReadSessionMeta reads the lightweight listing descriptor: id, cwd, first
+// timestamps, latest runtime, and the first real user prompt as the title
+// fallback. It parses the whole file; callers on the streaming hot path
+// should prefer ReadSessionMetaTail for already-known sessions.
 func ReadSessionMeta(path string) (SessionMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -349,6 +395,116 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	return nil, &p
 }
 
+// FeedLineParts is the multi-part entry point: one record can carry several
+// display parts (e.g. an assistant line with a thinking block followed by
+// text), and callers that stream parts live need each one.
+func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPart) {
+	ev, err := ParseLine(raw)
+	if err != nil {
+		return nil, nil
+	}
+	if ev.Type != "assistant" {
+		completed, part := a.Feed(ev)
+		if part != nil {
+			parts = []*TurnPart{part}
+		}
+		return completed, parts
+	}
+	// Assistant line: yield one part per content block class (thinking, text),
+	// preserving block order, so reasoning stays visible ahead of the reply.
+	blocks := assistantContentBlocks(ev.Message)
+	if len(blocks) == 0 {
+		completed, part := a.Feed(ev)
+		if part != nil {
+			parts = []*TurnPart{part}
+		}
+		return completed, parts
+	}
+	if a.cur == nil {
+		a.cur = &Turn{
+			Role:  "assistant",
+			Time:  ev.Timestamp,
+			Model: messageModel(ev.Message),
+		}
+	} else if m := messageModel(ev.Message); m != "" && a.cur.Model == "" {
+		a.cur.Model = m
+	}
+	collectToolUses(ev.Message, a.toolMap)
+	if ev.UUID != "" {
+		a.cur.UUID = ev.UUID
+	}
+	a.cur.Touch(ev.Timestamp)
+	for _, b := range blocks {
+		var p *TurnPart
+		switch b.kind {
+		case "thinking":
+			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "thinking", Content: b.text})
+			p = &a.cur.Parts[len(a.cur.Parts)-1]
+		case "text":
+			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "text", Content: b.text})
+			p = &a.cur.Parts[len(a.cur.Parts)-1]
+		}
+		if p != nil {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		// A tool_use-only line (or empty): run the legacy path for its side
+		// effects (turn bookkeeping) without double-appending content parts.
+		_, part := a.Feed(ev)
+		if part != nil {
+			parts = []*TurnPart{part}
+		}
+	}
+	return nil, parts
+}
+
+type contentBlock struct {
+	kind string // "thinking" | "text"
+	text string
+}
+
+// assistantContentBlocks extracts the displayable blocks of an assistant
+// message in order. String content is one text block; array content keeps
+// thinking and text blocks, skipping tool_use (rendered via tool_result).
+func assistantContentBlocks(msg json.RawMessage) []contentBlock {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		if s == "" {
+			return nil
+		}
+		return []contentBlock{{kind: "text", text: s}}
+	}
+	var blocks []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return nil
+	}
+	var out []contentBlock
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				out = append(out, contentBlock{kind: "text", text: b.Text})
+			}
+		case "thinking":
+			if b.Thinking != "" {
+				out = append(out, contentBlock{kind: "thinking", text: b.Thinking})
+			}
+		}
+	}
+	return out
+}
+
 // FeedLine parses one raw jsonl line and feeds it, the uniform entry point
 // shared with other backends' assemblers (a malformed line is ignored).
 func (a *Assembler) FeedLine(raw []byte) (completed []Turn, part *TurnPart) {
@@ -396,11 +552,7 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 
 	asm := NewAssembler()
 	for sc.Scan() {
-		ev, err := ParseLine(sc.Bytes())
-		if err != nil {
-			continue
-		}
-		completed, _ := asm.Feed(ev)
+		completed, _ := asm.FeedLineParts(sc.Bytes())
 		turns = append(turns, completed...)
 	}
 	if t := asm.Flush(); t != nil {

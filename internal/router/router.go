@@ -61,17 +61,17 @@ type Router struct {
 	// runTurn overrides the turn executor ((*Router).runSend) in tests, so
 	// queue mechanics are testable without a live tmux sender. nil in
 	// production.
-	runTurn func(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken)
+	runTurn func(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken)
 }
 
 // startTurn launches one turn's executor goroutine (the seam runTurn tests
 // override).
-func (r *Router) startTurn(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
+func (r *Router) startTurn(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken) {
 	run := r.runTurn
 	if run == nil {
 		run = r.runSend
 	}
-	go run(ctx, sessionID, prompt, cwd, tok)
+	go run(ctx, sessionID, prompt, cwd, model, tok)
 }
 
 // sendToken pairs a cancel function with a unique pointer identity so that a
@@ -88,6 +88,7 @@ type sendToken struct {
 // if the queued send is dropped (session deleted, turn cancelled).
 type pendingSend struct {
 	text  string
+	model string
 	pre   func()
 	abort func(err error)
 }
@@ -252,6 +253,8 @@ func (r *Router) ReadTurns(id string, limit int) ([]jsonl.Turn, int, error) {
 func backendForModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case m == "opencode":
+		return "opencode"
 	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"),
 		strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"),
 		strings.Contains(m, "codex"):
@@ -414,6 +417,10 @@ func (r *Router) DeleteSession(id string) error {
 	if !ok {
 		return errors.New("session not found")
 	}
+	// Capture the backend BEFORE removing the file: the fsnotify Remove event
+	// can drop the session from discovery's map before we look it up again
+	// below, and then the native delete would be silently skipped.
+	backendName := r.backendOf(id)
 	// Release any in-flight turn first so its tail goroutine stops before the
 	// file is pulled out from under it.
 	r.stopLive(id)
@@ -422,6 +429,14 @@ func (r *Router) DeleteSession(id string) error {
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete session file: %w", err)
+	}
+	// Backends with an usher-owned shadow transcript keep their canonical
+	// state elsewhere (opencode: SQLite); give the runtime a chance to delete
+	// that too, or the shadow sync would resurrect the session.
+	if kr, ok := r.senderForBackend(backendName).(interface{ DeleteNative(string) error }); ok {
+		if err := kr.DeleteNative(id); err != nil {
+			slog.Warn("native session delete failed", "session", id, "err", err)
+		}
 	}
 	// Cascade to this session's read-only subagent transcripts so they don't
 	// orphan on disk (and in discovery) with a now-dangling parent.
@@ -510,7 +525,13 @@ func (r *Router) stopLive(id string) {
 // FIFO queue and is injected when that turn ends. Returns an error only if
 // the session is unknown or the queue is full.
 func (r *Router) SendToSession(id, text string) error {
-	return r.enqueueSend(id, text, nil, nil)
+	return r.enqueueSend(id, text, "", nil, nil)
+}
+
+// SendToSessionWithModel injects a prompt with an explicit per-turn model
+// override; backends without per-turn switching fall back to their default.
+func (r *Router) SendToSessionWithModel(id, text, model string) error {
+	return r.enqueueSend(id, text, model, nil, nil)
 }
 
 // enqueueSend is the single entry point for turn-tracked sends: run now if
@@ -519,7 +540,7 @@ func (r *Router) SendToSession(id, text string) error {
 // sound way to capture one turn's reply — a send injected mid-turn would
 // tail the PREVIOUS turn's remainder instead. Typing directly into an
 // attached tmux pane still bypasses this (the manual-attach corner).
-func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) error {
+func (r *Router) enqueueSend(id, text, model string, pre func(), abort func(error)) error {
 	sess, ok := r.discovery.Get(id)
 	if !ok {
 		return errors.New("session not found")
@@ -537,7 +558,7 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 			r.sendMu.Unlock()
 			return errors.New("send queue full for session")
 		}
-		r.sendQueue[id] = append(r.sendQueue[id], pendingSend{text: text, pre: pre, abort: abort})
+		r.sendQueue[id] = append(r.sendQueue[id], pendingSend{text: text, model: model, pre: pre, abort: abort})
 		r.sendMu.Unlock()
 		return nil
 	}
@@ -549,7 +570,7 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 	if pre != nil {
 		pre()
 	}
-	r.startTurn(ctx, sess.ID, text, sess.Cwd, tok)
+	r.startTurn(ctx, sess.ID, text, sess.Cwd, model, tok)
 	return nil
 }
 
@@ -558,7 +579,7 @@ func (r *Router) enqueueSend(id, text string, pre func(), abort func(error)) err
 // turn would, so the web client adopts the echo and returns to idle with no
 // special-casing. No activeSend: nothing to cancel, and the session stays
 // "live" rather than "running". The 45s budget covers a cold window's resume.
-func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok *sendToken) {
+func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd, model string, tok *sendToken) {
 	defer r.releaseSend(sessionID, tok)
 
 	format, err := r.transcriptForBackend(r.backendOf(sessionID))
@@ -569,7 +590,19 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd string, tok
 		return
 	}
 	started := time.Now()
-	ch, err := r.senderFor(sessionID).Send(ctx, sessionID, prompt, cwd)
+	rt := r.senderFor(sessionID)
+	var ch <-chan sender.StreamEvent
+	if model != "" {
+		if ms, ok := rt.(interface {
+			SendWithModel(context.Context, string, string, string, string) (<-chan sender.StreamEvent, error)
+		}); ok {
+			ch, err = ms.SendWithModel(ctx, sessionID, prompt, cwd, model)
+		} else {
+			ch, err = rt.Send(ctx, sessionID, prompt, cwd)
+		}
+	} else {
+		ch, err = rt.Send(ctx, sessionID, prompt, cwd)
+	}
 	if err != nil {
 		r.markSendIdle(sessionID, tok)
 		errMsg, _ := json.Marshal(map[string]string{"message": err.Error()})
@@ -795,7 +828,7 @@ func (r *Router) releaseSend(sessionID string, tok *sendToken) {
 	if next.pre != nil {
 		next.pre()
 	}
-	r.startTurn(nextCtx, sess.ID, next.text, sess.Cwd, nextTok)
+	r.startTurn(nextCtx, sess.ID, next.text, sess.Cwd, next.model, nextTok)
 }
 
 // flushSendQueue drops every queued send for sessionID, calling each abort.
@@ -1268,7 +1301,7 @@ var errNoResponse = errors.New("timeout (no response received)")
 // observed — onDone is NOT called: a day-late "(relay: timeout)" message is
 // noise, and the reply, if any, is in the transcript.
 func (r *Router) SendToSessionRelayed(id, text string, onDone func(sessionID, reply string, err error)) error {
-	return r.enqueueSend(id, text,
+	return r.enqueueSend(id, text, "",
 		func() {
 			ch, cancel := r.broker.Subscribe(id)
 			go func() {

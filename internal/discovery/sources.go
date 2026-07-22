@@ -30,6 +30,13 @@ type Source interface {
 	ReadMeta(path string) (core.SessionMeta, error)
 }
 
+// TailMetaReader is an optional Source capability: refresh only the volatile
+// tail-derived fields (last activity, latest usage) without re-parsing the
+// whole transcript. Discovery prefers it on the streaming hot path.
+type TailMetaReader interface {
+	ReadMetaTail(path string) (core.SessionMeta, error)
+}
+
 // ClaudeSource scans Claude Code's projects tree:
 // <root>/<sanitized-cwd>/<id>.jsonl, where the id is the bare filename.
 type ClaudeSource struct{ root string }
@@ -102,6 +109,11 @@ func (s ClaudeSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return meta, nil
 }
 
+// ReadMetaTail refreshes only tail-derived fields for a known session.
+func (s ClaudeSource) ReadMetaTail(path string) (core.SessionMeta, error) {
+	return jsonl.ReadSessionMetaTail(path)
+}
+
 // CodexSource scans Codex CLI's rollout tree:
 // <root>/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl, where the id is the UUID embedded
 // in the filename. The date partitioning is handled by Discovery's recursive
@@ -146,4 +158,44 @@ func (s PiSource) IsSessionFile(path string) bool {
 func (s PiSource) SessionID(path string) string { return piagent.SessionIDFromPath(path) }
 func (s PiSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return piagent.ReadSessionMeta(path)
+}
+
+// OpenCodeSource scans usher's shadow transcripts for opencode sessions:
+// <root>/<sanitized-cwd>/<id>.jsonl. opencode stores its native state in
+// SQLite, so usher writes this small Claude-shaped jsonl for sessions it
+// drives instead of binding discovery to opencode's internal database schema.
+type OpenCodeSource struct{ root string }
+
+func NewOpenCodeSource(root string) OpenCodeSource { return OpenCodeSource{root: root} }
+
+func (s OpenCodeSource) Backend() string { return "opencode" }
+func (s OpenCodeSource) Root() string    { return s.root }
+
+func (s OpenCodeSource) IsSessionFile(path string) bool {
+	if !strings.HasSuffix(path, ".jsonl") {
+		return false
+	}
+	rel, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	return len(parts) == 2
+}
+
+func (s OpenCodeSource) SessionID(path string) string {
+	name := filepath.Base(path)
+	if !strings.HasSuffix(name, ".jsonl") {
+		return ""
+	}
+	return strings.TrimSuffix(name, ".jsonl")
+}
+
+func (s OpenCodeSource) ReadMeta(path string) (core.SessionMeta, error) {
+	return jsonl.ReadSessionMeta(path)
+}
+
+// ReadMetaTail refreshes only tail-derived fields for a known session.
+func (s OpenCodeSource) ReadMetaTail(path string) (core.SessionMeta, error) {
+	return jsonl.ReadSessionMetaTail(path)
 }

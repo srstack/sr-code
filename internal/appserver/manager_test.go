@@ -85,7 +85,7 @@ func TestManagerConcurrentResumeStartsOneWorker(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := m.getOrResume(ctx, "same-thread", "/tmp")
+			_, err := m.getOrResume(ctx, "same-thread", "/tmp", "")
 			errs <- err
 		}()
 	}
@@ -110,11 +110,11 @@ func TestManagerWorkerFailureIsIsolated(t *testing.T) {
 	m := NewManager(script, nil, nil, nil, []string{"FAKE_LOG=" + logPath}, 2, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	first, err := m.getOrResume(ctx, "first", "/tmp")
+	first, err := m.getOrResume(ctx, "first", "/tmp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.getOrResume(ctx, "second", "/tmp"); err != nil {
+	if _, err := m.getOrResume(ctx, "second", "/tmp", ""); err != nil {
 		t.Fatal(err)
 	}
 	first.client.mu.Lock()

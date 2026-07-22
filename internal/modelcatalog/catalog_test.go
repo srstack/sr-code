@@ -9,7 +9,7 @@ import (
 
 func TestCodexModels(t *testing.T) {
 	ctx := context.Background()
-	got, err := (Codex{Path: "/no/such/models_cache.json"}).Models(ctx)
+	got, err := (&Codex{Path: "/no/such/models_cache.json"}).Models(ctx)
 	if err != nil || len(got) != 2 || got[0].ID != "gpt-5.5" {
 		t.Fatalf("missing-cache fallback = %v, %v; want gpt-5.5 then mini", got, err)
 	}
@@ -22,7 +22,7 @@ func TestCodexModels(t *testing.T) {
 	]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	catalog := Codex{Path: p}
+	catalog := &Codex{Path: p}
 	got, err = catalog.Models(ctx)
 	if err != nil || len(got) != 2 || got[0].ID != "gpt-5.4-mini" || got[1].ID != "gpt-5.5" {
 		t.Fatalf("catalog parse/sort = %v, %v; want mini then 5.5", got, err)
@@ -33,11 +33,10 @@ func TestCodexModels(t *testing.T) {
 	if effort, _ := catalog.DefaultEffort(ctx, "auto-review"); effort != "high" {
 		t.Errorf("hidden model default effort = %q, want high", effort)
 	}
-	if err := catalog.ValidateModel(ctx, "auto-review"); err != nil {
-		t.Errorf("hidden catalog model rejected: %v", err)
-	}
-	if err := catalog.ValidateModel(ctx, "not-in-catalog"); err == nil {
-		t.Error("unknown Codex model accepted")
+	// ValidateModel is intentionally permissive (custom providers make any
+	// hardcoded list wrong).
+	if err := catalog.ValidateModel(ctx, "anything-at-all"); err != nil {
+		t.Errorf("permissive validation rejected: %v", err)
 	}
 }
 

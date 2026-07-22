@@ -241,6 +241,19 @@ func (s *Sender) Send(ctx context.Context, sessionID, prompt, cwd string) (<-cha
 	return nil, errors.New("sender has no headless backend")
 }
 
+// SendWithModel resumes a session with a per-turn model override. Claude
+// passes --model to the resume invocation; Codex re-resumes its app-server
+// thread with the new model (see Manager.StartTurnWithModel).
+func (s *Sender) SendWithModel(ctx context.Context, sessionID, prompt, cwd, model string) (<-chan StreamEvent, error) {
+	if s.app != nil {
+		return s.appTurnModel(ctx, sessionID, prompt, cwd, model, false)
+	}
+	if s.claude != nil {
+		return s.claudeTurn(ctx, sessionID, prompt, cwd, model, true)
+	}
+	return s.Send(ctx, sessionID, prompt, cwd)
+}
+
 // Start creates a new backend session and starts its first turn. The concrete
 // backend owns ID assignment: Claude accepts a caller-generated UUID while
 // Codex returns the thread ID assigned by app-server.
@@ -375,6 +388,10 @@ func emitClaudeRuntime(ctx context.Context, out chan<- StreamEvent, result claud
 // appTurn keeps rollout jsonl as the content plane while app-server supplies
 // the driving and terminal lifecycle signal.
 func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool) (<-chan StreamEvent, error) {
+	return s.appTurnModel(ctx, id, prompt, cwd, "", fresh)
+}
+
+func (s *Sender) appTurnModel(ctx context.Context, id, prompt, cwd, model string, fresh bool) (<-chan StreamEvent, error) {
 	path := s.locate(id)
 	var offset int64
 	if path != "" {
@@ -382,7 +399,7 @@ func (s *Sender) appTurn(ctx context.Context, id, prompt, cwd string, fresh bool
 			offset = fi.Size()
 		}
 	}
-	done, deltas, err := s.app.StartTurn(ctx, id, prompt, cwd)
+	done, deltas, err := s.app.StartTurnWithModel(ctx, id, prompt, cwd, model)
 	if err != nil {
 		return nil, err
 	}

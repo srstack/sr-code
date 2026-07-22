@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/modelcatalog"
+	"github.com/nexustar/usher/internal/opencode"
 	piagent "github.com/nexustar/usher/internal/pi"
 	"github.com/nexustar/usher/internal/pluginapi"
 	"github.com/nexustar/usher/internal/push"
@@ -108,6 +110,9 @@ func serve(args []string) error {
 	piSessionsDir := fs.String("pi-sessions-dir", defaultPiSessionsDir(),
 		"pi coding-agent sessions directory; the pi backend auto-enables when it exists")
 	piArgs := fs.String("pi-args", "", "extra flags for spawned pi RPC workers (space-separated)")
+	openCodeCmd := fs.String("opencode", "opencode", "path to the opencode binary (OpenCode backend)")
+	openCodeSessionsDir := fs.String("opencode-sessions-dir", "",
+		"usher-owned OpenCode shadow transcript directory; empty uses <data-dir>/opencode-sessions")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
@@ -182,17 +187,19 @@ func serve(args []string) error {
 	backends := map[string]backend.Backend{}
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	defaultBackend := ""
+	var ocSync *opencode.Runtime
 
 	if dir := *projectsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewClaudeSource(dir))
-		backends["claude"] = backend.Backend{Runtime: sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Claude{}, Forker: transcript.ClaudeForker{}, Models: modelcatalog.Claude{}}
+		backends["claude"] = backend.Backend{Runtime: sender.New(*claudeCmd, *permissionMode, dir, *tmuxSocket+"-claude", hookSockPath(*dataDir), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Claude{}, Forker: transcript.ClaudeForker{}, Models: &modelcatalog.Claude{}}
 		defaultBackend = "claude"
 		logger.Info("claude backend enabled", "projects_dir", dir)
 	}
 	if dir := *codexSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewCodexSource(dir))
 		modelsPath := filepath.Join(filepath.Dir(dir), "models_cache.json")
-		backends["codex"] = backend.Backend{Runtime: sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Codex{}, Forker: transcript.CodexForker{}, Models: modelcatalog.Codex{Path: modelsPath}}
+		codexCfgPath := filepath.Join(filepath.Dir(dir), "config.toml")
+		backends["codex"] = backend.Backend{Runtime: sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Codex{}, Forker: transcript.CodexForker{}, Models: &modelcatalog.Codex{Path: modelsPath, ConfigPath: codexCfgPath}}
 		// codex's per-account model catalog sits next to the sessions dir.
 		if defaultBackend == "" {
 			defaultBackend = "codex"
@@ -217,11 +224,31 @@ func serve(args []string) error {
 		}
 		logger.Info("pi backend enabled", "sessions_dir", dir)
 	}
+	if *openCodeSessionsDir == "" {
+		*openCodeSessionsDir = filepath.Join(*dataDir, "opencode-sessions")
+	}
+	if *openCodeCmd != "" && commandExists(*openCodeCmd) {
+		if err := os.MkdirAll(*openCodeSessionsDir, 0o755); err != nil {
+			return fmt.Errorf("create opencode sessions dir: %w", err)
+		}
+		sources = append(sources, discovery.NewOpenCodeSource(*openCodeSessionsDir))
+		ocRuntime := opencode.NewRuntime(*openCodeCmd, *openCodeSessionsDir, logger)
+		backends["opencode"] = backend.Backend{
+			Runtime:    ocRuntime,
+			Transcript: transcript.Claude{},
+			Models:     &modelcatalog.OpenCode{Cmd: *openCodeCmd},
+		}
+		ocSync = ocRuntime
+		if defaultBackend == "" {
+			defaultBackend = "opencode"
+		}
+		logger.Info("opencode backend enabled", "sessions_dir", *openCodeSessionsDir)
+	}
 
 	if len(backends) == 0 {
-		return fmt.Errorf("no backend found: Claude %q, Codex %q, and pi %q do not exist.\n"+
+		return fmt.Errorf("no backend found: Claude %q, Codex %q, pi %q, and OpenCode %q are unavailable.\n"+
 			"  run a supported agent once first, or pass its sessions-directory flag.",
-			*projectsDir, *codexSessionsDir, *piSessionsDir)
+			*projectsDir, *codexSessionsDir, *piSessionsDir, *openCodeCmd)
 	}
 
 	d, err := discovery.NewMulti(logger, sources...)
@@ -274,6 +301,11 @@ func serve(args []string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if ocSync != nil {
+		ocSync.LoadTombstones()
+		go opencode.SyncLoop(ctx, ocSync, logger)
+	}
 
 	if err := d.Start(ctx); err != nil {
 		return err
@@ -468,6 +500,15 @@ func defaultPiCmd() string {
 func isDir(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
+}
+
+func commandExists(cmd string) bool {
+	if strings.ContainsRune(cmd, os.PathSeparator) {
+		info, err := os.Stat(cmd)
+		return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+	}
+	_, err := exec.LookPath(cmd)
+	return err == nil
 }
 
 func defaultDataDir() string { return pluginapi.DefaultDataDir() }
