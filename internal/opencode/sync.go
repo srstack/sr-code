@@ -293,8 +293,10 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 	cwd := s.Directory
 	// The DB title is authoritative (opencode auto-generates it); the shadow's
 	// first user line is often a system-reminder injection, which would
-	// otherwise become the displayed title.
-	if s.Title != "" {
+	// otherwise become the displayed title. Skip opencode's "New session"
+	// placeholder — the first prompt is a better title than that, and the
+	// real title lands on a later sync.
+	if s.Title != "" && s.Title != "New session" {
 		write(mustMarshal(map[string]any{
 			"type":      "ai-title",
 			"aiTitle":   s.Title,

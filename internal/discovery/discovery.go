@@ -158,9 +158,11 @@ func (d *Discovery) upsert(path string) {
 	if known {
 		existing.LastEventAt = info.ModTime()
 		// cwd/prompt/title land in jsonl written after the file appears; re-read
-		// while any is empty. Title is set once and never cleared, so this
-		// self-limits. Codex has no ai-title, so exclude it from the title re-read.
-		needTitle := existing.Title == "" && existing.Backend != "codex"
+		// while any is empty. Codex has no ai-title, so exclude it from the
+		// title re-read. Placeholder titles ("New session", written by
+		// opencode before it generates the real one) also force the full read
+		// so the real title replaces them when it lands.
+		needTitle := (existing.Title == "" || isPlaceholderTitle(existing.Title)) && existing.Backend != "codex"
 		// Fully-known sessions need only the file's TAIL on each burst: last
 		// activity + the latest usage. A full re-parse of a large transcript
 		// on every write burst is what made the UI feel slow.
@@ -216,6 +218,13 @@ func (d *Discovery) upsert(path string) {
 					existing.Cwd = meta.Cwd
 				}
 				if existing.Title == "" {
+					existing.Title = meta.Title
+				} else if meta.Title != "" && meta.Title != existing.Title {
+					// ai-title is the backend's own session title and it
+					// legitimately changes after creation (opencode writes a
+					// "New session" placeholder first, generates the real
+					// title after the first turn). Follow those updates;
+					// user renames still win via sessionmeta's custom title.
 					existing.Title = meta.Title
 				}
 				if existing.Prompt == "" {
@@ -465,6 +474,13 @@ func (d *Discovery) Get(id string) (core.Session, bool) {
 		resolveTitle(&s)
 	}
 	return s, ok
+}
+
+// isPlaceholderTitle reports backend-written placeholder titles that must
+// not stick: opencode labels fresh sessions "New session" until its first
+// turn completes and the real title is generated.
+func isPlaceholderTitle(t string) bool {
+	return t == "" || t == "New session" || t == "Untitled" || t == "(untitled)"
 }
 
 // resolveTitle fills Title from Prompt when no ai-title has been seen yet.
