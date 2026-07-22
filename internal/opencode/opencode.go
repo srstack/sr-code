@@ -110,7 +110,16 @@ type turn struct {
 	readyOnce sync.Once
 	failed    chan error
 
+	lastTokens *tokenTotals
+
 	out chan backend.Event
+}
+
+// tokenTotals is the step_finish accounting we emit as ctx usage at turn end.
+type tokenTotals struct {
+	Total  int64 `json:"total"`
+	Input  int64 `json:"input"`
+	Output int64 `json:"output"`
 }
 
 // rawEvent is one line of `opencode run --format json` output.
@@ -123,17 +132,13 @@ type rawEvent struct {
 
 // partPayload is the union of streamed part shapes we translate.
 type partPayload struct {
-	ID     string     `json:"id"`
-	Type   string     `json:"type"`
-	Text   string     `json:"text"`
-	Tool   string     `json:"tool"`
-	CallID string     `json:"callID"`
-	State  *toolState `json:"state"`
-	Tokens *struct {
-		Total  int64 `json:"total"`
-		Input  int64 `json:"input"`
-		Output int64 `json:"output"`
-	} `json:"tokens"`
+	ID     string       `json:"id"`
+	Type   string       `json:"type"`
+	Text   string       `json:"text"`
+	Tool   string       `json:"tool"`
+	CallID string       `json:"callID"`
+	State  *toolState   `json:"state"`
+	Tokens *tokenTotals `json:"tokens"`
 }
 
 func (r *Runtime) spawn(ctx context.Context, id, prompt, cwd, model string, fresh bool) (*turn, error) {
@@ -291,20 +296,15 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 		ts := eventTime(ev.Timestamp)
 		switch ev.Type {
 		case "step_finish":
-			// Token accounting for the ctx-usage pie. opencode reports the
-			// turn's cumulative totals; the context window comes from the
-			// model's models.dev metadata (cached in the runtime).
+			// Capture the turn's cumulative token totals; the runtime event
+			// is emitted after process exit (see below), when opencode's own
+			// store is guaranteed to have the message row for model lookup.
 			var p partPayload
 			if json.Unmarshal(ev.Part, &p) != nil || p.Tokens == nil {
 				return true
 			}
-			rt := core.SessionRuntime{
-				Model:         t.model,
-				ContextTokens: p.Tokens.Total,
-				ContextWindow: t.rt.contextWindow(t.model),
-			}
-			raw, _ := json.Marshal(rt)
-			return t.emit(ctx, backend.Event{Type: backend.EventRuntime, Raw: raw})
+			t.lastTokens = p.Tokens
+			return true
 		case "text", "reasoning":
 			var p partPayload
 			if json.Unmarshal(ev.Part, &p) != nil {
@@ -368,6 +368,24 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 			msg = waitErr.Error()
 		}
 		t.emitErr("opencode turn failed: " + msg)
+	}
+	// Emit the ctx-usage runtime after the process exited: opencode's store
+	// now certainly holds the turn's message, so the default-model lookup is
+	// race-free, and the discovery merge keeps this fresher data.
+	if t.lastTokens != nil {
+		model := t.model
+		if model == "" || model == "default" {
+			model = t.rt.sessionModel(t.id)
+		}
+		rt := core.SessionRuntime{
+			Model:         model,
+			ContextTokens: t.lastTokens.Total,
+			ContextWindow: t.rt.contextWindow(model),
+		}
+		raw, _ := json.Marshal(rt)
+		if !t.emit(ctx, backend.Event{Type: backend.EventRuntime, Raw: raw}) {
+			return
+		}
 	}
 	systemRaw := turnCompleteLine(t.id, time.Now().UTC())
 	if !t.appendAndEmit(ctx, path, "system", systemRaw) {
@@ -522,6 +540,37 @@ func (r *Runtime) contextWindow(model string) int64 {
 	r.cwMap = m
 	r.cwAt = time.Now()
 	return m[model]
+}
+
+// sessionModel resolves the model a session last ran as "provider/model"
+// from opencode's store — used when a send left the model at the CLI default.
+func (r *Runtime) sessionModel(id string) string {
+	if !sessionIDPattern.MatchString(id) {
+		return ""
+	}
+	out, err := exec.Command(r.cmd, "db",
+		"SELECT id, data FROM message WHERE session_id = '"+id+"' AND json_extract(data, '$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1",
+		"--format", "tsv").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		_, payload, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		var d struct {
+			ProviderID string `json:"providerID"`
+			ModelID    string `json:"modelID"`
+		}
+		if json.Unmarshal([]byte(payload), &d) == nil && d.ModelID != "" {
+			if d.ProviderID != "" {
+				return d.ProviderID + "/" + d.ModelID
+			}
+			return d.ModelID
+		}
+	}
+	return ""
 }
 
 // Locate finds the shadow transcript for id under root, "" when absent.

@@ -595,7 +595,7 @@ async function handleKebabAction(action, id) {
 // actions: [{name, label, kind: 'primary'|'danger'|'plain'}]. Esc/overlay
 // click resolves null. An input field is included when opts.input is set:
 // {label, value, placeholder} — the resolve value is then {action, text}.
-function appModal(opts) {
+export function appModal(opts) {
   return new Promise((resolve) => {
     const wrap = document.createElement('div');
     wrap.id = 'app-modal'; // NOT "modal" — interaction.js owns that id and

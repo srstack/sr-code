@@ -289,7 +289,19 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		buf = append(buf, raw...)
 		buf = append(buf, '\n')
 	}
+	sid := s.ID
 	cwd := s.Directory
+	// The DB title is authoritative (opencode auto-generates it); the shadow's
+	// first user line is often a system-reminder injection, which would
+	// otherwise become the displayed title.
+	if s.Title != "" {
+		write(mustMarshal(map[string]any{
+			"type":      "ai-title",
+			"aiTitle":   s.Title,
+			"sessionId": sid,
+			"timestamp": eventTime(s.Created),
+		}))
+	}
 	for _, row := range messages {
 		var md messageData
 		if json.Unmarshal([]byte(row[1]), &md) != nil {
