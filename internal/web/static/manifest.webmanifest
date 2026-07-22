@@ -1,13 +1,13 @@
 {
-  "name": "usher",
-  "short_name": "usher",
-  "description": "Router for managing multiple Claude Code sessions.",
+  "name": "SR Code",
+  "short_name": "SR Code",
+  "description": "Web console for managing multiple coding-agent sessions.",
   "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#fafafa",
+  "background_color": "#ffffff",
   "theme_color": "#ffffff",
   "icons": [
     { "src": "/icons/icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any" },

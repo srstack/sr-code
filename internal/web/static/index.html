@@ -3,27 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>usher</title>
-<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
-<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d1117">
+<title>SR Code</title>
+<meta name="theme-color" content="#f5f5f7">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="usher">
+<meta name="apple-mobile-web-app-title" content="SR Code">
 <link rel="stylesheet" href="/style.css">
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
 <div id="sidebar-backdrop" aria-hidden="true"></div>
 <aside id="sidebar">
-  <h1 class="sidebar-brand"><a href="#/">usher</a> <button class="sidebar-toggle sidebar-collapse" id="sidebar-collapse" title="Close sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button></h1>
-  <a href="#/chat/default" class="sidebar-mainchat"><svg class="mainchat-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="3.5" cy="8" r="1.6"/><circle cx="12.5" cy="3.5" r="1.6"/><circle cx="12.5" cy="12.5" r="1.6"/><path d="M5.1 8h2.4M7.5 8l3.5-3.7M7.5 8l3.5 3.7"/></svg>Router</a>
+  <h1 class="sidebar-brand"><a href="#/"><img src="/icons/icon.svg" alt="" class="brand-icon">SR Code</a> <button class="sidebar-toggle sidebar-collapse" id="sidebar-collapse" title="Close sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button></h1>
+  <a href="#/new" class="sidebar-newsession"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 2v12M2 8h12"/></svg>New session</a>
   <div class="sidebar-heading">
     <span>sessions <span id="sidebar-session-count" class="muted"></span></span>
-    <a href="#/new" class="sidebar-new" title="new session" aria-label="new session">+</a>
   </div>
   <div class="sidebar-section">
     <div id="sidebar-pinned"></div>
@@ -37,6 +35,7 @@
     <button id="settings-btn" class="settings-btn" type="button" title="settings">Settings</button>
   </div>
 </aside>
+<div id="sidebar-resizer" aria-hidden="true"></div>
 <div class="main-wrap">
   <header>
     <button id="mobile-toggle" class="sidebar-toggle mobile-toggle" aria-label="Open sidebar" type="button"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="5.2" y1="1" x2="5.2" y2="15"/></svg></button>

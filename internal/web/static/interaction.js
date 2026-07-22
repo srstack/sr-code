@@ -172,11 +172,13 @@ function renderInteractions() {
     wirePermission(bar.querySelector('.interaction'));
   }
 
-  // Keep AskUserQuestion in its existing modal.
+  // Keep AskUserQuestion in its existing modal. Only remove the modal when
+  // it's one WE created (dataset.interactions marker) — other parts of the
+  // app (confirm/prompt dialogs) use their own containers.
   const asks = pendingInteractions.filter(isAskQuestion);
   let modal = document.getElementById('modal');
   if (!asks.length) {
-    if (modal) modal.remove();
+    if (modal && modal.dataset.interactions !== undefined) modal.remove();
     return;
   }
   if (!modal) {

@@ -29,6 +29,16 @@ window.marked.use({
   silent: true,
   renderer: {
     html(token) { return esc(typeof token === 'string' ? token : token.text); },
+    code(token) {
+      const lang = typeof token === 'string' ? '' : (token.lang || '');
+      const text = typeof token === 'string' ? token : (token.text || '');
+      if (/^diff$/i.test(lang.trim())) {
+        return renderSideDiff(text);
+      }
+      // marked's default path: escape everything and emit a plain pre/code.
+      return '<pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>' +
+        esc(text) + '</code></pre>';
+    },
     image(token) {
       const href = String(token.href || '');
       const alt = String(token.text || '');
@@ -48,6 +58,70 @@ window.marked.use({
     },
   },
 });
+
+// ---------- side-by-side diff rendering ----------
+
+// renderSideDiff parses unified-diff text (hunks whose lines carry ' ', '-',
+// '+' prefixes) into a GitHub-style split view: old file left, new file
+// right, deletions against their paired additions. Falls back to nothing
+// fancy when a line doesn't fit — it just lands as context on both sides.
+function renderSideDiff(src) {
+  const rows = []; // {type: 'hunk'|'pair', left?, right?}
+  let oldNo = 0, newNo = 0;
+  let dels = []; // pending deletion lines awaiting their addition run
+
+  const flushDels = () => {
+    while (dels.length) {
+      rows.push({ type: 'pair', left: dels.shift(), right: null });
+    }
+  };
+
+  for (const raw of src.split('\n')) {
+    if (raw.startsWith('@@')) {
+      flushDels();
+      const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+      if (m) { oldNo = parseInt(m[1], 10); newNo = parseInt(m[2], 10); }
+      rows.push({ type: 'hunk', text: raw });
+      continue;
+    }
+    if (raw.startsWith('-')) {
+      dels.push({ no: oldNo++, text: raw.slice(1) });
+      continue;
+    }
+    if (raw.startsWith('+')) {
+      const add = { no: newNo++, text: raw.slice(1) };
+      if (dels.length) {
+        rows.push({ type: 'pair', left: dels.shift(), right: add });
+      } else {
+        rows.push({ type: 'pair', left: null, right: add });
+      }
+      continue;
+    }
+    // Context line (' ' prefix) or anything unrecognized.
+    flushDels();
+    const text = raw.startsWith(' ') ? raw.slice(1) : raw;
+    rows.push({
+      type: 'pair',
+      left: { no: oldNo++, text, ctx: true },
+      right: { no: newNo++, text, ctx: true },
+    });
+  }
+  flushDels();
+
+  const cell = (side, kind) => {
+    if (!side) return `<span class="diff-cell diff-empty"></span>`;
+    const cls = side.ctx ? 'diff-ctx' : (kind === 'left' ? 'diff-del' : 'diff-add');
+    return `<span class="diff-cell ${cls}"><span class="diff-no">${side.no}</span>` +
+      `<span class="diff-text">${esc(side.text)}</span></span>`;
+  };
+  const body = rows.map(r => {
+    if (r.type === 'hunk') {
+      return `<div class="diff-row diff-hunkrow"><span class="diff-hunk">${esc(r.text)}</span></div>`;
+    }
+    return `<div class="diff-row">${cell(r.left, 'left')}${cell(r.right, 'right')}</div>`;
+  }).join('');
+  return `<div class="diff-view" role="table" aria-label="file diff">${body}</div>`;
+}
 
 export function renderMarkdown(md) {
   if (renderMode === 'raw') {
@@ -144,9 +218,15 @@ export function renderToolPart(p) {
     '<rect x="6" y="6" width="8" height="8" rx="1.5"/>' +
     '<path d="M4.5 10.5h-1a1.5 1.5 0 0 1-1.5-1.5V3.5A1.5 1.5 0 0 1 3.5 2h5.5A1.5 1.5 0 0 1 10.5 3.5v1"/>' +
     '</svg>';
+  // Shell calls render Codex-desktop style: the command IS the title, prefixed
+  // with a prompt glyph; everything else keeps "Name <target>".
+  const isShell = /^(shell|bash|local_shell|exec|execute)$/i.test(name);
   const label = target
-    ? esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' +
-      '<button class="tool-copy" type="button" title="Copy" aria-label="Copy target">' + copyIcon + '</button>'
+    ? (isShell
+        ? '<span class="tool-prompt">$</span> <span class="tool-target tool-cmd">' + esc(target) + '</span>' +
+          '<button class="tool-copy" type="button" title="Copy" aria-label="Copy target">' + copyIcon + '</button>'
+        : esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' +
+          '<button class="tool-copy" type="button" title="Copy" aria-label="Copy target">' + copyIcon + '</button>')
     : esc(name);
   return `<details class="tool-details"${openAttr}>` +
     `<summary>${label}</summary>` +
@@ -162,10 +242,20 @@ export function forkBtnHTML(uuid) {
   return `<button class="turn-fork" type="button" data-uuid="${esc(uuid)}" title="Fork: branch a new session from this point">⑂ fork</button>`;
 }
 
+// renderThinkingPart renders a reasoning/thinking part as a collapsed,
+// muted block — visible on demand but never competing with the reply.
+export function renderThinkingPart(p) {
+  return `<details class="thinking-details">` +
+    `<summary>thinking</summary>` +
+    `<div class="content thinking-body" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>` +
+    `</details>`;
+}
+
 // renderAssistantParts renders the parts array of a grouped assistant turn.
 export function renderAssistantParts(parts) {
   return (parts || []).map(p => {
     if (p.type === 'tool') return renderToolPart(p);
+    if (p.type === 'thinking') return renderThinkingPart(p);
     return `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
   }).join('');
 }
@@ -183,6 +273,7 @@ export function appendChatMessage(m) {
   // A relay message is a session's own reply forwarded verbatim into the main
   // chat — label it as the session speaking, linked to its detail view.
   let roleLabel = esc(role);
+  if (role === 'user') roleLabel = 'Master';
   if (role === 'relay') {
     roleLabel = m.source_session
       ? `<a class="relay-source" href="#/s/${esc(m.source_session)}">session ${esc(m.source_session.slice(0, 8))}</a>`
@@ -269,6 +360,8 @@ export const BACKEND_MARKS = {
   pi: '<path fill="currentColor" fill-rule="evenodd" d="M4.96 4.96H15.52V12H12V15.52H8.48V19.04H4.96Z'
     + 'M8.48 8.48V12H12V8.48Z"/>'
     + '<path fill="currentColor" d="M15.52 12H19.04V19.04H15.52Z"/>',
+  opencode: '<path d="M12 3.2 19.6 7.6v8.8L12 20.8 4.4 16.4V7.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="2"/>'
+    + '<path d="M9.25 9.3 6.85 12l2.4 2.7M14.75 9.3l2.4 2.7-2.4 2.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
 };
 
 // Unknown/empty backend falls back to claude, mirroring the router default.

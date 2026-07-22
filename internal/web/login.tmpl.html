@@ -2,75 +2,93 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>usher — sign in</title>
+<title>SR Code — sign in</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <style>
-  :root { color-scheme: dark light; }
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
   body {
-    font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
-    background: #14171c;
-    color: #d5dae0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+    background: #ffffff;
+    color: #111111;
     margin: 0;
     min-height: 100vh;
     display: grid;
     place-items: center;
+    -webkit-font-smoothing: antialiased;
   }
   form {
-    background: #1c2027;
-    border: 1px solid #2a3038;
-    border-radius: 8px;
-    padding: 24px 28px;
+    background: #ffffff;
+    border: 1px solid #e1e4e8;
+    border-radius: 10px;
+    padding: 36px 36px 30px;
     box-sizing: border-box;
     width: min(360px, 90vw);
-    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
   }
   h1 {
-    margin: 0 0 18px;
-    font-size: 18px;
-    font-weight: 500;
-    letter-spacing: 0.5px;
+    margin: 0 0 28px;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
   }
-  label { display: block; margin-bottom: 6px; color: #8a93a0; font-size: 12px; }
+  label {
+    display: block;
+    margin-bottom: 6px;
+    color: #5c5e62;
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
   input[type=password] {
     width: 100%;
     box-sizing: border-box;
-    padding: 9px 10px;
-    background: #0f1217;
-    border: 1px solid #2a3038;
-    border-radius: 5px;
-    color: inherit;
+    padding: 9px 12px;
+    background: #f7f8f9;
+    border: 1px solid #d0d4d8;
+    border-radius: 6px;
+    color: #111111;
     font: inherit;
-    font-size: 16px;
+    font-size: 15px;
+    transition: border-color 0.2s ease;
   }
-  input[type=password]:focus { outline: none; border-color: #4a90e2; }
+  input[type=password]:focus {
+    outline: none;
+    border-color: #4f46e5;
+  }
   button {
-    margin-top: 14px;
+    margin-top: 16px;
     width: 100%;
     padding: 9px 14px;
-    background: #4a90e2;
+    background: #4f46e5;
     border: none;
-    border-radius: 5px;
+    border-radius: 6px;
     color: white;
     font: inherit;
+    font-size: 15px;
+    font-weight: 500;
     cursor: pointer;
+    transition: background 0.2s ease;
   }
-  button:hover { background: #5ea0ee; }
+  button:hover { background: #4338ca; }
   .err {
     margin-top: 12px;
-    padding: 8px 10px;
-    background: #3a1e22;
-    border: 1px solid #5a2a30;
-    border-radius: 4px;
-    color: #f0a8af;
+    padding: 8px 12px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 6px;
+    color: #991b1b;
     font-size: 13px;
   }
 </style>
 </head>
 <body>
 <form method="post" action="/login" autocomplete="off">
-  <h1>usher</h1>
+  <h1>SR Code</h1>
   <label for="password">password</label>
   <input id="password" type="password" name="password" autofocus required>
   <input type="hidden" name="next" value="{{.Next}}">

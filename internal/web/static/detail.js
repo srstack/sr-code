@@ -9,13 +9,14 @@ import {
   registerRefreshSubtitle,
 } from './state.js';
 import {
-  renderMarkdown, appendChatMessage, renderToolPart,
+  renderMarkdown, appendChatMessage, renderToolPart, renderThinkingPart,
   forkBtnHTML, updateMessageTs,
   backendMark,
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
 import { loadSidebar } from './sidebar.js';
 import { loadList } from './list.js';
+import { makeDropdown } from './dropdown.js';
 
 // --- detail-private state (not shared with other modules) ---
 
@@ -65,7 +66,7 @@ let liveTurnDirty = false;
 // Transcript window: render the most recent `transcriptLimit` turns; "load
 // earlier" grows it by a page and re-fetches. transcriptTotal is the server's
 // full turn count (X-Transcript-Total), used to show/hide the button.
-const TRANSCRIPT_PAGE = 100;
+const TRANSCRIPT_PAGE = 50;
 let transcriptLimit = TRANSCRIPT_PAGE;
 let transcriptTotal = 0;
 
@@ -99,24 +100,29 @@ export async function showNewSession(prefillCwd) {
   root.innerHTML = `
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
-        <div class="send-controls">
-          <label class="new-cwd-field">
-            <span class="muted">cwd</span>
-            <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
-                   placeholder="/absolute/path/to/project">
-            <datalist id="new-cwd-list">${options}</datalist>
-          </label>
+        <div class="new-form">
+          <div class="new-form-row">
+            <label class="new-field">
+              <span class="new-field-label">directory</span>
+              <input id="new-cwd" type="text" list="new-cwd-list" autocomplete="off"
+                     placeholder="/absolute/path/to/project">
+              <datalist id="new-cwd-list">${options}</datalist>
+            </label>
+          </div>
+          <div class="new-form-row new-form-split">
+            <div class="new-field">
+              <span class="new-field-label">agent</span>
+              <div id="new-backend" class="new-select-mount"></div>
+            </div>
+            <div class="new-field">
+              <span class="new-field-label">model</span>
+              <div id="new-model" class="new-select-mount"></div>
+            </div>
+          </div>
         </div>
         <div class="composer">
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
-            <div class="composer-tools">
-              <div class="composer-model-pickers">
-                <select id="new-backend" class="composer-picker composer-backend" aria-label="backend"></select>
-                <span class="picker-divider" aria-hidden="true"></span>
-                <select id="new-model" class="composer-picker composer-model" aria-label="model"></select>
-              </div>
-            </div>
             <div class="composer-send"><button id="send">send</button></div>
           </div>
         </div>
@@ -128,8 +134,8 @@ export async function showNewSession(prefillCwd) {
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send');
   const cwdEl = document.getElementById('new-cwd');
-  const backendEl = document.getElementById('new-backend');
-  const modelEl = document.getElementById('new-model');
+  const backendMount = document.getElementById('new-backend');
+  const modelMount = document.getElementById('new-model');
   const errEl = document.getElementById('new-session-err');
   // Prefilled from a sidebar cwd "+": cwd is known, so drop the cursor in the
   // message box instead of the cwd field.
@@ -141,57 +147,62 @@ export async function showNewSession(prefillCwd) {
   }
 
   let modelCatalogs = {};
+  const modelDD = makeDropdown({
+    placeholder: 'model',
+    allowCustom: true,
+    onChange: (id) => {
+      try { localStorage.setItem('usher.newModel.' + backendDD.getValue(), id); } catch {/* private mode */}
+    },
+  });
+  modelMount.appendChild(modelDD.el);
+  const backendDD = makeDropdown({
+    placeholder: 'agent',
+    onChange: () => {
+      try { localStorage.setItem('usher.newBackend', backendDD.getValue()); } catch {/* private mode */}
+      renderModels();
+      modelMount.parentElement.dataset.backend = backendDD.getValue();
+    },
+  });
+  backendMount.appendChild(backendDD.el);
+
   const renderModels = () => {
-    const backend = backendEl.value;
+    const backend = backendDD.getValue();
     const models = modelCatalogs[backend] || [];
     const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
-    modelEl.replaceChildren(...choices.map(m => {
-      const o = document.createElement('option');
-      o.value = m.id;
-      o.textContent = m.display_name || m.id;
-      return o;
-    }));
-    try {
-      const key = 'usher.newModel.' + backend;
-      const saved = localStorage.getItem(key);
-      if (saved && [...modelEl.options].some(o => o.value === saved)) {
-        modelEl.value = saved;
-      }
-    } catch {/* private mode → keep first model */}
-    backendEl.parentElement.dataset.backend = backend || 'claude';
+    const defaultLabel = (backend === 'codex' && choices.length && choices[0].id !== 'default')
+      ? `Default (${choices[0].id})` : 'Default';
+    let saved = '';
+    try { saved = localStorage.getItem('usher.newModel.' + backend) || ''; } catch {/* private mode */}
+    modelDD.setOptions([
+      { id: 'default', label: defaultLabel },
+      ...choices.filter(m => m.id !== 'default').map(m => ({ id: m.id, label: m.display_name || m.id })),
+    ]);
+    if (saved && choices.some(o => o.id === saved)) {
+      modelDD.setValue(saved);
+    } else {
+      modelDD.setValue('default');
+    }
+    modelMount.parentElement.dataset.backend = backend || 'claude';
   };
-  backendEl.addEventListener('change', () => {
-    try { localStorage.setItem('usher.newBackend', backendEl.value); } catch {/* private mode */}
-    renderModels();
-  });
-  modelEl.addEventListener('change', () => {
-    try { localStorage.setItem('usher.newModel.' + backendEl.value, modelEl.value); } catch {/* private mode */}
-  });
 
   // Build the backend picker once, then show only that backend's models.
   fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
     const backends = (data && data.backends) || ['claude'];
     modelCatalogs = (data && data.models) || {};
-    backendEl.replaceChildren();
-    for (const name of backends) {
-      const o = document.createElement('option');
-      o.value = name;
-      o.textContent = name.charAt(0).toUpperCase() + name.slice(1);
-      backendEl.appendChild(o);
-    }
+    backendDD.setOptions(backends.map(name => ({
+      id: name,
+      label: name.charAt(0).toUpperCase() + name.slice(1),
+    })));
     try {
       const savedBackend = localStorage.getItem('usher.newBackend');
       if (savedBackend && backends.includes(savedBackend)) {
-        backendEl.value = savedBackend;
+        backendDD.setValue(savedBackend);
       }
     } catch {/* private mode → keep first backend */}
     renderModels();
   }).catch(() => {
     modelCatalogs = {};
-    const o = document.createElement('option');
-    o.value = 'claude';
-    o.textContent = 'Claude';
-    backendEl.replaceChildren(o);
+    backendDD.setOptions([{ id: 'claude', label: 'Claude' }]);
     renderModels();
   });
 
@@ -208,8 +219,8 @@ export async function showNewSession(prefillCwd) {
         body: JSON.stringify({
           cwd: cwdEl.value.trim(),
           initial_message: promptEl.value,
-          backend: backendEl.value,
-          model: modelEl.value,
+          backend: backendDD.getValue(),
+          model: modelDD.getValue(),
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -318,6 +329,7 @@ export async function showDetail(id) {
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
           <div class="composer-bar">
             <div class="composer-tools">
+              <span id="model-mount" class="model-mount"></span>
               <button id="upload-btn" class="upload-btn" type="button" title="upload file">
                 <span class="t-icon">+</span><span class="t-full">upload</span>
               </button>
@@ -349,6 +361,47 @@ export async function showDetail(id) {
 
   await loadTranscript(id);
   if (epoch !== detailEpoch) return; // superseded before we wired the streams
+
+  // Per-turn model override. Codex re-resumes its thread on a model change;
+  // claude/opencode pass it per invocation. Choice persists per session.
+  let sessionModel = null;
+  if (sess.backend === 'claude' || sess.backend === 'opencode' || sess.backend === 'codex') {
+    const mount = document.getElementById('model-mount');
+    if (mount) {
+      sessionModel = makeDropdown({
+        placeholder: 'model',
+        allowCustom: true,
+        onChange: (v) => {
+          try { localStorage.setItem('usher.sessionModel.' + id, v); } catch {/* private mode */}
+        },
+      });
+      sessionModel.el.classList.add('model-dd');
+      mount.appendChild(sessionModel.el);
+      fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
+        const models = ((data && data.models) || {})[sess.backend] || [];
+        const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
+        // Codex's catalog leads with the CLI-configured model; annotate the
+        // Default row with it so "use the CLI default" shows what it is.
+        const defaultLabel = (sess.backend === 'codex' && choices.length && choices[0].id !== 'default')
+          ? `Default (${choices[0].id})` : 'Default';
+        const opts = [
+          { id: '', label: defaultLabel },
+          ...choices.filter(m => m.id !== 'default').map(m => ({ id: m.id, label: m.display_name || m.id })),
+        ];
+        // The dropdown is an OVERRIDE control: its resting state is the CLI
+        // default (annotated above), not whatever model the last turn ran —
+        // runtime.model is history, not a selection. Only an explicit user
+        // pick (persisted) changes what's sent.
+        let current = '';
+        try { current = localStorage.getItem('usher.sessionModel.' + id) || ''; } catch {/* private mode */}
+        if (current && !opts.some(o => o.id === current)) opts.push({ id: current, label: current });
+        sessionModel.setOptions(opts);
+        sessionModel.setValue(current);
+      }).catch(() => {
+        sessionModel.setOptions([{ id: '', label: 'Default' }]);
+      });
+    }
+  }
 
   const chatEl = document.getElementById('chat-scroll');
   const promptEl = document.getElementById('prompt');
@@ -612,7 +665,7 @@ export async function showDetail(id) {
       const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, model: sessionModel ? sessionModel.getValue() : '' }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -1153,7 +1206,9 @@ function appendLivePart(d) {
   const tmpl = document.createElement('template');
   tmpl.innerHTML = p.type === 'tool'
     ? renderToolPart(p)
-    : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
+    : p.type === 'thinking'
+      ? renderThinkingPart(p)
+      : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
   const partNode = tmpl.content.firstElementChild;
   if (enrichTool && lt.partNodes.length) {
     const oldNode = lt.partNodes[enrichIndex];

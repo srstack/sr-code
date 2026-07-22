@@ -119,15 +119,28 @@ export function renderSidebarSessions(allSessions) {
       ? '<span class="auto-dot" title="auto-approve enabled">ϟ</span>'
       : '';
     const title = s.title || '(untitled)';
+    const mark = backendMark(s.backend);
     if (child) {
       return `<li class="sidebar-item subagent-row">
-        <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
+        <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${mark}${dot}${auto}${esc(title)}</a>
       </li>`;
     }
     const liClass = s.archived ? 'sidebar-item archived-row' : 'sidebar-item';
     const subs = children.get(s.id) || [];
+    const archAction = s.archived ? 'unarchive' : 'archive';
+    const archTitle = s.archived ? 'unarchive' : 'archive';
     return `<li class="${liClass}">
-      <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${dot}${auto}${esc(title)}</a>
+      <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${mark}${dot}${auto}${esc(title)}</a>
+      <span class="row-actions">
+        <button class="row-action-btn" type="button" data-quick="${archAction}" data-id="${esc(s.id)}" title="${archTitle}" aria-label="${archTitle}">
+          ${s.archived
+            ? '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3V5z"/><path d="M2 5l6 3 6-3M8 8v6" transform="rotate(180 8 8)"/></svg>'
+            : '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3V5z"/><path d="M2 5l6 3 6-3M8 8v6"/></svg>'}
+        </button>
+        <button class="row-action-btn row-action-danger" type="button" data-quick="delete" data-id="${esc(s.id)}" title="delete" aria-label="delete">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h12M6 4V2.5A.5.5 0 0 1 6.5 2h3a.5.5 0 0 1 .5.5V4M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/></svg>
+        </button>
+      </span>
       <button class="kebab-btn" type="button"
         data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}"
         data-pinned="${s.pinned ? '1' : '0'}"
@@ -193,12 +206,8 @@ export function renderSidebarSessions(allSessions) {
 
 export function updateSidebarActive() {
   const hash = location.hash || '#/';
-  const inMainChat = hash === '#/chat' || hash.startsWith('#/chat/');
-  document.querySelectorAll('.sidebar-mainchat').forEach(a => {
-    a.classList.toggle('active', inMainChat);
-  });
-  document.querySelectorAll('.sidebar-new:not(.cwd-new)').forEach(a => {
-    a.classList.toggle('active', hash === '#/new');
+  document.querySelectorAll('.sidebar-newsession').forEach(a => {
+    a.classList.toggle('active', hash === '#/new' || hash.startsWith('#/new/'));
   });
   let sessionKey = '';
   if (hash.startsWith('#/s/')) {
@@ -241,6 +250,47 @@ if (sidebarCollapse) {
 const sidebarBackdrop = document.getElementById('sidebar-backdrop');
 if (sidebarBackdrop && sidebarEl) {
   sidebarBackdrop.addEventListener('click', () => sidebarEl.classList.remove('open'));
+}
+
+// Sidebar width drag. The resizer is a 6px hit strip on the sidebar's right
+// edge; dragging updates --sidebar-width live and persists to localStorage.
+// Collapsing ignores the stored width until the sidebar is re-opened.
+const resizer = document.getElementById('sidebar-resizer');
+const SIDEBAR_W_KEY = 'usher.sidebarWidth';
+const SIDEBAR_MIN = 180, SIDEBAR_MAX = 480;
+function applySidebarWidth(px) {
+  const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, px));
+  document.documentElement.style.setProperty('--sidebar-width', w + 'px');
+  return w;
+}
+try {
+  const saved = parseInt(localStorage.getItem(SIDEBAR_W_KEY) || '', 10);
+  if (saved) applySidebarWidth(saved);
+} catch {/* private mode */}
+if (resizer) {
+  resizer.addEventListener('pointerdown', (e) => {
+    if (window.innerWidth <= 720) return; // drawer mode: fixed width
+    e.preventDefault();
+    resizer.setPointerCapture(e.pointerId);
+    document.body.classList.add('sidebar-resizing');
+    const startX = e.clientX;
+    const startW = sidebarEl.getBoundingClientRect().width;
+    const onMove = (ev) => {
+      applySidebarWidth(startW + (ev.clientX - startX));
+    };
+    const onUp = (ev) => {
+      resizer.removeEventListener('pointermove', onMove);
+      resizer.removeEventListener('pointerup', onUp);
+      resizer.removeEventListener('pointercancel', onUp);
+      document.body.classList.remove('sidebar-resizing');
+      try {
+        localStorage.setItem(SIDEBAR_W_KEY, String(parseInt(sidebarEl.getBoundingClientRect().width, 10)));
+      } catch {/* private mode */}
+    };
+    resizer.addEventListener('pointermove', onMove);
+    resizer.addEventListener('pointerup', onUp);
+    resizer.addEventListener('pointercancel', onUp);
+  });
 }
 
 // Kebab popover. A single floating element lives at document level and
@@ -338,6 +388,13 @@ function openKebabPopover(btn) {
 }
 
 document.addEventListener('click', (e) => {
+  const quick = e.target.closest('.row-action-btn');
+  if (quick) {
+    e.preventDefault();
+    e.stopPropagation();
+    handleKebabAction(quick.dataset.quick, quick.dataset.id);
+    return;
+  }
   const cwdToggle = e.target.closest('.cwd-toggle-archived');
   if (cwdToggle) {
     e.preventDefault();
@@ -532,16 +589,68 @@ async function handleKebabAction(action, id) {
   }
 }
 
+// ---------- Lightweight app modal (replaces native confirm/prompt) ----------
+
+// appModal shows a small dialog and resolves with the action name clicked.
+// actions: [{name, label, kind: 'primary'|'danger'|'plain'}]. Esc/overlay
+// click resolves null. An input field is included when opts.input is set:
+// {label, value, placeholder} — the resolve value is then {action, text}.
+function appModal(opts) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.id = 'app-modal'; // NOT "modal" — interaction.js owns that id and
+    // removes it on every poll when no questions are pending.
+    const inputHtml = opts.input
+      ? `<label class="app-modal-label">${esc(opts.input.label || '')}</label>` +
+        `<input class="app-modal-input" type="text" value="${esc(opts.input.value || '')}" placeholder="${esc(opts.input.placeholder || '')}">`
+      : '';
+    const buttons = opts.actions.map(a =>
+      `<button type="button" class="app-modal-btn app-modal-${a.kind || 'plain'}" data-action="${esc(a.name)}">${esc(a.label)}</button>`
+    ).join('');
+    wrap.innerHTML = `
+      <div class="overlay"></div>
+      <div class="dialog app-modal">
+        <h3>${esc(opts.title || '')}</h3>
+        ${opts.body ? `<div class="app-modal-body">${esc(opts.body)}</div>` : ''}
+        ${inputHtml}
+        <div class="app-modal-actions">${buttons}</div>
+      </div>`;
+    document.body.appendChild(wrap);
+    const input = wrap.querySelector('.app-modal-input');
+    if (input) { input.focus(); input.select(); }
+    const done = (action) => {
+      wrap.remove();
+      document.removeEventListener('keydown', onKey, true);
+      if (action && opts.input) resolve({ action, text: input.value });
+      else resolve(action ? { action } : null);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); done(null); }
+      if (e.key === 'Enter' && opts.input) { e.stopPropagation(); done(opts.actions[0].name); }
+    };
+    document.addEventListener('keydown', onKey, true);
+    wrap.querySelector('.overlay').addEventListener('click', () => done(null));
+    wrap.querySelectorAll('.app-modal-btn').forEach(b =>
+      b.addEventListener('click', () => done(b.dataset.action)));
+  });
+}
+
 // deleteSession permanently removes a session (and its transcript) after a
 // confirm — irreversible, unlike archive. If the deleted session is the one on
 // screen, route home so the detail view doesn't sit on a now-404 id.
 async function deleteSession(id) {
-  if (!confirm('Delete this session permanently? Its conversation transcript will be removed and cannot be recovered.')) {
-    return;
-  }
+  const res = await appModal({
+    title: 'Delete session?',
+    body: 'The conversation transcript will be removed permanently and cannot be recovered.',
+    actions: [
+      { name: 'delete', label: 'Delete', kind: 'danger' },
+      { name: 'cancel', label: 'Cancel', kind: 'plain' },
+    ],
+  });
+  if (!res || res.action !== 'delete') return;
   try {
-    const res = await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const res2 = await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!res2.ok) throw new Error('HTTP ' + res2.status);
     if (location.hash === '#/s/' + encodeURIComponent(id)) {
       location.hash = '#/';
     }
@@ -549,7 +658,7 @@ async function deleteSession(id) {
     loadList(); // no-op unless the list view is open
   } catch (e) {
     console.warn('delete failed', e);
-    alert('Failed to delete session.');
+    appModal({ title: 'Delete failed', body: String(e.message || e), actions: [{ name: 'ok', label: 'OK', kind: 'primary' }] });
   }
 }
 
@@ -570,15 +679,22 @@ async function pauseSession(id) {
 }
 
 async function renameSession(id) {
-  const title = prompt('Rename session (empty to reset):');
-  if (title === null) return;
+  const res = await appModal({
+    title: 'Rename session',
+    input: { label: 'title (empty resets to the derived title)', value: '', placeholder: 'session title' },
+    actions: [
+      { name: 'save', label: 'Save', kind: 'primary' },
+      { name: 'cancel', label: 'Cancel', kind: 'plain' },
+    ],
+  });
+  if (!res || res.action !== 'save') return;
   try {
-    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/rename', {
+    const res2 = await fetch('/api/sessions/' + encodeURIComponent(id) + '/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title: res.text || '' }),
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res2.ok) throw new Error('HTTP ' + res2.status);
     loadSidebar();
     loadList();
     if (id === currentDetailId) refreshSubtitle(id);
