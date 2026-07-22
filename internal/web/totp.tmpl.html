@@ -32,13 +32,19 @@
   #qr {
     display: grid;
     place-items: center;
-    padding: 16px;
+    padding: 20px;
     background: #fff;
     border: 1px solid #efefef;
     border-radius: 10px;
     margin-bottom: 16px;
   }
-  #qr img, #qr canvas { display: block; }
+  #qr img, #qr canvas {
+    display: block;
+    width: 240px;
+    height: 240px;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
   .key-label {
     font-size: 11px;
     font-weight: 600;
@@ -126,7 +132,7 @@
     <div class="key-label">manual entry key</div>
     <div class="key">{{.Secret}}</div>
     <div class="row">
-      <a class="btn btn-primary" href="#/">Done</a>
+      <a class="btn btn-primary" href="/">Done</a>
       <form method="post" action="/totp/remove" onsubmit="return confirm('Remove two-factor auth? Every device will be signed out.')">
         <button class="btn btn-danger" type="submit">Remove</button>
       </form>
@@ -162,7 +168,7 @@
   var qr = qrcode(0, 'M');
   qr.addData({{.URI}});
   qr.make();
-  el.innerHTML = qr.createImgTag(5, 8);
+  el.innerHTML = qr.createImgTag(4, 4);
 </script>
 {{end}}
 </body>
