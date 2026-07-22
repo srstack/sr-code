@@ -33,7 +33,7 @@ func runTotp(args []string) error {
 		fmt.Fprintln(os.Stderr, "two-factor auth disabled; all browser sessions have been kicked.")
 		return nil
 	}
-	_, uri, err := store.TotpEnroll("SR Code", "admin")
+	_, uri, err := store.TotpEnrollDirect("SR Code", "admin")
 	if err != nil {
 		return err
 	}

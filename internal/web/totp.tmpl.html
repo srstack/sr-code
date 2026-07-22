@@ -79,22 +79,83 @@
   }
   .btn-danger:hover { background: #fef2f2; }
   form { margin: 0; }
+  input[type=text] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    background: #f4f4f5;
+    border: 1px solid #d9d9d9;
+    border-radius: 8px;
+    color: inherit;
+    font: inherit;
+    font-size: 18px;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    letter-spacing: 0.3em;
+    text-align: center;
+    margin-bottom: 12px;
+  }
+  input[type=text]:focus { outline: none; border-color: #0d0d0d; }
+  .err {
+    margin: 0 0 12px;
+    padding: 8px 12px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    color: #991b1b;
+    font-size: 13px;
+  }
+  .status {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #e6f4ea;
+    color: #1a7f37;
+    margin-bottom: 12px;
+  }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Two-factor auth</h1>
-  <div class="sub">Scan this QR code with your authenticator app (Google Authenticator, Authy, 1Password…), then sign in with the 6-digit code it shows.</div>
-  <div id="qr"></div>
-  <div class="key-label">manual entry key</div>
-  <div class="key">{{.Secret}}</div>
-  <div class="row">
-    <a class="btn btn-primary" href="#/">Done</a>
-    <form method="post" action="/totp/remove" onsubmit="return confirm('Remove two-factor auth? Every device will be signed out.')">
-      <button class="btn btn-danger" type="submit">Remove</button>
+  {{if .Enabled}}
+    <div class="status">enabled</div>
+    <div class="sub">Your account is protected by an authenticator code. Sign-in needs only the 6-digit code — no password.</div>
+    <div id="qr"></div>
+    <div class="key-label">manual entry key</div>
+    <div class="key">{{.Secret}}</div>
+    <div class="row">
+      <a class="btn btn-primary" href="#/">Done</a>
+      <form method="post" action="/totp/remove" onsubmit="return confirm('Remove two-factor auth? Every device will be signed out.')">
+        <button class="btn btn-danger" type="submit">Remove</button>
+      </form>
+    </div>
+  {{else if .Enrolling}}
+    <div class="sub">1. Scan this QR code with your authenticator app (Google Authenticator, Authy, 1Password…).</div>
+    <div id="qr"></div>
+    <div class="key-label">manual entry key</div>
+    <div class="key">{{.Secret}}</div>
+    <div class="sub">2. Enter the 6-digit code the app shows to finish setup. TOTP stays off until this succeeds.</div>
+    {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
+    <form method="post" action="/totp/confirm" autocomplete="off">
+      <input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="000000" autofocus required>
+      <div class="row">
+        <button class="btn btn-primary" type="submit">Activate</button>
+        <a class="btn btn-danger" href="/totp">Cancel</a>
+      </div>
     </form>
-  </div>
+  {{else}}
+    <div class="sub">Add an authenticator-app code to your sign-in. Once enabled, signing in needs only the 6-digit code — no password.</div>
+    <form method="post" action="/totp/enable">
+      <div class="row">
+        <button class="btn btn-primary" type="submit">Enable two-factor auth</button>
+        <a class="btn btn-danger" href="#/">Back</a>
+      </div>
+    </form>
+  {{end}}
 </div>
+{{if .URI}}
 <script src="/vendor/qrcode.js"></script>
 <script>
   var el = document.getElementById('qr');
@@ -103,5 +164,6 @@
   qr.make();
   el.innerHTML = qr.createImgTag(5, 8);
 </script>
+{{end}}
 </body>
 </html>

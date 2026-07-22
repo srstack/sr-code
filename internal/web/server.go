@@ -164,6 +164,8 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /logout", s.handleLogout)
 	webMux.HandleFunc("POST /logout", s.handleLogout)
 	webMux.HandleFunc("GET /totp", s.handleTotp)
+	webMux.HandleFunc("POST /totp/enable", s.handleTotp)
+	webMux.HandleFunc("POST /totp/confirm", s.handleTotpConfirm)
 	webMux.HandleFunc("POST /totp/remove", s.handleTotpRemove)
 
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
@@ -396,16 +398,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	pw := r.PostForm.Get("password")
 	next := r.PostForm.Get("next")
-	if !s.auth.Verify(pw) {
+	// TOTP enrolled: the 6-digit code alone is the credential (password stays
+	// as a recovery path only when TOTP is off).
+	if s.auth.TotpEnabled() {
+		if !s.auth.VerifyTotp(r.PostForm.Get("code")) {
+			s.auth.Limiter.OnFailure(ip)
+			s.logger.Info("login failed (totp)", "ip", ip)
+			s.renderLogin(w, r, "invalid 6-digit code", http.StatusUnauthorized, next)
+			return
+		}
+	} else if !s.auth.Verify(pw) {
 		s.auth.Limiter.OnFailure(ip)
 		s.logger.Info("login failed", "ip", ip)
 		s.renderLogin(w, r, "invalid password", http.StatusUnauthorized, next)
-		return
-	}
-	if s.auth.TotpEnabled() && !s.auth.VerifyTotp(r.PostForm.Get("code")) {
-		s.auth.Limiter.OnFailure(ip)
-		s.logger.Info("login failed (totp)", "ip", ip)
-		s.renderLogin(w, r, "invalid 6-digit code", http.StatusUnauthorized, next)
 		return
 	}
 	s.auth.Limiter.OnSuccess(ip)
@@ -433,8 +438,8 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 	})
 }
 
-// handleTotp shows the TOTP enrollment page (QR + manual key). Authenticated
-// only — the middleware gates it like every other page.
+// handleTotp renders the two-factor page: current status (GET never
+// changes state), or the enrollment QR after POST /totp/enable.
 func (s *Server) handleTotp(w http.ResponseWriter, r *http.Request) {
 	if s.auth == nil {
 		http.NotFound(w, r)
@@ -444,17 +449,63 @@ func (s *Server) handleTotp(w http.ResponseWriter, r *http.Request) {
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
-	secret, uri, err := s.auth.TotpEnroll("SR Code", "admin@"+host)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+	view := struct {
+		Enabled  bool
+		Enrolling bool
+		Secret   string
+		URI      string
+		Error    string
+	}{Enabled: s.auth.TotpEnabled()}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/totp/enable" {
+		secret, uri, err := s.auth.TotpBegin("SR Code", "admin@"+host)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		view.Enrolling = true
+		view.Secret = secret
+		view.URI = strconv.Quote(uri)
+	} else if view.Enabled {
+		secret, uri, err := s.auth.TotpEnrollURI("SR Code", "admin@"+host)
+		if err == nil {
+			view.Secret = secret
+			view.URI = strconv.Quote(uri)
+		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = totpTmpl.Execute(w, struct {
-		Secret string
-		URI    string
-	}{Secret: secret, URI: strconv.Quote(uri)})
+	_ = totpTmpl.Execute(w, view)
+}
+
+// handleTotpConfirm activates enrollment: the user proves their app works by
+// entering its current code before TOTP can ever lock anyone out.
+func (s *Server) handleTotpConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid form")
+		return
+	}
+	if err := s.auth.TotpConfirm(r.PostForm.Get("code")); err != nil {
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		secret, uri, _ := s.auth.TotpBegin("SR Code", "admin@"+host) // restart enrollment display
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = totpTmpl.Execute(w, struct {
+			Enabled   bool
+			Enrolling bool
+			Secret    string
+			URI       string
+			Error     string
+		}{Enabled: false, Enrolling: true, Secret: secret, URI: strconv.Quote(uri), Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, "/totp", http.StatusSeeOther)
 }
 
 // handleTotpRemove disables TOTP. Removing the second factor rotates the

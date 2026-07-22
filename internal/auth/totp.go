@@ -37,21 +37,79 @@ func (s *Store) TotpEnabled() bool {
 	return s.totpSecret != nil
 }
 
-// TotpEnroll generates (or returns the existing) secret and the otpauth://
-// URI to encode as a QR code. issuer/account label the entry in the app.
-func (s *Store) TotpEnroll(issuer, account string) (secretBase32, uri string, err error) {
+// TotpBegin starts enrollment: generates a PENDING secret (memory only) and
+// returns it with the otpauth:// URI. Nothing is persisted — a stray page
+// visit can never lock anyone out. TotpConfirm activates it. Calling Begin
+// again while a pending secret exists reuses it, so a wrong confirmation
+// code doesn't force a rescan.
+func (s *Store) TotpBegin(issuer, account string) (secretBase32, uri string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.totpSecret == nil {
+	if s.totpPending == nil {
 		raw := make([]byte, 20)
 		if _, err := rand.Read(raw); err != nil {
 			return "", "", err
 		}
-		s.totpSecret = raw
-		if err := s.writeTotpLocked(); err != nil {
-			s.totpSecret = nil
-			return "", "", err
-		}
+		s.totpPending = raw
+	}
+	secretBase32 = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(s.totpPending)
+	v := url.Values{}
+	v.Set("secret", secretBase32)
+	v.Set("issuer", issuer)
+	v.Set("digits", "6")
+	v.Set("period", "30")
+	uri = "otpauth://totp/" + url.PathEscape(issuer+":"+account) + "?" + v.Encode()
+	return secretBase32, uri, nil
+}
+
+// TotpConfirm activates two-factor auth iff code matches the pending secret
+// — proving the user has it in their app before we can ever lock them out.
+func (s *Store) TotpConfirm(code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.totpPending == nil {
+		return errors.New("no enrollment in progress")
+	}
+	if !verifyTotpWith(s.totpPending, code) {
+		return errors.New("code does not match; scan the QR and try the current 6-digit code")
+	}
+	s.totpSecret = s.totpPending
+	s.totpPending = nil
+	return s.writeTotpLocked()
+}
+
+// TotpEnrollDirect generates and ACTIVATES a secret immediately, returning
+// the otpauth:// URI. Used by the CLI recovery path, where running the
+// command is itself the explicit confirmation.
+func (s *Store) TotpEnrollDirect(issuer, account string) (secretBase32, uri string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw := make([]byte, 20)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	s.totpSecret = raw
+	if err := s.writeTotpLocked(); err != nil {
+		s.totpSecret = nil
+		return "", "", err
+	}
+	secretBase32 = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw)
+	v := url.Values{}
+	v.Set("secret", secretBase32)
+	v.Set("issuer", issuer)
+	v.Set("digits", "6")
+	v.Set("period", "30")
+	uri = "otpauth://totp/" + url.PathEscape(issuer+":"+account) + "?" + v.Encode()
+	return secretBase32, uri, nil
+}
+
+// TotpEnrollURI returns the otpauth:// URI for an ALREADY-enrolled secret
+// (display only, e.g. adding a second device).
+func (s *Store) TotpEnrollURI(issuer, account string) (secretBase32, uri string, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.totpSecret == nil {
+		return "", "", errors.New("totp not enrolled")
 	}
 	secretBase32 = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(s.totpSecret)
 	v := url.Values{}
@@ -82,6 +140,10 @@ func (s *Store) VerifyTotp(code string) bool {
 	if secret == nil {
 		return false
 	}
+	return verifyTotpWith(secret, code)
+}
+
+func verifyTotpWith(secret []byte, code string) bool {
 	code = strings.TrimSpace(code)
 	if len(code) != 6 {
 		return false

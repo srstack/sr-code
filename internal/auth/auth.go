@@ -77,6 +77,7 @@ type Store struct {
 	hash       *Hash  // nil ⇒ auth disabled
 	secret     []byte // HMAC key, always non-nil after Load
 	totpSecret []byte // nil ⇒ TOTP disabled
+	totpPending []byte // enrollment in progress, not yet active
 
 	// Limiter gates /login attempts. Callers acquire before verifying and
 	// report success/failure after.
