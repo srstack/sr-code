@@ -327,8 +327,27 @@ body {
 }
 .cwd-toggle-archived:hover { color: var(--text-faint); background: var(--bg-hover); }
 
-/* ===== App modal (confirm/prompt replacements) ===== */
+/* Running tool placeholder card */
+.tool-details.running { border-style: dashed; }
+.tool-details.running > summary { color: var(--text-faint); }
+.tool-running {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.5rem 0.65rem;
+  color: var(--text-faint);
+  font-size: 0.8rem;
+  font-style: italic;
+}
+.tool-running-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--live-dot);
+  animation: breathe 2s ease-in-out infinite;
+}
 
+/* ===== App modal (confirm/prompt replacements) ===== */
 .app-modal { max-width: 400px; }
 .app-modal-body {
   color: var(--text-muted);

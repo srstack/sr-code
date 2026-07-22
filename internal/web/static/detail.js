@@ -757,6 +757,7 @@ function openEventStream(id, chatEl, renderAction, confirmRunningAction) {
   };
   const onIdle = () => {
     detailStreaming = false;
+    stopThinkTimer();
     renderAction();
     setLoadEarlierDisabled(false);
   };
@@ -1111,6 +1112,26 @@ registerRefreshSubtitle(refreshSubtitle);
 
 // ----- live turn (streamed parts) -----
 
+// thinking… elapsed-time ticker: updates the live bubble's role label every
+// second while the turn is still in its pre-output phase. Self-stops the
+// moment the role flips to 'assistant' (first part arrived) or the turn ends.
+let thinkTimer = null;
+function startThinkTimer(node) {
+  stopThinkTimer();
+  const t0 = Date.now();
+  thinkTimer = setInterval(() => {
+    const roleEl = node && node.querySelector('.role');
+    if (!roleEl || !roleEl.firstChild || !String(roleEl.firstChild.textContent).startsWith('thinking')) {
+      stopThinkTimer();
+      return;
+    }
+    roleEl.firstChild.textContent = `thinking… ${Math.floor((Date.now() - t0) / 1000)}s`;
+  }, 1000);
+}
+function stopThinkTimer() {
+  if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+}
+
 // ensureLiveTurn stands up the optimistic assistant bubble the streamed parts
 // render into. Parts-shaped from birth (empty parts array → role header only)
 // so it matches the structure of a committed turn.
@@ -1120,6 +1141,7 @@ function ensureLiveTurn() {
   if (!node) return null;
   node.classList.add('optimistic');
   liveTurn = { node, parts: [], partNodes: [], ts: '', preview: null, previewText: '', previewRAF: 0, acceptDeltas: true };
+  startThinkTimer(node);
   return liveTurn;
 }
 

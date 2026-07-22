@@ -325,8 +325,16 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 			if json.Unmarshal(ev.Part, &p) != nil || p.State == nil {
 				return true
 			}
+			if p.State.Status == "running" || p.State.Status == "pending" {
+				// Live placeholder only: the card shows immediately while the
+				// tool runs; the shadow gets the completed pair on finish.
+				if raw := assistantLine(t.id, toolUseBlocks(p), ts); raw != nil {
+					t.emit(ctx, backend.Event{Type: "assistant", Raw: withModel(raw, t.model)})
+				}
+				return true
+			}
 			if p.State.Status != "completed" && p.State.Status != "error" {
-				return true // running/pending: wait for the terminal state
+				return true
 			}
 			if !t.appendAndEmit(ctx, path, "assistant", withModel(assistantLine(t.id, toolUseBlocks(p), ts), t.model)) {
 				return false

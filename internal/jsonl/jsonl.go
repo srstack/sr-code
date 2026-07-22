@@ -272,10 +272,14 @@ func IsTurnComplete(raw []byte) bool {
 type Assembler struct {
 	toolMap map[string]toolInfo
 	cur     *Turn
+	// pendingTool tracks placeholder tool parts (emitted when a tool_use
+	// appears, before its result) by tool_use id, so the result replaces the
+	// placeholder instead of appending a second card.
+	pendingTool map[string]int
 }
 
 func NewAssembler() *Assembler {
-	return &Assembler{toolMap: map[string]toolInfo{}}
+	return &Assembler{toolMap: map[string]toolInfo{}, pendingTool: map[string]int{}}
 }
 
 // Feed consumes one session event. completed holds turns this event finished
@@ -367,18 +371,26 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	a.cur.Touch(ev.Timestamp)
 
 	if ev.Type == "assistant" {
-		// Collect tool_use id→info for later matching.
+		// Collect tool_use id→info for later matching, and stand up an empty
+		// card for each call so long-running tools are visible while running
+		// instead of appearing only when they finish.
 		collectToolUses(ev.Message, a.toolMap)
+		before := len(a.cur.Parts)
+		a.appendToolPlaceholders(ev.Message)
 		// Append a text part (skip tool_use/thinking-only messages).
 		if text := extractAssistantText(ev.Message); text != "" {
 			p := TurnPart{Type: "text", Content: text}
 			a.cur.Parts = append(a.cur.Parts, p)
 			return nil, &p
 		}
+		if len(a.cur.Parts) > before {
+			return nil, &a.cur.Parts[before]
+		}
 		return nil, nil
 	}
 
-	// user event carrying a tool_result: append as a "tool" part.
+	// user event carrying a tool_result: fill the matching placeholder card
+	// (append only when the call predates this assembler's window).
 	content := renderToolResult(ev)
 	if content == "" {
 		return nil, nil
@@ -391,8 +403,49 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		ToolTarget: ti.target,
 		ToolUseID:  tuID,
 	}
+	if idx, ok := a.pendingTool[tuID]; ok && idx < len(a.cur.Parts) {
+		delete(a.pendingTool, tuID)
+		a.cur.Parts[idx] = p // fill the placeholder in place
+		return nil, &a.cur.Parts[idx]
+	}
 	a.cur.Parts = append(a.cur.Parts, p)
 	return nil, &p
+}
+
+// appendToolPlaceholders emits one empty tool card per tool_use block in an
+// assistant message and records card positions keyed by tool_use id, so the
+// matching tool_result replaces the card in place. Long-running tools become
+// visible at call time instead of at completion time.
+func (a *Assembler) appendToolPlaceholders(msg json.RawMessage) {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return
+	}
+	for _, b := range blocks {
+		if b.Type != "tool_use" || b.ID == "" {
+			continue
+		}
+		if _, dup := a.pendingTool[b.ID]; dup {
+			continue // already has a placeholder (e.g. live event re-delivery)
+		}
+		ti := a.toolMap[b.ID]
+		a.cur.Parts = append(a.cur.Parts, TurnPart{
+			Type:       "tool",
+			ToolName:   ti.name,
+			ToolTarget: ti.target,
+			ToolUseID:  b.ID,
+		})
+		a.pendingTool[b.ID] = len(a.cur.Parts) - 1
+	}
 }
 
 // FeedLineParts is the multi-part entry point: one record can carry several
@@ -434,6 +487,13 @@ func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPa
 		a.cur.UUID = ev.UUID
 	}
 	a.cur.Touch(ev.Timestamp)
+	// Empty tool cards first so running tools are visible immediately; the
+	// result replaces them in place when it lands.
+	before := len(a.cur.Parts)
+	a.appendToolPlaceholders(ev.Message)
+	for i := before; i < len(a.cur.Parts); i++ {
+		parts = append(parts, &a.cur.Parts[i])
+	}
 	for _, b := range blocks {
 		var p *TurnPart
 		switch b.kind {
@@ -446,14 +506,6 @@ func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPa
 		}
 		if p != nil {
 			parts = append(parts, p)
-		}
-	}
-	if len(parts) == 0 {
-		// A tool_use-only line (or empty): run the legacy path for its side
-		// effects (turn bookkeeping) without double-appending content parts.
-		_, part := a.Feed(ev)
-		if part != nil {
-			parts = []*TurnPart{part}
 		}
 	}
 	return nil, parts

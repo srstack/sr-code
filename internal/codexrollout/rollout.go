@@ -269,9 +269,10 @@ type Assembler struct {
 }
 
 type toolStash struct {
-	name   string
-	target string
-	skip   bool
+	name      string
+	target    string
+	skip      bool
+	partIndex int // position of the running placeholder card, -1 if none
 }
 
 func NewAssembler() *Assembler {
@@ -692,13 +693,15 @@ func (a *Assembler) feedResponseItem(l line) (part *core.TurnPart) {
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return &tp
 	case "function_call":
-		// Stash until the output arrives; emit one combined tool part then, so a
-		// tool turn carries name + target + result like Claude's.
-		a.pending[p.CallID] = toolStash{
-			name:   prettyToolName(p.Name),
-			target: toolTarget(p.Arguments),
-		}
-		return nil
+		// Stand up an empty card immediately — long-running commands stay
+		// visible for their whole run instead of appearing at completion.
+		name := prettyToolName(p.Name)
+		target := toolTarget(p.Arguments)
+		a.ensureTurn(l.Timestamp)
+		tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+		a.cur.Parts = append(a.cur.Parts, tp)
+		a.pending[p.CallID] = toolStash{name: name, target: target, partIndex: len(a.cur.Parts) - 1}
+		return &tp
 	case "function_call_output":
 		stash := a.pending[p.CallID]
 		delete(a.pending, p.CallID)
@@ -712,22 +715,51 @@ func (a *Assembler) feedResponseItem(l line) (part *core.TurnPart) {
 			ToolName:   stash.name,
 			ToolTarget: stash.target,
 		}
+		if stash.partIndex >= 0 && stash.partIndex < len(a.cur.Parts) {
+			a.cur.Parts[stash.partIndex] = tp // fill the placeholder in place
+			return &a.cur.Parts[stash.partIndex]
+		}
 		a.cur.Parts = append(a.cur.Parts, tp)
 		return &tp
 	case "custom_tool_call":
 		target := customExecTarget(p.Input)
-		a.pending[p.CallID] = toolStash{
-			name: prettyToolName(p.Name), target: target,
-			skip: customCallHasCanonicalEvent(p.Name, p.Input),
+		name := prettyToolName(p.Name)
+		skip := customCallHasCanonicalEvent(p.Name, p.Input)
+		if skip {
+			// A canonical event elsewhere renders this call (e.g. apply_patch);
+			// no placeholder, or it would dangle as an eternally-running card.
+			a.pending[p.CallID] = toolStash{name: name, target: target, skip: true, partIndex: -1}
+			return nil
 		}
-		return nil
+		a.ensureTurn(l.Timestamp)
+		tp := core.TurnPart{Type: "tool", ToolName: name, ToolTarget: target}
+		a.cur.Parts = append(a.cur.Parts, tp)
+		a.pending[p.CallID] = toolStash{name: name, target: target, partIndex: len(a.cur.Parts) - 1}
+		return &tp
 	case "custom_tool_call_output":
 		stash, ok := a.pending[p.CallID]
 		delete(a.pending, p.CallID)
 		if !ok || stash.skip {
 			return nil
 		}
-		return a.appendTool(l.Timestamp, stash.name, stash.target, renderOutputBody(p.Output))
+		a.ensureTurn(l.Timestamp)
+		body := renderOutputBody(p.Output)
+		content := ""
+		if body != "" {
+			content = fence(clampBody(body))
+		}
+		tp := core.TurnPart{
+			Type:       "tool",
+			Content:    content,
+			ToolName:   stash.name,
+			ToolTarget: stash.target,
+		}
+		if stash.partIndex >= 0 && stash.partIndex < len(a.cur.Parts) {
+			a.cur.Parts[stash.partIndex] = tp
+			return &a.cur.Parts[stash.partIndex]
+		}
+		a.cur.Parts = append(a.cur.Parts, tp)
+		return &tp
 	}
 	return nil
 }
