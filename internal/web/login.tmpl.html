@@ -91,6 +91,10 @@
   <h1>SR Code</h1>
   <label for="password">password</label>
   <input id="password" type="password" name="password" autofocus required>
+  {{if .TOTP}}
+  <label for="code">6-digit code</label>
+  <input id="code" type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000" required>
+  {{end}}
   <input type="hidden" name="next" value="{{.Next}}">
   <button type="submit">sign in</button>
   {{if .Error}}<div class="err">{{.Error}}</div>{{end}}

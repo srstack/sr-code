@@ -52,7 +52,11 @@ var staticFS embed.FS
 //go:embed login.tmpl.html
 var loginTemplateRaw string
 
+//go:embed totp.tmpl.html
+var totpTemplateRaw string
+
 var loginTmpl = template.Must(template.New("login").Parse(loginTemplateRaw))
+var totpTmpl = template.Must(template.New("totp").Parse(totpTemplateRaw))
 
 func init() {
 	// Go's default MIME table has no .webmanifest entry; without this the
@@ -159,6 +163,8 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /login", s.handleLogin)
 	webMux.HandleFunc("GET /logout", s.handleLogout)
 	webMux.HandleFunc("POST /logout", s.handleLogout)
+	webMux.HandleFunc("GET /totp", s.handleTotp)
+	webMux.HandleFunc("POST /totp/remove", s.handleTotpRemove)
 
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
@@ -396,6 +402,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.renderLogin(w, r, "invalid password", http.StatusUnauthorized, next)
 		return
 	}
+	if s.auth.TotpEnabled() && !s.auth.VerifyTotp(r.PostForm.Get("code")) {
+		s.auth.Limiter.OnFailure(ip)
+		s.logger.Info("login failed (totp)", "ip", ip)
+		s.renderLogin(w, r, "invalid 6-digit code", http.StatusUnauthorized, next)
+		return
+	}
 	s.auth.Limiter.OnSuccess(ip)
 	cookieVal, err := s.auth.IssueCookie()
 	if err != nil {
@@ -413,10 +425,50 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 	_ = loginTmpl.Execute(w, struct {
 		Error string
 		Next  string
+		TOTP  bool
 	}{
 		Error: errMsg,
 		Next:  validateNext(next),
+		TOTP:  s.auth != nil && s.auth.TotpEnabled(),
 	})
+}
+
+// handleTotp shows the TOTP enrollment page (QR + manual key). Authenticated
+// only — the middleware gates it like every other page.
+func (s *Server) handleTotp(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		http.NotFound(w, r)
+		return
+	}
+	host := r.Host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	secret, uri, err := s.auth.TotpEnroll("SR Code", "admin@"+host)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = totpTmpl.Execute(w, struct {
+		Secret string
+		URI    string
+	}{Secret: secret, URI: strconv.Quote(uri)})
+}
+
+// handleTotpRemove disables TOTP. Removing the second factor rotates the
+// cookie key, signing every device out (including this one → login page).
+func (s *Server) handleTotpRemove(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.auth.TotpRemove(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

@@ -73,9 +73,10 @@ type Hash struct {
 type Store struct {
 	dataDir string
 
-	mu     sync.RWMutex
-	hash   *Hash  // nil ⇒ auth disabled
-	secret []byte // HMAC key, always non-nil after Load
+	mu         sync.RWMutex
+	hash       *Hash  // nil ⇒ auth disabled
+	secret     []byte // HMAC key, always non-nil after Load
+	totpSecret []byte // nil ⇒ TOTP disabled
 
 	// Limiter gates /login attempts. Callers acquire before verifying and
 	// report success/failure after.
@@ -102,6 +103,9 @@ func Load(dataDir string) (*Store, error) {
 		return nil, err
 	}
 	s.secret = secret
+	if err := s.loadTotp(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -193,6 +197,7 @@ func (s *Store) macForHash() ([]byte, error) {
 	s.mu.RLock()
 	h := s.hash
 	secret := s.secret
+	totp := s.totpSecret
 	s.mu.RUnlock()
 	if h == nil {
 		return nil, errors.New("auth not configured")
@@ -203,6 +208,9 @@ func (s *Store) macForHash() ([]byte, error) {
 	}
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(hashBytes)
+	// Bind the cookie to the TOTP enrollment too: changing or removing the
+	// second factor invalidates every session, same as a password change.
+	mac.Write(totp)
 	return mac.Sum(nil), nil
 }
 

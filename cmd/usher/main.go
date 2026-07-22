@@ -66,6 +66,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usher set-password:", err)
 			os.Exit(1)
 		}
+	case "totp":
+		if err := runTotp(args); err != nil {
+			fmt.Fprintln(os.Stderr, "usher totp:", err)
+			os.Exit(1)
+		}
 	case "mcp-stdio":
 		if err := runMCPStdio(args); err != nil {
 			fmt.Fprintln(os.Stderr, "usher mcp-stdio:", err)
@@ -89,6 +94,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  serve              start the web server")
 	fmt.Fprintln(os.Stderr, "  setup --remove     remove hooks installed by older usher releases")
 	fmt.Fprintln(os.Stderr, "  set-password       set/change the web UI password (required for non-loopback bind)")
+	fmt.Fprintln(os.Stderr, "  totp [--remove]    show the TOTP enrollment URI (or disable two-factor auth)")
 	fmt.Fprintln(os.Stderr, "  hook <event-name>  invoked by Claude Code; not for direct use")
 	fmt.Fprintln(os.Stderr, "  version            print version")
 }
