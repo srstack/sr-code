@@ -599,6 +599,53 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 	}
 	defer f.Close()
 
+	if limit > 0 {
+		return readTurnsTailWindow(f, limit)
+	}
+	return readTurnsFull(f)
+}
+
+const tailWindowSize = 2 << 20 // 2 MB
+
+func readTurnsTailWindow(f *os.File, limit int) (turns []Turn, total int, err error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	size := fi.Size()
+	start := int64(0)
+	if size > tailWindowSize {
+		start = size - tailWindowSize
+	}
+	if _, err := f.Seek(start, 0); err != nil {
+		return nil, 0, err
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	if start > 0 {
+		sc.Scan()
+	}
+
+	asm := NewAssembler()
+	var raw []Turn
+	for sc.Scan() {
+		completed, _ := asm.FeedLineParts(sc.Bytes())
+		raw = append(raw, completed...)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, err
+	}
+	if t := asm.Flush(); t != nil {
+		raw = append(raw, *t)
+	}
+	total = len(raw)
+	if len(raw) > limit {
+		raw = raw[len(raw)-limit:]
+	}
+	return raw, total, nil
+}
+
+func readTurnsFull(f *os.File) (turns []Turn, total int, err error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
@@ -615,9 +662,6 @@ func ReadTurns(path string, limit int) (turns []Turn, total int, err error) {
 		return nil, 0, err
 	}
 	total = len(turns)
-	if limit > 0 && len(turns) > limit {
-		turns = turns[len(turns)-limit:]
-	}
 	return turns, total, nil
 }
 

@@ -97,6 +97,13 @@ func (c *Client) SendToSession(id, text string) error {
 	return c.post(ctx, "/v1/sessions/"+id+"/send", sendReq{Text: text})
 }
 
+// InterruptSession stops the in-flight turn for a session.
+func (c *Client) InterruptSession(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	return c.post(ctx, "/v1/sessions/"+id+"/interrupt", nil)
+}
+
 // StartSession asks the router to spawn a brand-new session.
 func (c *Client) StartSession(cwd, initialMsg, model string) (string, error) {
 	return c.StartSessionWithBackend("", cwd, initialMsg, model)

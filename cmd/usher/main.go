@@ -76,6 +76,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usher mcp-stdio:", err)
 			os.Exit(1)
 		}
+	case "send":
+		if err := runSendCommand(args); err != nil {
+			fmt.Fprintln(os.Stderr, "usher send:", err)
+			os.Exit(1)
+		}
+	case "interrupt":
+		if err := runInterruptCommand(args); err != nil {
+			fmt.Fprintln(os.Stderr, "usher interrupt:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(Version)
 	case "-h", "--help", "help":
@@ -96,6 +106,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  set-password       set/change the web UI password (required for non-loopback bind)")
 	fmt.Fprintln(os.Stderr, "  totp [--remove]    show the TOTP enrollment URI (or disable two-factor auth)")
 	fmt.Fprintln(os.Stderr, "  hook <event-name>  invoked by Claude Code; not for direct use")
+	fmt.Fprintln(os.Stderr, "  send <id> <text>   send a message to a session")
+	fmt.Fprintln(os.Stderr, "  interrupt <id>     stop the in-flight turn for a session")
 	fmt.Fprintln(os.Stderr, "  version            print version")
 }
 

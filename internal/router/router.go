@@ -890,6 +890,12 @@ func (r *Router) CancelSend(sessionID string) error {
 	return nil
 }
 
+// InterruptSession stops the in-flight turn for sessionID — the plugin API
+// name for CancelSend.
+func (r *Router) InterruptSession(sessionID string) error {
+	return r.CancelSend(sessionID)
+}
+
 func (r *Router) SubscribeSession(id string) (<-chan broker.Event, func()) {
 	return r.broker.Subscribe(id)
 }

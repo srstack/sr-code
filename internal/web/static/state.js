@@ -161,10 +161,62 @@ export function clearDraft() {
   if (currentDraftKey) promptDrafts.delete(currentDraftKey);
 }
 
+// --- send history (ArrowUp/ArrowDown in prompt) ---
+
+const historyStore = new Map();
+const maxHistory = 64;
+
+export function pushSendHistory(key, text) {
+  if (!key || !text) return;
+  let h = historyStore.get(key);
+  if (!h) { h = []; historyStore.set(key, h); }
+  if (h.length && h[h.length - 1] === text) return;
+  h.push(text);
+  if (h.length > maxHistory) h.shift();
+}
+
+let histNavKey = null;
+let histNavIdx = -1;
+let histNavSaved = '';
+
+export function historyNavigate(key, promptEl, direction) {
+  if (!promptEl || !key) return;
+  const h = historyStore.get(key);
+  if (!h || h.length === 0) return;
+  if (histNavKey !== key) {
+    histNavKey = key;
+    histNavIdx = h.length;
+    histNavSaved = promptEl.value;
+  }
+  const prev = histNavIdx;
+  if (direction < 0) {
+    histNavIdx = Math.max(0, histNavIdx - 1);
+  } else {
+    histNavIdx = Math.min(h.length, histNavIdx + 1);
+  }
+  if (histNavIdx === prev) return;
+  promptEl.value = histNavIdx < h.length ? h[histNavIdx] : histNavSaved;
+  promptEl.selectionStart = promptEl.value.length;
+  promptEl.selectionEnd = promptEl.value.length;
+  growPrompt(promptEl);
+}
+
+export function resetHistoryNav() {
+  histNavKey = null;
+  histNavIdx = -1;
+  histNavSaved = '';
+}
+
 document.addEventListener('input', (e) => {
   if (e.target && e.target.id === 'prompt') {
     growPrompt(e.target);
     if (currentDraftKey) promptDrafts.set(currentDraftKey, e.target.value);
+  }
+});
+
+document.addEventListener('focusout', (e) => {
+  if (e.target && e.target.id === 'prompt') {
+    resetHistoryNav();
   }
 });
 

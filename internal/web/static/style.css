@@ -1325,7 +1325,7 @@ td.cwd { font-size: 0.75rem; }
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 0.95rem;
+  font-size: 16px;
   line-height: 1.55;
   resize: none;
   min-height: calc(1.5rem + 1.25rem);

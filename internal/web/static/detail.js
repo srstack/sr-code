@@ -6,6 +6,7 @@ import {
   setSuppressAppendScroll,
   isNearBottom, markViewing, setCurrentES,
   restoreDraft, clearDraft, growPrompt,
+  pushSendHistory, historyNavigate, resetHistoryNav,
   registerRefreshSubtitle,
 } from './state.js';
 import {
@@ -646,6 +647,8 @@ export async function showDetail(id) {
   const submit = async () => {
     const text = promptEl.value;
     if (!text.trim() || detailStreaming || actionPending) return;
+    pushSendHistory('s:' + id, text);
+    resetHistoryNav();
     actionPending = 'send';
     sendAccepted = false;
     sendLifecycleObserved = false;
@@ -707,8 +710,24 @@ export async function showDetail(id) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submit();
+      return;
+    }
+    if (e.key === 'ArrowUp' && !e.isComposing) {
+      if (promptEl.selectionStart === 0 || promptEl.value.length === 0) {
+        e.preventDefault();
+        historyNavigate('s:' + id, promptEl, -1);
+      }
+      return;
+    }
+    if (e.key === 'ArrowDown' && !e.isComposing) {
+      if (promptEl.selectionStart === promptEl.value.length) {
+        e.preventDefault();
+        historyNavigate('s:' + id, promptEl, 1);
+      }
+      return;
     }
   });
+  setupPasteImage(promptEl, id);
 
   promptEl.focus();
 }
@@ -1016,6 +1035,8 @@ export async function showMainChat(id) {
   const submit = async () => {
     const text = promptEl.value;
     if (!text.trim() || sendBtn.disabled) return;
+    pushSendHistory('c:' + id, text);
+    resetHistoryNav();
     sendBtn.disabled = true;
     promptEl.value = '';
     clearDraft();
@@ -1057,8 +1078,24 @@ export async function showMainChat(id) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submit();
+      return;
+    }
+    if (e.key === 'ArrowUp' && !e.isComposing) {
+      if (promptEl.selectionStart === 0 || promptEl.value.length === 0) {
+        e.preventDefault();
+        historyNavigate('c:' + id, promptEl, -1);
+      }
+      return;
+    }
+    if (e.key === 'ArrowDown' && !e.isComposing) {
+      if (promptEl.selectionStart === promptEl.value.length) {
+        e.preventDefault();
+        historyNavigate('c:' + id, promptEl, 1);
+      }
+      return;
     }
   });
+  setupPasteImage(promptEl, id);
   promptEl.focus();
 }
 
@@ -1575,4 +1612,43 @@ function legacyCopy(s) {
   try { ok = document.execCommand('copy'); } catch (_) {}
   ta.remove();
   return ok;
+}
+
+function setupPasteImage(el, sessionId) {
+  if (!el || !sessionId) return;
+  el.addEventListener('paste', async (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      if (!items[i].type.startsWith('image/')) continue;
+      e.preventDefault();
+      const file = items[i].getAsFile();
+      if (!file) continue;
+      const placeholder = '[uploading image…]';
+      const start = el.selectionStart;
+      el.setRangeText(placeholder, start, el.selectionEnd, 'end');
+      el.selectionStart = start + placeholder.length;
+      el.selectionEnd = start + placeholder.length;
+      try {
+        const fd = new FormData();
+        fd.append('file', file, 'paste-' + Date.now() + '.' + (file.type.split('/')[1] || 'png'));
+        const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/upload', {
+          method: 'POST',
+          body: fd,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || 'HTTP ' + res.status);
+        }
+        const data = await res.json();
+        el.value = el.value.replace(placeholder, data.path);
+      } catch (err) {
+        el.value = el.value.replace(placeholder, '');
+        el.value += '\n[upload failed: ' + String(err.message || err) + ']';
+      } finally {
+        growPrompt(el);
+      }
+      return;
+    }
+  });
 }

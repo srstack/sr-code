@@ -37,6 +37,7 @@ type RouterAPI interface {
 	StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error)
 	SubscribeAllSessions() (<-chan broker.Event, func())
 	SendToSession(id, text string) error
+	InterruptSession(id string) error
 	ListPendingInteractions() []hook.Pending
 	SubscribePendingInteractions() (<-chan hook.Pending, func())
 	RespondInteraction(id string, resp hook.Response) error
@@ -98,6 +99,7 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/sessions", s.handleStartSession)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/send", s.handleSend)
+	mux.HandleFunc("POST /v1/sessions/{id}/interrupt", s.handleInterrupt)
 	mux.HandleFunc("POST /v1/sessions/{id}/attachments", s.handleAttachment)
 	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.HandleFunc("GET /v1/interactions", s.handleInteractions)
@@ -176,6 +178,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.router.SendToSession(r.PathValue("id"), req.Text); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleInterrupt(w http.ResponseWriter, r *http.Request) {
+	if err := s.router.InterruptSession(r.PathValue("id")); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}

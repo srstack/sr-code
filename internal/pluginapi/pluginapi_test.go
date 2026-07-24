@@ -69,6 +69,13 @@ func (f *fakeRouter) SendToSession(id, text string) error {
 	return nil
 }
 
+func (f *fakeRouter) InterruptSession(id string) error {
+	if _, ok := f.sessions[id]; !ok {
+		return errors.New("no such session")
+	}
+	return nil
+}
+
 func (f *fakeRouter) StartSessionWithBackend(backend, cwd, initialMsg, model string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
