@@ -44,10 +44,11 @@ needed, vendor a popular, self-contained, minimal one.
   dereference references that appear in a transcript (e.g. images shown by a
   tool), but it never offers filesystem navigation or interpretation. The only
   exception is one tmux shell per conversation, opened in its cwd and limited
-  to whole-text input plus fixed control keys. It is not a filesystem API or
-  security boundary. Still decided and out of scope:
+  to keystroke-level input (typed text, pasted text, and an allow-listed set
+  of tmux control keys) — whole-line submit is a convenience on top. It is
+  not a filesystem API or security boundary. Still decided and out of scope:
   file-read or directory-listing endpoints, diff views, syntax highlighting,
-  arbitrary send-keys, path linkification in prose, a native VSCode extension.
+  path linkification in prose, a native VSCode extension.
 - **The main-chat agent never answers substantive questions itself.** Its only
   local job is session management (list, route, focus, permission handling,
   create). Anything else — however trivial-looking — is forwarded to a

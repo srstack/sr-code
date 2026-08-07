@@ -159,6 +159,28 @@ func (m *Manager) Submit(id, requestID, text string) error {
 	return nil
 }
 
+// Type pastes text WITHOUT pressing Enter — keystroke-driven typing, as
+// opposed to Submit's whole-line command. No bracketed-paste wrap: the text
+// reaches the pty exactly as if typed.
+func (m *Manager) Type(id, text string) error {
+	if !m.Available() {
+		return ErrUnavailable
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasLocked(id) {
+		return ErrNotOpen
+	}
+	buf := "usher-terminal-type"
+	if _, err := m.runner.runStdin(text, "load-buffer", "-b", buf, "-"); err != nil {
+		return fmt.Errorf("load terminal input: %w", err)
+	}
+	if _, err := m.runner.run("paste-buffer", "-d", "-b", buf, "-t", target(id)); err != nil {
+		return fmt.Errorf("type terminal input: %w", err)
+	}
+	return nil
+}
+
 // SendControl accepts already allow-listed tmux key names from the web layer.
 func (m *Manager) SendControl(id string, keys ...string) error {
 	if !m.Available() {

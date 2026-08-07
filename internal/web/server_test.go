@@ -55,8 +55,11 @@ func TestTerminalControlsAreAllowListed(t *testing.T) {
 	want := map[string]string{
 		"up": "Up", "down": "Down", "left": "Left", "right": "Right",
 		"enter": "Enter", "escape": "Escape", "tab": "Tab",
-		"ctrl-c": "C-c", "ctrl-z": "C-z", "ctrl-d": "C-d", "ctrl-x": "C-x",
-		"ctrl-o": "C-o", "ctrl-w": "C-w", "ctrl-k": "C-k", "ctrl-u": "C-u",
+		"backspace": "BSpace", "delete": "DC", "home": "Home", "end": "End",
+		"pageup": "PPage", "pagedown": "NPage",
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		want["ctrl-"+string(c)] = "C-" + string(c)
 	}
 	if len(terminalControls) != len(want) {
 		t.Fatalf("terminalControls has %d entries, want %d", len(terminalControls), len(want))

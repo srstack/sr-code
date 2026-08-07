@@ -134,22 +134,55 @@ func NewServer(
 }
 
 // handleModels feeds the new-session picker from each backend's model catalog.
+// Catalogs are fetched in parallel with a bounded wait: a cold agent CLI (or
+// a starting opencode2 service) must not freeze the whole picker.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	backends := s.router.Backends()
 	models := make(map[string][]backend.Model, len(backends))
+	defaults := make(map[string]string, len(backends))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, name := range backends {
-		catalog, err := s.router.Models(r.Context(), name)
-		if err == nil {
-			models[name] = catalog
-		}
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+			defer cancel()
+			if catalog, err := s.router.Models(ctx, name); err == nil {
+				mu.Lock()
+				models[name] = catalog
+				mu.Unlock()
+			}
+			if b, ok := s.router.Backend(name); ok && b.Models != nil {
+				if dm, ok := b.Models.(interface {
+					DefaultModel(context.Context) (string, error)
+				}); ok {
+					if def, err := dm.DefaultModel(ctx); err == nil && def != "" {
+						mu.Lock()
+						defaults[name] = def
+						mu.Unlock()
+					}
+				}
+			}
+		}(name)
 	}
+	wg.Wait()
 	writeJSON(w, http.StatusOK, struct {
 		Backends []string                   `json:"backends"`
 		Models   map[string][]backend.Model `json:"models"`
+		Defaults map[string]string          `json:"defaults"`
 	}{
 		Backends: backends,
 		Models:   models,
+		Defaults: defaults,
 	})
+}
+
+// handleBackends is the cheap half of handleModels: just the enabled backend
+// names, so the new-session form can render its backend picker immediately
+// instead of waiting on every model catalog.
+func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string][]string{"backends": s.router.Backends()})
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -171,6 +204,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	webMux.HandleFunc("GET /api/models", s.handleModels)
+	webMux.HandleFunc("GET /api/backends", s.handleBackends)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
@@ -182,6 +216,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/terminal", s.handleOpenTerminal)
 	webMux.HandleFunc("DELETE /api/sessions/{id}/terminal", s.handleCloseTerminal)
 	webMux.HandleFunc("POST /api/sessions/{id}/terminal/input", s.handleTerminalInput)
+	webMux.HandleFunc("POST /api/sessions/{id}/terminal/type", s.handleTerminalType)
 	webMux.HandleFunc("GET /api/sessions/{id}/terminal/screen", s.handleTerminalScreen)
 	webMux.HandleFunc("GET /api/sessions/{id}/image", s.handleSessionImage)
 	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
@@ -1034,21 +1069,27 @@ const (
 
 // terminalControls is the fixed set of keys accepted by the HTTP API.
 var terminalControls = map[string]string{
-	"up":     "Up",
-	"down":   "Down",
-	"left":   "Left",
-	"right":  "Right",
-	"enter":  "Enter",
-	"escape": "Escape",
-	"tab":    "Tab",
-	"ctrl-c": "C-c",
-	"ctrl-z": "C-z",
-	"ctrl-d": "C-d",
-	"ctrl-x": "C-x",
-	"ctrl-o": "C-o",
-	"ctrl-w": "C-w",
-	"ctrl-k": "C-k",
-	"ctrl-u": "C-u",
+	"up":        "Up",
+	"down":      "Down",
+	"left":      "Left",
+	"right":     "Right",
+	"enter":     "Enter",
+	"escape":    "Escape",
+	"tab":       "Tab",
+	"backspace": "BSpace",
+	"delete":    "DC",
+	"home":      "Home",
+	"end":       "End",
+	"pageup":    "PPage",
+	"pagedown":  "NPage",
+}
+
+// Ctrl-letter combos complete the keystroke set (ctrl-c/z/d/x/o/w/k/u were
+// the original allow-list; the rest join for direct typing).
+func init() {
+	for c := 'a'; c <= 'z'; c++ {
+		terminalControls["ctrl-"+string(c)] = "C-" + string(c)
+	}
 }
 
 func terminalErrStatus(err error) int {
@@ -1125,6 +1166,33 @@ func (s *Server) handleTerminalInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.router.SubmitTerminal(r.PathValue("id"), req.RequestID, req.Text); err != nil {
+		writeErr(w, terminalErrStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleTerminalType pastes keystroke text without a trailing Enter — the
+// per-key counterpart of handleTerminalInput for direct shell typing.
+func (s *Server) handleTerminalType(w http.ResponseWriter, r *http.Request) {
+	const maxTerminalInput = 64 << 10
+	r.Body = http.MaxBytesReader(w, r.Body, maxTerminalInput)
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Text == "" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	if strings.IndexByte(req.Text, 0) >= 0 {
+		writeErr(w, http.StatusBadRequest, "terminal input contains NUL")
+		return
+	}
+	if err := s.router.SendTerminalType(r.PathValue("id"), req.Text); err != nil {
 		writeErr(w, terminalErrStatus(err), err.Error())
 		return
 	}
