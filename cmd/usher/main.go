@@ -131,6 +131,9 @@ func serve(args []string) error {
 	openCodeCmd := fs.String("opencode", "opencode", "path to the opencode binary (OpenCode backend)")
 	openCodeSessionsDir := fs.String("opencode-sessions-dir", "",
 		"usher-owned OpenCode shadow transcript directory; empty uses <data-dir>/opencode-sessions")
+	openCode2Cmd := fs.String("opencode2", "opencode2", "path to the opencode2 binary (OpenCode 2 backend)")
+	openCode2SessionsDir := fs.String("opencode2-sessions-dir", "",
+		"usher-owned OpenCode 2 shadow transcript directory; empty uses <data-dir>/opencode2-sessions")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
@@ -206,6 +209,7 @@ func serve(args []string) error {
 	h := hook.New(filepath.Join(*dataDir, "auto-approve.json"))
 	defaultBackend := ""
 	var ocSync *opencode.Runtime
+	var oc2Sync *opencode.Runtime
 
 	if dir := *projectsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewClaudeSource(dir))
@@ -262,12 +266,48 @@ func serve(args []string) error {
 		}
 		logger.Info("opencode backend enabled", "sessions_dir", *openCodeSessionsDir)
 	}
+	if *openCode2SessionsDir == "" {
+		*openCode2SessionsDir = filepath.Join(*dataDir, "opencode2-sessions")
+	}
+	if *openCode2Cmd != "" && commandExists(*openCode2Cmd) {
+		if err := os.MkdirAll(*openCode2SessionsDir, 0o755); err != nil {
+			return fmt.Errorf("create opencode2 sessions dir: %w", err)
+		}
+		sources = append(sources, discovery.NewOpenCode2Source(*openCode2SessionsDir))
+		oc2Runtime := opencode.NewRuntimeV2(*openCode2Cmd, *openCode2SessionsDir, logger)
+		backends["opencode2"] = backend.Backend{
+			Runtime:    oc2Runtime,
+			Transcript: transcript.Claude{},
+			Models:     &modelcatalog.OpenCode{Cmd: *openCode2Cmd, V2: true},
+		}
+		oc2Sync = oc2Runtime
+		if defaultBackend == "" {
+			defaultBackend = "opencode2"
+		}
+		logger.Info("opencode2 backend enabled", "sessions_dir", *openCode2SessionsDir)
+	}
 
 	if len(backends) == 0 {
 		return fmt.Errorf("no backend found: Claude %q, Codex %q, pi %q, and OpenCode %q are unavailable.\n"+
 			"  run a supported agent once first, or pass its sessions-directory flag.",
 			*projectsDir, *codexSessionsDir, *piSessionsDir, *openCodeCmd)
 	}
+
+	// Pre-warm every backend's model catalog in the background so the first
+	// picker request never waits on an agent CLI probe; catalogs are cached
+	// for the process lifetime.
+	go func() {
+		for name, b := range backends {
+			if b.Models == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if _, err := b.Models.Models(ctx); err != nil {
+				logger.Warn("model catalog pre-warm failed", "backend", name, "err", err)
+			}
+			cancel()
+		}
+	}()
 
 	d, err := discovery.NewMulti(logger, sources...)
 	if err != nil {
@@ -323,6 +363,10 @@ func serve(args []string) error {
 	if ocSync != nil {
 		ocSync.LoadTombstones()
 		go opencode.SyncLoop(ctx, ocSync, logger)
+	}
+	if oc2Sync != nil {
+		oc2Sync.LoadTombstones()
+		go opencode.SyncLoop(ctx, oc2Sync, logger)
 	}
 
 	if err := d.Start(ctx); err != nil {

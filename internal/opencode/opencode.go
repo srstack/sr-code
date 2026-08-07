@@ -32,10 +32,15 @@ import (
 // Runtime drives opencode through `opencode run` — one child process per
 // turn, resumed across turns with --session. Session ids are opencode's own
 // (ses_…): a new session's id is learned from the first streamed event.
+//
+// v2 selects the OpenCode 2 flavor: the binary is `opencode2`, `run` has no
+// --dir flag, and native-store access (session lookup, model catalog) goes
+// through `opencode2 api` instead of `opencode db` / `opencode models`.
 type Runtime struct {
 	cmd    string
 	root   string
 	logger *slog.Logger
+	v2     bool
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
@@ -43,17 +48,31 @@ type Runtime struct {
 	cwMu  sync.Mutex
 	cwMap map[string]int64
 	cwAt  time.Time
+
+	forgotten sync.Map // tombstoned session id -> deletion time
+	failures  *failedSync
 }
 
 func NewRuntime(cmd, root string, logger *slog.Logger) *Runtime {
+	return newRuntime(cmd, root, logger, false)
+}
+
+// NewRuntimeV2 adapts the OpenCode 2 CLI (`opencode2`).
+func NewRuntimeV2(cmd, root string, logger *slog.Logger) *Runtime {
+	return newRuntime(cmd, root, logger, true)
+}
+
+func newRuntime(cmd, root string, logger *slog.Logger, v2 bool) *Runtime {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Runtime{
-		cmd:     cmd,
-		root:    root,
-		logger:  logger,
-		running: map[string]context.CancelFunc{},
+		cmd:      cmd,
+		root:     root,
+		logger:   logger,
+		v2:       v2,
+		running:  map[string]context.CancelFunc{},
+		failures: &failedSync{entries: map[string]failedEntry{}},
 	}
 }
 
@@ -116,18 +135,36 @@ type turn struct {
 }
 
 // tokenTotals is the step_finish accounting we emit as ctx usage at turn end.
+// v1 reports a ready-made total; v2 doesn't, so it is derived as
+// input+output+cache — matching v1's total on the same wire data.
 type tokenTotals struct {
-	Total  int64 `json:"total"`
-	Input  int64 `json:"input"`
-	Output int64 `json:"output"`
+	Total     int64 `json:"total"`
+	Input     int64 `json:"input"`
+	Output    int64 `json:"output"`
+	Reasoning int64 `json:"reasoning"`
+	Cache     struct {
+		Write int64 `json:"write"`
+		Read  int64 `json:"read"`
+	} `json:"cache"`
 }
 
-// rawEvent is one line of `opencode run --format json` output.
+// contextTokens is the turn's context occupancy: v1's total verbatim, or the
+// derived sum when the stream left it zero (v2).
+func (t *tokenTotals) contextTokens() int64 {
+	if t.Total > 0 {
+		return t.Total
+	}
+	return t.Input + t.Output + t.Cache.Read + t.Cache.Write
+}
+
+// rawEvent is one line of `opencode run --format json` output. Turn-level
+// failures arrive as type=error with the payload at top level (no part).
 type rawEvent struct {
 	Type      string          `json:"type"`
 	Timestamp int64           `json:"timestamp"`
 	SessionID string          `json:"sessionID"`
 	Part      json.RawMessage `json:"part"`
+	Error     json.RawMessage `json:"error"`
 }
 
 // partPayload is the union of streamed part shapes we translate.
@@ -150,7 +187,10 @@ func (r *Runtime) spawn(ctx context.Context, id, prompt, cwd, model string, fres
 		}
 	}
 	childCtx, cancel := context.WithCancel(ctx)
-	args := []string{"run", "--format", "json", "--dir", cwd}
+	args := []string{"run", "--format", "json"}
+	if !r.v2 {
+		args = append(args, "--dir", cwd) // v1 flag; v2 has none and uses the cwd
+	}
 	if id != "" {
 		args = append(args, "--session", id)
 	}
@@ -295,6 +335,27 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 	stream := func(ev rawEvent) bool {
 		ts := eventTime(ev.Timestamp)
 		switch ev.Type {
+		case "error":
+			// Fatal turn-level failure (bad model, auth, …) surfaced as an
+			// event instead of a non-zero exit; without this the turn would
+			// end silently clean.
+			var p struct {
+				Message string `json:"message"`
+			}
+			_ = json.Unmarshal(ev.Error, &p)
+			msg := p.Message
+			if msg == "" {
+				msg = "opencode turn failed"
+			}
+			t.emitErr(msg)
+			return t.appendAndEmit(ctx, path, "system", mustMarshal(map[string]any{
+				"type":      "system",
+				"subtype":   "turn_error",
+				"sessionId": t.id,
+				"timestamp": ts,
+				"uuid":      randomHexID(),
+				"content":   msg,
+			}))
 		case "step_finish":
 			// Capture the turn's cumulative token totals; the runtime event
 			// is emitted after process exit (see below), when opencode's own
@@ -379,7 +440,7 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 		}
 		rt := core.SessionRuntime{
 			Model:         model,
-			ContextTokens: t.lastTokens.Total,
+			ContextTokens: t.lastTokens.contextTokens(),
 			ContextWindow: t.rt.contextWindow(model),
 		}
 		raw, _ := json.Marshal(rt)
@@ -480,16 +541,26 @@ func (r *Runtime) Shutdown() {
 	}
 }
 
-// contextWindow returns the model's context limit from `opencode models
-// --verbose` (models.dev metadata), cached for five minutes. 0 when unknown —
-// the usage pie just hides without a window.
+// contextWindow returns the model's context limit, cached for the process
+// lifetime in practice (model limits change rarely).
+// 0 when unknown — the usage pie just hides without a window. v1 parses
+// `opencode models --verbose` (models.dev metadata); v2 reads
+// `opencode2 api /api/model`.
 func (r *Runtime) contextWindow(model string) int64 {
 	if model == "" || model == "default" {
 		return 0
 	}
+	model, _, _ = strings.Cut(model, "#") // strip any effort variant suffix
 	r.cwMu.Lock()
 	defer r.cwMu.Unlock()
-	if r.cwMap != nil && time.Since(r.cwAt) < 5*time.Minute {
+	if r.cwMap != nil && time.Since(r.cwAt) < 24*time.Hour {
+		return r.cwMap[model]
+	}
+	if r.v2 {
+		if m, err := v2ContextWindows(context.Background(), r.cmd); err == nil {
+			r.cwMap = m
+			r.cwAt = time.Now()
+		}
 		return r.cwMap[model]
 	}
 	out, err := exec.Command(r.cmd, "models", "--verbose").Output()
@@ -548,6 +619,9 @@ func (r *Runtime) sessionModel(id string) string {
 	if !sessionIDPattern.MatchString(id) {
 		return ""
 	}
+	if r.v2 {
+		return v2SessionModel(context.Background(), r.cmd, id)
+	}
 	out, err := exec.Command(r.cmd, "db",
 		"SELECT id, data FROM message WHERE session_id = '"+id+"' AND json_extract(data, '$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1",
 		"--format", "tsv").Output()
@@ -574,7 +648,8 @@ func (r *Runtime) sessionModel(id string) string {
 }
 
 // Locate finds the shadow transcript for id under root, "" when absent.
-func Locate(root, id string) string {	var found string
+func Locate(root, id string) string {
+	var found string
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info == nil || info.IsDir() {
 			return nil

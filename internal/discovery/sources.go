@@ -164,11 +164,23 @@ func (s PiSource) ReadMeta(path string) (core.SessionMeta, error) {
 // <root>/<sanitized-cwd>/<id>.jsonl. opencode stores its native state in
 // SQLite, so usher writes this small Claude-shaped jsonl for sessions it
 // drives instead of binding discovery to opencode's internal database schema.
-type OpenCodeSource struct{ root string }
+// backend distinguishes OpenCode 1 ("opencode") from OpenCode 2 ("opencode2");
+// the file layout is identical.
+type OpenCodeSource struct {
+	root    string
+	backend string
+}
 
-func NewOpenCodeSource(root string) OpenCodeSource { return OpenCodeSource{root: root} }
+func NewOpenCodeSource(root string) OpenCodeSource {
+	return OpenCodeSource{root: root, backend: "opencode"}
+}
 
-func (s OpenCodeSource) Backend() string { return "opencode" }
+// NewOpenCode2Source scans the OpenCode 2 shadow tree.
+func NewOpenCode2Source(root string) OpenCodeSource {
+	return OpenCodeSource{root: root, backend: "opencode2"}
+}
+
+func (s OpenCodeSource) Backend() string { return s.backend }
 func (s OpenCodeSource) Root() string    { return s.root }
 
 func (s OpenCodeSource) IsSessionFile(path string) bool {

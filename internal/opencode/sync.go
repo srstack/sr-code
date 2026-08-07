@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,7 +32,11 @@ func SyncLoop(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	syncOnce(ctx, rt, logger)
+	if rt.v2 {
+		syncOnceV2(ctx, rt, logger)
+	} else {
+		syncOnce(ctx, rt, logger)
+	}
 	tick := time.NewTicker(syncInterval)
 	defer tick.Stop()
 	for {
@@ -39,7 +44,11 @@ func SyncLoop(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			syncOnce(ctx, rt, logger)
+			if rt.v2 {
+				syncOnceV2(ctx, rt, logger)
+			} else {
+				syncOnce(ctx, rt, logger)
+			}
 		}
 	}
 }
@@ -52,25 +61,27 @@ func SyncLoop(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 func (r *Runtime) DeleteNative(id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	forgotten.Store(id, time.Now())
+	r.forgotten.Store(id, time.Now())
 	r.persistTombstones()
+	if r.v2 {
+		return apiDelete(ctx, r.Cmd(), "/api/session/"+id)
+	}
 	// `opencode session delete` asks for interactive confirmation; answer it.
 	cmd := exec.CommandContext(ctx, r.Cmd(), "session", "delete", id)
 	cmd.Stdin = strings.NewReader("y\n")
 	return cmd.Run()
 }
 
-// forgotten is the tombstone set for usher-deleted sessions. Entries expire
-// after a day — long past any reasonable native-delete propagation.
-var forgotten sync.Map // id -> time.Time
-
-func forgottenHas(id string) bool {
-	v, ok := forgotten.Load(id)
+// forgotten is the per-runtime tombstone set for usher-deleted sessions.
+// Entries expire after a day — long past any reasonable native-delete
+// propagation.
+func (r *Runtime) forgottenHas(id string) bool {
+	v, ok := r.forgotten.Load(id)
 	if !ok {
 		return false
 	}
 	if time.Since(v.(time.Time)) > 24*time.Hour {
-		forgotten.Delete(id)
+		r.forgotten.Delete(id)
 		return false
 	}
 	return true
@@ -92,13 +103,13 @@ func (r *Runtime) LoadTombstones() {
 		return
 	}
 	for id, ts := range entries {
-		forgotten.Store(id, ts)
+		r.forgotten.Store(id, ts)
 	}
 }
 
 func (r *Runtime) persistTombstones() {
 	entries := map[string]time.Time{}
-	forgotten.Range(func(k, v any) bool {
+	r.forgotten.Range(func(k, v any) bool {
 		entries[k.(string)] = v.(time.Time)
 		return true
 	})
@@ -115,6 +126,77 @@ type sessionEntry struct {
 	Updated   int64  `json:"updated"`
 	Created   int64  `json:"created"`
 	Directory string `json:"directory"`
+}
+
+// syncMetaLine is the footer every full shadow rewrite ends with. The
+// freshness check compares sourceUpdated against the native session's
+// updated timestamp — file mtime is NOT trustworthy (a runtime append or an
+// unrelated touch looks like a fresh sync and permanently suppresses it).
+func syncMetaLine(s sessionEntry) json.RawMessage {
+	return mustMarshal(map[string]any{
+		"type":          "system",
+		"subtype":       "sync-meta",
+		"sessionId":     s.ID,
+		"timestamp":     eventTime(s.Updated),
+		"uuid":          randomHexID(),
+		"sourceUpdated": s.Updated,
+	})
+}
+
+// readSyncMeta returns the sourceUpdated marker from a shadow's tail.
+// ok=false: no marker (pre-marker shadow) → treat as stale and rewrite once.
+func readSyncMeta(path string) (updated int64, ok bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	const tail = 8192
+	start := int64(0)
+	if fi.Size() > tail {
+		start = fi.Size() - tail
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	_, _ = f.Seek(start, 0)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if start > 0 {
+		sc.Scan() // discard the partial first line
+	}
+	for sc.Scan() {
+		var ev struct {
+			Subtype       string `json:"subtype"`
+			SourceUpdated int64  `json:"sourceUpdated"`
+		}
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+		if ev.Subtype == "sync-meta" && ev.SourceUpdated > 0 {
+			updated, ok = ev.SourceUpdated, true
+		}
+	}
+	return updated, ok
+}
+
+// shadowFresh reports whether the shadow at path already mirrors the native
+// session state (updated ms).
+//
+// The native `updated` can LAG the final message commit — observed on v2:
+// the last assistant message lands ~1s after the last updated bump, so a
+// fetch that races turn end permanently loses the reply. A recently-active
+// session is therefore never considered settled; it keeps re-fetching each
+// tick until it has been quiet for syncSettleWindow.
+const syncSettleWindow = 2 * time.Minute
+
+func shadowFresh(path string, updated int64) bool {
+	m, ok := readSyncMeta(path)
+	if !ok || m < updated {
+		return false
+	}
+	return time.Since(time.UnixMilli(updated)) > syncSettleWindow
 }
 
 func syncOnce(ctx context.Context, rt *Runtime, logger *slog.Logger) {
@@ -140,53 +222,153 @@ func syncOnce(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 		if s.ID == "" || s.Directory == "" {
 			continue
 		}
-		if forgottenHas(s.ID) {
+		if rt.forgottenHas(s.ID) {
 			continue // deleted via usher; don't resurrect
 		}
 		if rt.Has(s.ID) {
 			continue // live turn owns the shadow file
 		}
 		path := logPath(rt.Root(), s.Directory, s.ID)
-		if fi, err := os.Stat(path); err == nil && !fi.ModTime().Before(time.UnixMilli(s.Updated)) {
-			continue // shadow is already at least as fresh as the session
+		if shadowFresh(path, s.Updated) {
+			continue
 		}
 		// Transcripts are fetched with SQL via `opencode db` (paged rows, no
 		// size cap) rather than `opencode export`, whose stdout caps at 128KiB
 		// and loses every larger session — including long-running ones.
-		if failedSyncLoad(s.ID, s.Updated) {
+		if rt.failures.load(s.ID, s.Updated) {
 			continue
 		}
 		if err := fetchSession(ctx, rt, s, path); err != nil {
-			failedSyncStore(s.ID, s.Updated)
+			rt.failures.store(s.ID, s.Updated)
 			logger.Warn("opencode sync: fetch failed", "session", s.ID, "err", err)
 		}
 	}
 }
 
+// syncOnceV2 is syncOnce's v2 counterpart: the session list and transcripts
+// come from `opencode2 api` (HTTP) rather than SQLite over `opencode db`.
+func syncOnceV2(ctx context.Context, rt *Runtime, logger *slog.Logger) {
+	sessions, err := v2ListSessions(ctx, rt.Cmd())
+	if err != nil {
+		logger.Warn("opencode2 sync: session list failed", "err", err)
+		return
+	}
+	for _, s := range sessions {
+		if ctx.Err() != nil {
+			return
+		}
+		if rt.forgottenHas(s.ID) {
+			continue
+		}
+		if rt.Has(s.ID) {
+			continue
+		}
+		path := logPath(rt.Root(), s.Directory, s.ID)
+		if shadowFresh(path, s.Updated) {
+			continue
+		}
+		if rt.failures.load(s.ID, s.Updated) {
+			continue
+		}
+		if err := v2FetchSession(ctx, rt, s, path); err != nil {
+			rt.failures.store(s.ID, s.Updated)
+			logger.Warn("opencode2 sync: fetch failed", "session", s.ID, "err", err)
+		}
+	}
+}
+
+// RefreshSession synchronously re-mirrors one session when its native state
+// moved past the shadow — invoked when the UI opens a transcript so
+// point-of-use reads never wait for the next sync tick. Cheap when fresh:
+// one native row lookup plus a tail read.
+func (r *Runtime) RefreshSession(id string) error {
+	if r.Has(id) || r.forgottenHas(id) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s, err := r.sessionEntryFor(ctx, id)
+	if err != nil || s == nil {
+		return err
+	}
+	path := logPath(r.root, s.Directory, id)
+	if shadowFresh(path, s.Updated) {
+		return nil
+	}
+	if r.v2 {
+		return v2FetchSession(ctx, r, *s, path)
+	}
+	return fetchSession(ctx, r, *s, path)
+}
+
+// sessionEntryFor looks up one native session row (v1: SQL; v2: HTTP).
+func (r *Runtime) sessionEntryFor(ctx context.Context, id string) (*sessionEntry, error) {
+	if !sessionIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("refusing unexpected session id %q", id)
+	}
+	if r.v2 {
+		var s v2Session
+		if err := apiGetJSON(ctx, r.cmd, "/api/session/"+id, &s); err != nil {
+			return nil, err
+		}
+		if s.ID == "" || s.Location.Directory == "" {
+			return nil, nil
+		}
+		return &sessionEntry{
+			ID: s.ID, Title: s.Title, Directory: s.Location.Directory,
+			Created: s.Time.Created, Updated: s.Time.Updated,
+		}, nil
+	}
+	rows, err := queryRows(ctx, r.cmd,
+		"SELECT id, title, directory, time_created, time_updated FROM session WHERE id = '"+id+"' LIMIT 1")
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if len(row) < 5 {
+			continue
+		}
+		s := &sessionEntry{ID: row[0], Title: row[1], Directory: row[2]}
+		s.Created, _ = strconv.ParseInt(row[3], 10, 64)
+		s.Updated, _ = strconv.ParseInt(row[4], 10, 64)
+		return s, nil
+	}
+	return nil, nil
+}
+
 // failedSync remembers (id, updated) pairs whose export already failed, so a
-// permanently-too-large session isn't re-exported every tick.
+// permanently-too-large session isn't re-exported every tick. Entries expire
+// after five minutes: a transient failure (service cold start, locked DB)
+// must not freeze the session's shadow forever. Per-runtime: v1 and v2
+// sessions share the ses_ id space but not stores.
 type failedSync struct {
 	mu      sync.Mutex
-	entries map[string]int64
+	entries map[string]failedEntry
 }
 
-var failures = &failedSync{entries: map[string]int64{}}
-
-func failedSyncLoad(id string, updated int64) bool {
-	failures.mu.Lock()
-	defer failures.mu.Unlock()
-	ts, ok := failures.entries[id]
-	return ok && ts == updated
+type failedEntry struct {
+	updated int64
+	at      time.Time
 }
 
-func failedSyncStore(id string, updated int64) {
-	failures.mu.Lock()
-	defer failures.mu.Unlock()
-	if len(failures.entries) > 1000 {
-		failures.entries = map[string]int64{}
+const failedSyncTTL = 5 * time.Minute
+
+func (f *failedSync) load(id string, updated int64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.entries[id]
+	return ok && e.updated == updated && time.Since(e.at) < failedSyncTTL
+}
+
+func (f *failedSync) store(id string, updated int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.entries) > 1000 {
+		f.entries = map[string]failedEntry{}
 	}
-	failures.entries[id] = updated
+	f.entries[id] = failedEntry{updated: updated, at: time.Now()}
 }
+
 // sessionIDPattern guards the SQL interpolation below — session ids come from
 // `opencode session list` and are always ses_<alphanum>, but a defensive check
 // keeps a malformed id out of the query string.
@@ -274,6 +456,9 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 	}
 	partsByMsg := make(map[string][]exportPart, len(messages))
 	for _, row := range partRows {
+		if len(row) < 2 {
+			continue
+		}
 		var p exportPart
 		if json.Unmarshal([]byte(row[1]), &p) != nil {
 			continue
@@ -305,6 +490,9 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		}))
 	}
 	for _, row := range messages {
+		if len(row) < 2 {
+			continue
+		}
 		var md messageData
 		if json.Unmarshal([]byte(row[1]), &md) != nil {
 			continue
@@ -335,23 +523,25 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		if md.Role != "assistant" {
 			continue
 		}
+		window := rt.modelWindow(msg)
 		for _, p := range msg.Parts {
 			switch p.Type {
 			case "text":
-				write(assistantLineModel(s.ID, textBlocks(p.Text), ts, msg))
+				write(assistantLineModel(s.ID, textBlocks(p.Text), ts, msg, window))
 			case "reasoning":
-				write(assistantLineModel(s.ID, thinkingBlocks(p.Text), ts, msg))
+				write(assistantLineModel(s.ID, thinkingBlocks(p.Text), ts, msg, window))
 			case "tool":
 				if p.State == nil {
 					continue
 				}
 				pp := partPayload{ID: p.CallID, Tool: p.Tool, CallID: p.CallID, State: p.State}
-				write(assistantLineModel(s.ID, toolUseBlocks(pp), ts, msg))
+				write(assistantLineModel(s.ID, toolUseBlocks(pp), ts, msg, window))
 				write(toolResultLine(s.ID, cwd, pp, ts))
 			}
 		}
 		write(turnCompleteLine(s.ID, ts))
 	}
+	write(syncMetaLine(s))
 	if len(buf) == 0 {
 		return nil
 	}
@@ -397,8 +587,10 @@ func userLineWithUUID(sessionID, cwd, content string, ts time.Time, uuid string)
 // assistantLineModel is assistantLine plus the model tag the assembler reads
 // for per-turn model display. opencode stamps provider/model per message. It
 // also carries token usage in Claude's shape so ReadSessionMeta surfaces
-// context usage for the session list/detail views.
-func assistantLineModel(sessionID string, blocks []map[string]any, ts time.Time, m exportMessage) json.RawMessage {
+// context usage for the session list/detail views; window (the model's
+// context limit from the catalog) rides along as a nonstandard usage field
+// so synced sessions can show their limit without a live runtime event.
+func assistantLineModel(sessionID string, blocks []map[string]any, ts time.Time, m exportMessage, window int64) json.RawMessage {
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -415,13 +607,18 @@ func assistantLineModel(sessionID string, blocks []map[string]any, ts time.Time,
 		"model":   model,
 		"content": blocks,
 	}
-	if m.Info.Tokens != nil {
-		msg["usage"] = map[string]any{
-			"input_tokens":                m.Info.Tokens.Input,
-			"output_tokens":               m.Info.Tokens.Output,
-			"cache_read_input_tokens":     m.Info.Tokens.Cache.Read,
-			"cache_creation_input_tokens": m.Info.Tokens.Cache.Write,
+	if m.Info.Tokens != nil || window > 0 {
+		usage := map[string]any{}
+		if m.Info.Tokens != nil {
+			usage["input_tokens"] = m.Info.Tokens.Input
+			usage["output_tokens"] = m.Info.Tokens.Output
+			usage["cache_read_input_tokens"] = m.Info.Tokens.Cache.Read
+			usage["cache_creation_input_tokens"] = m.Info.Tokens.Cache.Write
 		}
+		if window > 0 {
+			usage["context_window"] = window
+		}
+		msg["usage"] = usage
 	}
 	return mustMarshal(map[string]any{
 		"type":      "assistant",
@@ -430,4 +627,14 @@ func assistantLineModel(sessionID string, blocks []map[string]any, ts time.Time,
 		"uuid":      uuid,
 		"message":   msg,
 	})
+}
+
+// modelWindow resolves the context limit for a session model reference
+// through the runtime's catalog cache (v1: models --verbose; v2: /api/model).
+func (r *Runtime) modelWindow(m exportMessage) int64 {
+	model := m.Info.ModelID
+	if m.Info.ProviderID != "" && model != "" {
+		model = m.Info.ProviderID + "/" + model
+	}
+	return r.contextWindow(model)
 }

@@ -124,6 +124,12 @@ func (r *Router) Backends() []string {
 	return out
 }
 
+// Backend returns the composed capabilities registered for backendName.
+func (r *Router) Backend(backendName string) (backendpkg.Backend, bool) {
+	b, ok := r.backends[backendName]
+	return b, ok
+}
+
 // Models returns the selectable model catalog owned by backendName.
 func (r *Router) Models(ctx context.Context, backendName string) ([]backendpkg.Model, error) {
 	b, ok := r.backends[backendName]
@@ -243,6 +249,14 @@ func (r *Router) ReadTurns(id string, limit int) ([]jsonl.Turn, int, error) {
 	if !ok {
 		return nil, 0, ErrSessionNotFound
 	}
+	// Shadow-transcript backends (opencode) mirror native state on a sync
+	// tick; give them a point-of-use freshness pass so opening a session
+	// never shows a stale transcript.
+	if rf, ok := r.senderForBackend(r.backendOf(id)).(interface {
+		RefreshSession(string) error
+	}); ok {
+		_ = rf.RefreshSession(id) // best-effort: serve what's on disk regardless
+	}
 	return r.readTurnsForBackend(path, r.backendOf(id), limit)
 }
 
@@ -255,6 +269,8 @@ func backendForModel(model string) string {
 	switch {
 	case m == "opencode":
 		return "opencode"
+	case m == "opencode2":
+		return "opencode2"
 	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"),
 		strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"),
 		strings.Contains(m, "codex"):
@@ -394,6 +410,14 @@ func (r *Router) Rename(sessionID, title string) { r.meta.Rename(sessionID, titl
 func (r *Router) applyCustomTitle(s *core.Session) {
 	if t := r.meta.CustomTitle(s.ID); t != "" {
 		s.Title = t
+	}
+	// The in-memory runtime dies with the process; the persisted window
+	// restores it so a restart doesn't blank the usage pie until the
+	// session's next turn.
+	if s.Runtime.ContextWindow == 0 {
+		if w := r.meta.ContextWindow(s.ID); w > 0 {
+			s.Runtime.ContextWindow = w
+		}
 	}
 }
 
@@ -660,6 +684,9 @@ func (r *Router) publishStream(sessionID string, asm backendpkg.Assembler, ev se
 		var runtime core.SessionRuntime
 		if json.Unmarshal(ev.Raw, &runtime) == nil {
 			r.discovery.UpdateRuntime(sessionID, runtime)
+			if runtime.ContextWindow > 0 {
+				r.meta.SaveContextWindow(sessionID, runtime.ContextWindow)
+			}
 		}
 	}
 	if ev.Type == backendpkg.EventProcessExit {
@@ -978,6 +1005,17 @@ func (r *Router) SendTerminalControl(id string, keys ...string) error {
 		return terminal.ErrUnavailable
 	}
 	return r.terminal.SendControl(id, keys...)
+}
+
+// SendTerminalType pastes keystroke text (no trailing Enter) into the shell.
+func (r *Router) SendTerminalType(id, text string) error {
+	if _, ok := r.discovery.Get(id); !ok {
+		return ErrSessionNotFound
+	}
+	if r.terminal == nil {
+		return terminal.ErrUnavailable
+	}
+	return r.terminal.Type(id, text)
 }
 
 func (r *Router) ResizeTerminal(id string, cols, rows int) error {
