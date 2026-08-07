@@ -7,11 +7,11 @@ import {
   isNearBottom, markViewing, setCurrentES,
   restoreDraft, clearDraft, growPrompt,
   pushSendHistory, historyNavigate, resetHistoryNav,
-  registerRefreshSubtitle,
+  registerRefreshSubtitle, loadModelCatalogs,
 } from './state.js';
 import {
   renderMarkdown, appendChatMessage, renderToolPart, renderThinkingPart,
-  forkBtnHTML, updateMessageTs,
+  forkBtnHTML, updateMessageTs, turnCopyText,
   backendMark,
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
@@ -148,6 +148,7 @@ export async function showNewSession(prefillCwd) {
   }
 
   let modelCatalogs = {};
+  let modelDefaults = {};
   const modelDD = makeDropdown({
     placeholder: 'model',
     allowCustom: true,
@@ -166,16 +167,29 @@ export async function showNewSession(prefillCwd) {
   });
   backendMount.appendChild(backendDD.el);
 
+  // The default row names the backend's actual default model when the server
+  // knows it (codex config, opencode2's /api/model/default) — never a bare
+  // "default" when the real thing is knowable.
+  const defaultRowLabel = (backend, choices) => {
+    const def = modelDefaults[backend];
+    if (def) {
+      const hit = choices.find(m => m.id === def);
+      return (hit && (hit.display_name || hit.id)) || def;
+    }
+    if (backend === 'codex' && choices.length && choices[0].id !== 'default') {
+      return choices[0].display_name || choices[0].id;
+    }
+    return 'Default';
+  };
+
   const renderModels = () => {
     const backend = backendDD.getValue();
     const models = modelCatalogs[backend] || [];
     const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
-    const defaultLabel = (backend === 'codex' && choices.length && choices[0].id !== 'default')
-      ? `Default (${choices[0].id})` : 'Default';
     let saved = '';
     try { saved = localStorage.getItem('usher.newModel.' + backend) || ''; } catch {/* private mode */}
     modelDD.setOptions([
-      { id: 'default', label: defaultLabel },
+      { id: 'default', label: defaultRowLabel(backend, choices) },
       ...choices.filter(m => m.id !== 'default').map(m => ({ id: m.id, label: m.display_name || m.id })),
     ]);
     if (saved && choices.some(o => o.id === saved)) {
@@ -186,10 +200,13 @@ export async function showNewSession(prefillCwd) {
     modelMount.parentElement.dataset.backend = backend || 'claude';
   };
 
-  // Build the backend picker once, then show only that backend's models.
-  fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
-    const backends = (data && data.backends) || ['claude'];
-    modelCatalogs = (data && data.models) || {};
+  // The shared catalog cache (warmed at boot) feeds both pickers — no
+  // per-form round trips. Render the backend picker as soon as the cache
+  // lands; models fill in behind it from the same payload.
+  loadModelCatalogs().then(data => {
+    modelCatalogs = data.models;
+    modelDefaults = data.defaults;
+    const backends = data.backends.length ? data.backends : ['claude'];
     backendDD.setOptions(backends.map(name => ({
       id: name,
       label: name.charAt(0).toUpperCase() + name.slice(1),
@@ -200,10 +217,6 @@ export async function showNewSession(prefillCwd) {
         backendDD.setValue(savedBackend);
       }
     } catch {/* private mode → keep first backend */}
-    renderModels();
-  }).catch(() => {
-    modelCatalogs = {};
-    backendDD.setOptions([{ id: 'claude', label: 'Claude' }]);
     renderModels();
   });
 
@@ -296,9 +309,52 @@ export async function showDetail(id) {
   }
 
   root.innerHTML = `
+    <div class="detail-col">
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
+        <div class="composer">
+          <div id="attach-chips" class="attach-chips" hidden></div>
+          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button id="upload-btn" class="upload-btn" type="button" title="upload file" aria-label="upload file">+</button>
+              <input id="upload-input" type="file" hidden>
+              <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
+                aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
+                title="ask: confirm each tool call · auto: run them automatically">
+                <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
+              </button>
+              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${sess.terminal_open ? 'mixed' : 'false'}"
+                ${sess.terminal_available ? '' : 'disabled'}
+                title="${sess.terminal_available ? 'show or hide this session’s shell — hiding keeps it running; type exit in the shell to end it' : 'terminal unavailable: tmux is not installed'}">
+                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">${sess.terminal_open ? 'bg' : 'off'}</span>
+              </button>
+            </div>
+            <div class="composer-send">
+              <div class="model-select-wrap">
+                <button id="model-summary" class="model-summary" type="button" title="model &amp; effort settings" aria-expanded="false"></button>
+                <div id="settings-pop" class="settings-pop" hidden>
+                  <div class="settings-row" id="settings-row-model"><span class="settings-label">model</span><span id="model-mount" class="model-mount"></span></div>
+                  <div class="settings-row" id="settings-row-effort" hidden><span class="settings-label">effort</span><span id="effort-mount" class="model-mount"></span></div>
+                </div>
+              </div>
+              <div class="session-usage-wrap">
+                <button id="session-usage" class="session-usage" type="button" hidden
+                  aria-expanded="false" aria-controls="session-usage-detail"></button>
+                <div id="session-usage-detail" class="session-usage-detail" hidden></div>
+              </div>
+              <button id="send" class="send-circle" type="button" title="send"></button>
+            </div>
+          </div>
+        </div>
         <div id="term-panel" class="term-panel" hidden>
+          <div class="term-head">
+            <span class="term-head-title">terminal</span>
+            <button id="term-expand" type="button" aria-expanded="false" title="expand / shrink terminal">
+              <svg viewBox="0 0 10 6" width="10" height="6" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1 5l4-4 4 4"/></svg>
+            </button>
+            <button id="term-hide" type="button" title="hide terminal — the shell keeps running in the background">×</button>
+          </div>
           <div class="term-screen"><pre id="term-grid" class="term-grid muted">connecting…</pre></div>
           <div class="term-input-row">
             <span class="term-prompt" aria-hidden="true">$</span>
@@ -326,37 +382,8 @@ export async function showDetail(id) {
             <button type="button" data-control="ctrl-u">^U</button>
           </div>
         </div>
-        <div class="composer">
-          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
-          <div class="composer-bar">
-            <div class="composer-tools">
-              <span id="model-mount" class="model-mount"></span>
-              <button id="upload-btn" class="upload-btn" type="button" title="upload file">
-                <span class="t-icon">+</span><span class="t-full">upload</span>
-              </button>
-              <input id="upload-input" type="file" hidden>
-              <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
-                aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
-                title="ask: confirm each tool call · auto: run them automatically">
-                <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
-              </button>
-              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${sess.terminal_open ? 'mixed' : 'false'}"
-                ${sess.terminal_available ? '' : 'disabled'}
-                title="${sess.terminal_available ? 'show or hide this session’s shell — hiding keeps it running; type exit in the shell to end it' : 'terminal unavailable: tmux is not installed'}">
-                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">${sess.terminal_open ? 'bg' : 'off'}</span>
-              </button>
-            </div>
-            <div class="composer-send">
-              <div class="session-usage-wrap">
-                <button id="session-usage" class="session-usage" type="button" hidden
-                  aria-expanded="false" aria-controls="session-usage-detail"></button>
-                <div id="session-usage-detail" class="session-usage-detail" hidden></div>
-              </div>
-              <button id="send">send</button>
-            </div>
-          </div>
-        </div>
       </section>
+    </div>
     </div>
   `;
 
@@ -366,7 +393,10 @@ export async function showDetail(id) {
   // Per-turn model override. Codex re-resumes its thread on a model change;
   // claude/opencode pass it per invocation. Choice persists per session.
   let sessionModel = null;
-  if (sess.backend === 'claude' || sess.backend === 'opencode' || sess.backend === 'codex') {
+  let followSessionModel = null;
+  let sessionEffort = null;
+  let effectiveModelId = () => '';
+  if (sess.backend === 'claude' || sess.backend === 'opencode' || sess.backend === 'opencode2' || sess.backend === 'codex') {
     const mount = document.getElementById('model-mount');
     if (mount) {
       sessionModel = makeDropdown({
@@ -374,34 +404,134 @@ export async function showDetail(id) {
         allowCustom: true,
         onChange: (v) => {
           try { localStorage.setItem('usher.sessionModel.' + id, v); } catch {/* private mode */}
+          renderEffort();
+          updateSummary();
         },
       });
       sessionModel.el.classList.add('model-dd');
       mount.appendChild(sessionModel.el);
-      fetch('/api/models').then(r => r.ok ? r.json() : {}).then(data => {
-        const models = ((data && data.models) || {})[sess.backend] || [];
-        const choices = models.length ? models : [{id: 'default', display_name: 'Default'}];
-        // Codex's catalog leads with the CLI-configured model; annotate the
-        // Default row with it so "use the CLI default" shows what it is.
-        const defaultLabel = (sess.backend === 'codex' && choices.length && choices[0].id !== 'default')
-          ? `Default (${choices[0].id})` : 'Default';
+      // Reasoning-effort row (ChatGPT-style settings popover) — only shown
+      // when the effective model exposes variants; the choice rides the
+      // model id as #variant.
+      const effortMount = document.getElementById('effort-mount');
+      const effortRow = document.getElementById('settings-row-effort');
+      sessionEffort = makeDropdown({
+        placeholder: 'effort',
+        onChange: (v) => {
+          try { localStorage.setItem('usher.sessionEffort.' + id, v); } catch {/* private mode */}
+          updateSummary();
+        },
+      });
+      sessionEffort.el.classList.add('model-dd', 'effort-dd');
+      if (effortMount) effortMount.appendChild(sessionEffort.el);
+      const summaryEl = document.getElementById('model-summary');
+      const updateSummary = () => {
+        if (!summaryEl) return;
+        const label = sessionModel.getDisplayLabel ? sessionModel.getDisplayLabel() : '';
+        const effort = sessionEffort && effortRow && !effortRow.hidden ? sessionEffort.getValue() : '';
+        const text = label + (effort ? ' · ' + effort : '');
+        summaryEl.textContent = text || 'model';
+      };
+      let catalogChoices = [];
+      let restingName = (sess.runtime && sess.runtime.model) || '';
+      let restingId = (sess.runtime && sess.runtime.model) || '';
+      const baseOf = (m) => { const i = String(m || '').indexOf('#'); return i < 0 ? String(m || '') : String(m).slice(0, i); };
+      const variantOf = (m) => { const i = String(m || '').indexOf('#'); return i < 0 ? '' : String(m).slice(i + 1); };
+      // The id the next send would run as: explicit override wins, else the
+      // session's live/default model.
+      effectiveModelId = () => {
+        const override = sessionModel.getValue() || '';
+        if (override) return override;
+        return restingId;
+      };
+      const renderEffort = () => {
+        if (!sessionEffort) return;
+        const base = baseOf(effectiveModelId());
+        const entry = catalogChoices.find(m => m.id === base);
+        const levels = (entry && entry.thinking_levels) || [];
+        if (!levels.length) {
+          if (effortRow) effortRow.hidden = true;
+          return;
+        }
+        if (effortRow) effortRow.hidden = false;
+        let saved = '';
+        try { saved = localStorage.getItem('usher.sessionEffort.' + id) || ''; } catch {/* private mode */}
+        const current = variantOf(effectiveModelId()) || saved;
+        sessionEffort.setOptions([
+          { id: '', label: 'auto' },
+          ...levels.map(l => ({ id: l, label: l })),
+        ]);
+        sessionEffort.setValue(levels.includes(current) ? current : '');
+      };
+      const buildOpts = () => {
         const opts = [
-          { id: '', label: defaultLabel },
-          ...choices.filter(m => m.id !== 'default').map(m => ({ id: m.id, label: m.display_name || m.id })),
+          { id: '', label: restingName || 'Default' },
+          ...catalogChoices.filter(m => m.id !== 'default').map(m => ({ id: m.id, label: m.display_name || m.id })),
         ];
-        // The dropdown is an OVERRIDE control: its resting state is the CLI
-        // default (annotated above), not whatever model the last turn ran —
-        // runtime.model is history, not a selection. Only an explicit user
-        // pick (persisted) changes what's sent.
         let current = '';
         try { current = localStorage.getItem('usher.sessionModel.' + id) || ''; } catch {/* private mode */}
         if (current && !opts.some(o => o.id === current)) opts.push({ id: current, label: current });
-        sessionModel.setOptions(opts);
+        return opts;
+      };
+      // Live-follow the session's model at resting state: after a turn the
+      // runtime event names the model that actually ran.
+      followSessionModel = (model) => {
+        if (!model || (sessionModel.getValue() || '') !== '') return;
+        restingName = model;
+        restingId = model;
+        sessionModel.setOptions(buildOpts());
+        sessionModel.setValue('');
+        renderEffort();
+        updateSummary();
+      };
+      loadModelCatalogs().then(data => {
+        catalogChoices = (data.models || {})[sess.backend] || [];
+        // The resting (non-override) state shows the model the session is
+        // actually running — falling back to the backend's named default —
+        // instead of a bare "Default" that says nothing.
+        if (!restingName) {
+          const def = (data.defaults || {})[sess.backend] || '';
+          const defHit = def && catalogChoices.find(m => m.id === def);
+          restingName = (defHit && (defHit.display_name || defHit.id)) || def
+            || ((sess.backend === 'codex' && catalogChoices.length && catalogChoices[0].id !== 'default')
+              ? (catalogChoices[0].display_name || catalogChoices[0].id) : '');
+          restingId = def || (sess.backend === 'codex' && catalogChoices.length ? catalogChoices[0].id : '');
+        }
+        // The dropdown is an OVERRIDE control: its resting state follows the
+        // session's live model (above); only an explicit user pick
+        // (persisted) changes what's sent.
+        let current = '';
+        try { current = localStorage.getItem('usher.sessionModel.' + id) || ''; } catch {/* private mode */}
+        sessionModel.setOptions(buildOpts());
         sessionModel.setValue(current);
-      }).catch(() => {
-        sessionModel.setOptions([{ id: '', label: 'Default' }]);
+        renderEffort();
+        updateSummary();
       });
     }
+  }
+
+  // Model name doubles as the settings trigger: click it to open the
+  // model/effort popover; closes on outside click.
+  const summaryBtn = document.getElementById('model-summary');
+  const settingsPop = document.getElementById('settings-pop');
+  if (summaryBtn && settingsPop) {
+    const onDocClick = (e) => {
+      // Detached targets are this popover's own re-rendered controls (the
+      // dropdowns swap trigger innerHTML on open), not outside clicks.
+      if (!e.target.isConnected) return;
+      if (!settingsPop.contains(e.target) && !summaryBtn.contains(e.target)) closePop();
+    };
+    const closePop = () => {
+      settingsPop.hidden = true;
+      summaryBtn.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('click', onDocClick);
+    };
+    summaryBtn.addEventListener('click', () => {
+      if (!settingsPop.hidden) { closePop(); return; }
+      settingsPop.hidden = false;
+      summaryBtn.setAttribute('aria-expanded', 'true');
+      document.addEventListener('click', onDocClick);
+    });
   }
 
   const chatEl = document.getElementById('chat-scroll');
@@ -548,6 +678,123 @@ export async function showDetail(id) {
         renderTerminal();
       }
     });
+    // Drawer header: expand toggles a tall viewport; hide mirrors the toggle's
+    // hide path (the shell keeps running in the background).
+    const termExpand = document.getElementById('term-expand');
+    if (termExpand) {
+      termExpand.addEventListener('click', () => {
+        const tall = termPanel.classList.toggle('term-panel--tall');
+        termExpand.setAttribute('aria-expanded', tall ? 'true' : 'false');
+      });
+    }
+    const termHide = document.getElementById('term-hide');
+    if (termHide) {
+      termHide.addEventListener('click', () => {
+        panelShown = false;
+        termPanel.classList.remove('term-panel--tall');
+        if (termExpand) termExpand.setAttribute('aria-expanded', 'false');
+        renderTerminal();
+      });
+    }
+    // Direct shell typing: the screen is focusable and forwards keystrokes —
+    // printable chars batched (~30ms) through /terminal/type, special keys
+    // through /terminal/control. The input row below stays as the
+    // mobile/no-keyboard fallback.
+    const termScreen = termPanel.querySelector('.term-screen');
+    if (termScreen) {
+      termScreen.tabIndex = 0;
+      if (!termScreen.dataset.keysWired) {
+        termScreen.dataset.keysWired = '1';
+        let typeQueue = Promise.resolve();
+        let typeBuf = '';
+        let typeTimer = 0;
+        const flushType = () => {
+          clearTimeout(typeTimer);
+          if (!typeBuf) return typeQueue;
+          const text = typeBuf;
+          typeBuf = '';
+          typeQueue = typeQueue.then(() =>
+            fetch('/api/sessions/' + encodeURIComponent(id) + '/terminal/type', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text }),
+            }).catch(() => {}));
+          return typeQueue;
+        };
+        const sendKey = (control) => {
+          typeQueue = typeQueue.then(() =>
+            fetch('/api/sessions/' + encodeURIComponent(id) + '/terminal/control', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ control }),
+            }).catch(() => {}));
+        };
+        const special = {
+          Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: 'escape',
+          Delete: 'delete', Home: 'home', End: 'end',
+          PageUp: 'pageup', PageDown: 'pagedown',
+          ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+        };
+        termScreen.addEventListener('keydown', (e) => {
+          if (e.isComposing) return; // IME composition stays on the input row
+          if ((e.ctrlKey || e.metaKey) && e.key.length === 1 && /^[a-z]$/i.test(e.key)) {
+            e.preventDefault();
+            flushType();
+            sendKey('ctrl-' + e.key.toLowerCase());
+            return;
+          }
+          if (e.ctrlKey || e.metaKey || e.altKey) return; // ctrl-v etc. → paste event
+          const key = special[e.key];
+          if (key) {
+            e.preventDefault();
+            flushType();
+            sendKey(key);
+            return;
+          }
+          if (e.key.length === 1) {
+            e.preventDefault();
+            typeBuf += e.key;
+            clearTimeout(typeTimer);
+            typeTimer = setTimeout(flushType, 30);
+          }
+        });
+        termScreen.addEventListener('paste', (e) => {
+          e.preventDefault();
+          const text = (e.clipboardData || window.clipboardData).getData('text');
+          if (text) {
+            typeBuf += text;
+            flushType();
+          }
+        });
+      }
+      termScreen.addEventListener('click', () => termScreen.focus());
+    }
+    // Drag the drawer head to resize freely (Codex-style); the two-step
+    // expand button still works alongside. Buttons inside the head don't
+    // start a drag.
+    const termHead = termPanel.querySelector('.term-head');
+    if (termHead) {
+      termHead.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button')) return;
+        e.preventDefault();
+        const screen = termPanel.querySelector('.term-screen');
+        if (!screen) return;
+        termPanel.classList.remove('term-panel--tall');
+        if (termExpand) termExpand.setAttribute('aria-expanded', 'false');
+        const startY = e.clientY;
+        const startH = screen.getBoundingClientRect().height;
+        const move = (ev) => {
+          const h = Math.min(window.innerHeight * 0.75, Math.max(64, startH + (startY - ev.clientY)));
+          screen.style.height = Math.round(h) + 'px';
+        };
+        const up = () => {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+        };
+        document.addEventListener('pointermove', move);
+        document.addEventListener('pointerup', up);
+      });
+    }
   }
   if (termInput && termSend) {
     let terminalRequestID = null;
@@ -594,6 +841,7 @@ export async function showDetail(id) {
 
   const uploadBtn = document.getElementById('upload-btn');
   const uploadInput = document.getElementById('upload-input');
+  const attachChips = document.getElementById('attach-chips');
   if (uploadBtn && uploadInput) {
     uploadBtn.addEventListener('click', () => uploadInput.click());
     uploadInput.addEventListener('change', async () => {
@@ -613,10 +861,33 @@ export async function showDetail(id) {
         }
         const { path } = await res.json();
         const prefix = promptEl.value && !promptEl.value.endsWith('\n') ? '\n' : '';
-        promptEl.value += prefix + '[file: ' + path + '] ';
+        const token = '[file: ' + path + '] ';
+        promptEl.value += prefix + token;
         promptEl.focus();
         growPrompt(promptEl);
-        appendChatMessage({ role: 'system', content: 'uploaded ' + file.name, ts: new Date().toISOString() });
+        // ChatGPT-style attachment chip inside the composer; × withdraws the
+        // reference from the draft instead of scrolling the transcript.
+        if (attachChips) {
+          const chip = document.createElement('span');
+          chip.className = 'attach-chip';
+          const name = document.createElement('span');
+          name.className = 'attach-name';
+          name.textContent = file.name;
+          name.title = path;
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.setAttribute('aria-label', 'remove attachment');
+          remove.textContent = '×';
+          remove.addEventListener('click', () => {
+            promptEl.value = promptEl.value.replace(token, '').replace(token.trim(), '');
+            chip.remove();
+            if (!attachChips.children.length) attachChips.hidden = true;
+          });
+          chip.appendChild(name);
+          chip.appendChild(remove);
+          attachChips.appendChild(chip);
+          attachChips.hidden = false;
+        }
       } catch (e) {
         appendChatMessage({ role: 'error', content: 'upload failed: ' + String(e), ts: new Date().toISOString() });
       } finally {
@@ -626,14 +897,21 @@ export async function showDetail(id) {
     });
   }
 
-  // Keep one send/cancel button stable while its request is in flight.
+  // Keep one circular action button: ↑ send, or ■ stop while a turn runs and
+  // the input is empty. Text in the input during a turn keeps ↑ — agents
+  // accept mid-turn steering (the router queues it).
+  const SEND_ICON = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>';
+  const STOP_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>';
   let actionPending = null; // null | send | cancel
   let sendAccepted = false;
   let sendLifecycleObserved = false;
   const renderAction = () => {
-    const action = actionPending || (detailStreaming ? 'cancel' : 'send');
-    sendBtn.textContent = action;
-    sendBtn.classList.toggle('cancel', action === 'cancel');
+    const hasText = promptEl.value.trim() !== '';
+    const stop = (detailStreaming || actionPending) && !hasText;
+    sendBtn.classList.toggle('stop', stop);
+    sendBtn.innerHTML = stop ? STOP_ICON : SEND_ICON;
+    sendBtn.title = stop ? 'stop the current turn' : 'send';
+    sendBtn.setAttribute('aria-label', sendBtn.title);
     sendBtn.disabled = actionPending !== null;
   };
 
@@ -646,7 +924,7 @@ export async function showDetail(id) {
 
   const submit = async () => {
     const text = promptEl.value;
-    if (!text.trim() || detailStreaming || actionPending) return;
+    if (!text.trim() || actionPending) return;
     pushSendHistory('s:' + id, text);
     resetHistoryNav();
     actionPending = 'send';
@@ -665,10 +943,18 @@ export async function showDetail(id) {
     const userNode = appendChatMessage({ role: 'user', content: text });
     if (userNode) userNode.classList.add('optimistic');
     try {
+      // Effort rides the model id as #variant; "auto" (or no variant support)
+      // sends the bare id, resting state sends '' (CLI default).
+      let modelParam = sessionModel ? sessionModel.getValue() : '';
+      const effort = sessionEffort && !sessionEffort.el.hidden ? sessionEffort.getValue() : '';
+      if (effort) {
+        const base = effectiveModelId();
+        if (base) modelParam = base.split('#')[0] + '#' + effort;
+      }
       const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, model: sessionModel ? sessionModel.getValue() : '' }),
+        body: JSON.stringify({ text, model: modelParam }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -705,7 +991,13 @@ export async function showDetail(id) {
     }
   };
 
-  sendBtn.addEventListener('click', () => detailStreaming ? cancel() : submit());
+  sendBtn.addEventListener('click', () => {
+    // Stop only when the input is empty; with text, mid-turn steering wins.
+    if (detailStreaming && !promptEl.value.trim()) cancel();
+    else submit();
+  });
+  promptEl.addEventListener('input', renderAction);
+  renderAction();
   promptEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
@@ -882,7 +1174,10 @@ function openEventStream(id, chatEl, renderAction, confirmRunningAction) {
       }
       liveTurnDirty = true;
     },
-    'session.runtime': (d) => renderSessionRuntime(d),
+    'session.runtime': (d) => {
+      renderSessionRuntime(d);
+      if (followSessionModel && d && d.model) followSessionModel(d.model);
+    },
     'subprocess.exit': (d) => {
       // Failed/unconfirmed exits follow an explicit error event. Keep that
       // error bubble visible instead of reconciling it away as a successful turn.
@@ -1266,7 +1561,7 @@ function appendLivePart(d) {
   tmpl.innerHTML = p.type === 'tool'
     ? renderToolPart(p)
     : p.type === 'thinking'
-      ? renderThinkingPart(p)
+      ? renderThinkingPart(p, true)
       : `<div class="content" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>`;
   const partNode = tmpl.content.firstElementChild;
   if (enrichTool && lt.partNodes.length) {
@@ -1574,6 +1869,21 @@ document.addEventListener('click', async (e) => {
   } finally {
     btn.disabled = false;
   }
+});
+
+// Turn copy delegate: copies the turn's thinking + reply text. Same delegate
+// pattern as fork — transcript nodes re-render, so listeners can't attach.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.turn-copy');
+  if (!btn) return;
+  const turn = btn.closest('.chat-message');
+  const text = turnCopyText(turn);
+  if (!text) return;
+  copyText(text).then((ok) => {
+    if (!ok) return;
+    btn.classList.add('copied');
+    setTimeout(() => btn.classList.remove('copied'), 1200);
+  });
 });
 
 // Copy button on tool block headers: copies the .tool-target text (path,

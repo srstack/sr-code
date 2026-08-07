@@ -1,7 +1,7 @@
 // sr code — reusable dropdown component (Codex GUI style).
 //
 // makeDropdown({options, value, placeholder, onChange, filterable, allowCustom})
-// returns { el, getValue, setValue, setOptions, open, close }.
+// returns { el, getValue, getDisplayLabel, setValue, setOptions, open, close }.
 //
 // options: [{id, label}] — label falls back to id. allowCustom adds a
 // 'Use "<filter>"' row when the filter text matches no option, so gateways
@@ -130,6 +130,9 @@ export function makeDropdown(opts) {
   };
 
   const onDocClick = (e) => {
+    // A click that re-rendered the trigger (open/close swaps its innerHTML)
+    // leaves e.target detached — that is our own click, not an outside one.
+    if (!e.target.isConnected) return;
     if (!el.contains(e.target)) api.close();
   };
 
@@ -153,6 +156,12 @@ export function makeDropdown(opts) {
       document.removeEventListener('click', onDocClick);
     },
     getValue: () => state.value,
+    // The selected option's label (for compact summaries elsewhere); falls
+    // back to the raw value when the option list doesn't know it.
+    getDisplayLabel() {
+      const hit = (state.options || []).find(o => o.id === state.value);
+      return (hit && hit.label) || state.value || '';
+    },
     setValue(v) { state.value = v; render(); },
     setOptions(options, keepValue) {
       state.options = options || [];

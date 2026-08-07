@@ -191,6 +191,14 @@ function parseImageDims(content) {
   return null;
 }
 
+// formatDuration renders a millisecond span the way ChatGPT labels work:
+// sub-minute as seconds, then minutes+seconds.
+export function formatDuration(ms) {
+  const s = Math.round(Number(ms) / 1000) || 0;
+  if (s <= 0) return '';
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
 export function renderToolPart(p) {
   const name = p.toolName || 'tool';
   const target = p.toolTarget || '';
@@ -228,13 +236,17 @@ export function renderToolPart(p) {
         : esc(name) + ' <span class="tool-target">' + esc(target) + '</span>' +
           '<button class="tool-copy" type="button" title="Copy" aria-label="Copy target">' + copyIcon + '</button>')
     : esc(name);
+  // Settled calls name their runtime, Codex-style ("$ ls · 3s"); a still-
+  // running placeholder shows the running hint instead.
+  const dur = formatDuration(p.duration_ms);
+  const suffix = dur ? ` <span class="tool-duration">· ${dur}</span>` : '';
   // Empty content = the call is still running (a placeholder card that the
   // result replaces in place). Show a subtle running hint as the body.
   const bodyHtml = p.content
     ? `<div class="tool-body" data-raw="${esc(p.content)}">${renderMarkdown(p.content)}</div>`
     : `<div class="tool-body tool-running"><span class="tool-running-dot"></span>running…</div>`;
   return `<details class="tool-details${p.content ? '' : ' running'}"${openAttr}>` +
-    `<summary>${label}</summary>` +
+    `<summary>${label}${suffix}</summary>` +
     bodyHtml +
     `</details>`;
 }
@@ -247,11 +259,40 @@ export function forkBtnHTML(uuid) {
   return `<button class="turn-fork" type="button" data-uuid="${esc(uuid)}" title="Fork: branch a new session from this point">⑂ fork</button>`;
 }
 
+// copyBtnHTML is the copy control beside fork at a turn's foot — copies the
+// turn's text (and thinking) to the clipboard. Clicks are delegated like fork.
+export function copyBtnHTML() {
+  return '<button class="turn-copy" type="button" title="Copy this reply">'
+    + '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">'
+    + '<rect x="6" y="6" width="8" height="8" rx="1.5"/>'
+    + '<path d="M4.5 10.5h-1a1.5 1.5 0 0 1-1.5-1.5V3.5A1.5 1.5 0 0 1 3.5 2h5.5A1.5 1.5 0 0 1 10.5 3.5v1"/>'
+    + '</svg> copy</button>';
+}
+
+// turnCopyText collects a turn node's copiable text: thinking bodies first,
+// then the visible content blocks, in order.
+export function turnCopyText(node) {
+  if (!node) return '';
+  const parts = [];
+  node.querySelectorAll('.thinking-body, .content').forEach(el => {
+    const raw = el.dataset && el.dataset.raw;
+    const text = raw != null ? raw : el.textContent;
+    if (text && text.trim()) parts.push(text.trim());
+  });
+  return parts.join('\n\n');
+}
+
 // renderThinkingPart renders a reasoning/thinking part as a collapsed,
-// muted block — visible on demand but never competing with the reply.
-export function renderThinkingPart(p) {
-  return `<details class="thinking-details">` +
-    `<summary>thinking</summary>` +
+// muted block — visible on demand but never competing with the reply. When
+// the server stamped a duration the summary names it, ChatGPT-style
+// ("Thought for 12s"). live marks a still-streaming part: animated label.
+export function renderThinkingPart(p, live) {
+  const dur = formatDuration(p && p.duration_ms);
+  let label = dur ? `Thought for ${dur}` : 'thinking';
+  const cls = live && !dur ? ' thinking-live' : '';
+  if (live && !dur) label = 'Thinking';
+  return `<details class="thinking-details${cls}">` +
+    `<summary>${label}</summary>` +
     `<div class="content thinking-body" data-raw="${esc(p.content || '')}">${renderMarkdown(p.content || '')}</div>` +
     `</details>`;
 }
@@ -296,6 +337,7 @@ export function appendChatMessage(m) {
     div.innerHTML =
       `<div class="role"${modelAttr}>${roleLabel}${ts}</div>` +
       renderAssistantParts(m.parts) +
+      copyBtnHTML() +
       (m.uuid ? forkBtnHTML(m.uuid) : '');
   } else if (role === 'summary') {
     // Compaction marker: earlier turns were folded into this standing
@@ -367,6 +409,9 @@ export const BACKEND_MARKS = {
     + '<path fill="currentColor" d="M15.52 12H19.04V19.04H15.52Z"/>',
   opencode: '<path d="M12 3.2 19.6 7.6v8.8L12 20.8 4.4 16.4V7.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="2"/>'
     + '<path d="M9.25 9.3 6.85 12l2.4 2.7M14.75 9.3l2.4 2.7-2.4 2.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+  opencode2: '<path d="M12 3.2 19.6 7.6v8.8L12 20.8 4.4 16.4V7.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="2"/>'
+    + '<path d="M9.25 9.3 6.85 12l2.4 2.7M14.75 9.3l2.4 2.7-2.4 2.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '<circle cx="12" cy="12" r="1.6" fill="currentColor"/>',
 };
 
 // Unknown/empty backend falls back to claude, mirroring the router default.

@@ -51,6 +51,34 @@ export function setSuppressAppendScroll(v) { suppressAppendScroll = v; }
 export let editorUrl = '';
 export function setEditorUrl(v) { editorUrl = v; }
 
+// --- model catalogs -------------------------------------------------------
+// Fetched ONCE per page load and shared by every view (new-session form,
+// per-session composer). Server-side catalogs are process-cached, so the
+// first fetch is already fast; this kills the per-session-view round trip
+// that made the model picker lag on every session switch.
+let modelCatalogData = null;
+let modelCatalogPromise = null;
+export function loadModelCatalogs() {
+  if (modelCatalogData) return Promise.resolve(modelCatalogData);
+  if (!modelCatalogPromise) {
+    modelCatalogPromise = fetch('/api/models')
+      .then(r => r.ok ? r.json() : {})
+      .then(d => {
+        modelCatalogData = {
+          backends: (d && d.backends) || [],
+          models: (d && d.models) || {},
+          defaults: (d && d.defaults) || {},
+        };
+        return modelCatalogData;
+      })
+      .catch(() => {
+        modelCatalogPromise = null; // allow a later retry
+        return { backends: [], models: {}, defaults: {} };
+      });
+  }
+  return modelCatalogPromise;
+}
+
 // --- constants used by multiple modules ---
 
 // Auto-scroll to the bottom on new content only when the user is already near

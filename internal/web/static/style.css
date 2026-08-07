@@ -55,6 +55,7 @@
   --codex: #6f76d6;
   --pi: #111111;
   --opencode: #18725f;
+  --opencode2: #0e5a8a;
 
   /* Code */
   --inline-code-bg: #f1f2f4;
@@ -604,6 +605,14 @@ body.sidebar-collapsed #sidebar-resizer { display: none; }
   flex-direction: column;
 }
 
+/* Session detail column: transcript scroll area + bottom terminal drawer. */
+.detail-col {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .chat-area {
   flex: 1 1 0;
   min-height: 0;
@@ -900,10 +909,16 @@ td.cwd { font-size: 0.75rem; }
   margin-bottom: 0.35rem;
   font-weight: 600;
 }
-/* User messages: blue role label + blue-tinted bubble so the prompt pops
- * out of the reply stream. */
+/* User messages: right-aligned blue bubble, Codex-style — the prompt pops
+ * out of the reply stream without spanning the full width. */
+.chat-message.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
 .chat-message.user .role { color: #2563eb; }
 .chat-message.user .content {
+  max-width: 78%;
   background: #eff6ff;
   border: 1px solid #bfdbfe;
   border-radius: var(--radius-lg);
@@ -986,6 +1001,23 @@ td.cwd { font-size: 0.75rem; }
   font-size: 0.85rem;
   font-style: italic;
 }
+/* Live-streaming reasoning: accent label + trailing animated ellipsis. */
+.thinking-details.thinking-live > summary { color: var(--accent); }
+.thinking-details.thinking-live > summary::after {
+  content: "";
+  display: inline-block;
+  width: 1.2em;
+  text-align: left;
+  animation: thinking-ellipsis 1.2s steps(1) infinite;
+}
+@keyframes thinking-ellipsis {
+  0% { content: ""; }
+  33% { content: "."; }
+  66% { content: ".."; }
+  100% { content: "..."; }
+}
+/* Settled tool calls name their runtime ("$ ls · 3s"). */
+.tool-duration { color: var(--text-disabled); font-weight: 400; }
 
 /* Tool parts */
 .chat-message.assistant .tool-details {
@@ -1124,6 +1156,26 @@ td.cwd { font-size: 0.75rem; }
 }
 .chat-message .turn-fork:hover:not(:disabled) { color: var(--text-muted); }
 .chat-message .turn-fork:disabled { opacity: 0.4; cursor: default; }
+/* Turn-level copy sits at the foot's left edge (fork keeps the right). */
+.chat-message .turn-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.15rem;
+  padding: 0.1rem 0.4rem;
+  border: 0;
+  background: transparent;
+  color: var(--text-disabled);
+  font-size: 0.68rem;
+  line-height: 1.4;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: color var(--duration-fast) var(--ease-out);
+}
+.chat-message .turn-copy:hover { color: var(--text-muted); }
+.chat-message .turn-copy.copied { color: var(--success, #1a7f37); }
+/* Reasoning-effort pill next to the model pill in the composer. */
+.effort-dd .dropdown-trigger { text-transform: none; }
 
 /* ===== Side-by-side diff view ===== */
 
@@ -1345,18 +1397,56 @@ td.cwd { font-size: 0.75rem; }
 .composer-tools { display: flex; align-items: center; gap: var(--space-1); }
 .composer-send { margin-left: auto; display: flex; align-items: center; gap: var(--space-2); }
 
-/* Composer model dropdown: compact ghost trigger, popover opens upward. */
+/* Composer model dropdown: pill trigger (Codex-style), popover opens upward. */
 .model-mount .dropdown-trigger {
-  padding: 0.25rem 0.5rem;
-  border: none;
-  background: transparent;
+  padding: 0.28rem 0.7rem;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  border-radius: 999px;
   font-family: var(--font-mono);
   font-size: 0.76rem;
-  color: var(--text-faint);
+  color: var(--text-muted);
   max-width: 16rem;
 }
-.model-mount .dropdown-trigger:hover { background: var(--bg-subtle); color: var(--text); }
+.model-mount .dropdown-trigger:hover { background: var(--bg-hover); color: var(--text); border-color: var(--border-strong); }
 .model-mount .dropdown-pop { bottom: calc(100% + 4px); top: auto; }
+
+/* Attachment chips (Codex-style) sitting above the composer textarea. */
+.attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.55rem 0.85rem 0;
+}
+.attach-chips[hidden] { display: none; }
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 16rem;
+  padding: 0.18rem 0.3rem 0.18rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.attach-chip .attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-chip button {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 0.25rem;
+  font-size: 0.85rem;
+  line-height: 1.2;
+  border-radius: 50%;
+}
+.attach-chip button:hover { color: var(--text); background: var(--bg-hover); }
 
 .session-usage-wrap { position: relative; display: flex; align-items: center; }
 .composer-send button.session-usage {
@@ -1399,7 +1489,10 @@ td.cwd { font-size: 0.75rem; }
 .session-usage-detail strong { width: 3.4rem; flex: none; font-weight: 500; color: var(--text-faint); }
 .session-usage-detail span { white-space: nowrap; }
 
-.composer-send button {
+/* The action pill styles apply ONLY to direct children (the send button) —
+ * a bare descendant selector also repainted every dropdown item inside the
+ * model-settings popover as a black pill. */
+.composer-send > button {
   padding: 0.4rem 1.1rem;
   border: 1px solid transparent;
   background: var(--accent);
@@ -1412,14 +1505,85 @@ td.cwd { font-size: 0.75rem; }
   line-height: 1.2;
   transition: background var(--duration-fast) var(--ease-out);
 }
-.composer-send button:hover:not(:disabled) {
+.composer-send > button:hover:not(:disabled) {
   background: var(--accent-hover);
 }
-.composer-send button:disabled {
+.composer-send > button:disabled {
   background: var(--border-strong);
   cursor: not-allowed;
   opacity: 0.5;
 }
+
+/* Circular send/stop action (ChatGPT-style). */
+.composer-send button.send-circle {
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 1;
+  transition: background var(--duration-fast) var(--ease-out), transform var(--duration-fast) var(--ease-out);
+}
+.composer-send button.send-circle:hover:not(:disabled) { background: var(--accent-hover); }
+.composer-send button.send-circle.stop { background: #2b2b2e; }
+.composer-send button.send-circle:disabled { background: var(--border-strong); cursor: default; }
+/* Clickable "model · effort" summary left of the action button — doubles as
+ * the trigger for the settings popover. */
+.model-select-wrap { position: relative; display: inline-flex; }
+.composer-send button.model-summary {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0.3rem 0.5rem;
+  border-radius: var(--radius-sm);
+}
+.composer-send button.model-summary:hover:not(:disabled) { background: var(--bg-subtle); color: var(--text); }
+.composer-send button.model-summary[aria-expanded="true"] { color: var(--accent); background: var(--bg-subtle); }
+/* Settings popover holding the model/effort dropdowns, anchored to the
+ * summary button (opens upward-left). */
+.settings-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  min-width: 17rem;
+  padding: 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+}
+.settings-pop[hidden] { display: none; }
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.25rem 0.35rem;
+  border-radius: var(--radius-sm);
+}
+.settings-row[hidden] { display: none; }
+.settings-row .settings-label {
+  width: 3.2rem;
+  flex: none;
+  font-size: 0.75rem;
+  color: var(--text-faint);
+}
+.settings-row .model-mount { flex: 1; display: flex; justify-content: flex-end; }
+.settings-row .model-mount .dropdown-pop { bottom: calc(100% + 4px); top: auto; }
 
 .render-pill {
   display: inline-flex;
@@ -1563,6 +1727,7 @@ pre.raw-markdown {
 .backend-mark--codex { color: var(--codex); }
 .backend-mark--pi { color: var(--pi); }
 .backend-mark--opencode { color: var(--opencode); }
+.backend-mark--opencode2 { color: var(--opencode2); }
 .archived-row .backend-mark { opacity: 0.4; }
 
 /* ===== Send controls ===== */
@@ -1596,24 +1761,66 @@ pre.raw-markdown {
 .auto-approve-toggle:disabled,
 .term-toggle:disabled,
 .upload-btn:disabled { opacity: 0.4; cursor: progress; }
-.upload-btn { color: var(--text); }
+/* ChatGPT-style plain plus: a touch larger than the neighbouring toggles. */
+.upload-btn {
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.3rem 0.5rem;
+}
 .auto-approve-toggle[aria-pressed="true"] { color: var(--warning-text); }
 .term-toggle[aria-pressed="true"],
 .term-toggle[aria-pressed="mixed"] { color: var(--accent); }
 @media (max-width: 720px) { .t-full { display: none; } }
 
-/* ===== Terminal panel ===== */
+/* ===== Terminal panel: drawer pinned below the composer at the same width,
+ * inside the sticky send anchor. The head doubles as the drag handle. ===== */
 
 .term-panel {
   display: flex;
   flex-direction: column;
-  margin-bottom: var(--space-3);
   position: relative;
+  margin-top: var(--space-2);
+  flex-shrink: 0;
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow: hidden;
-  border: 1px solid var(--border);
+  background: var(--bg-base);
 }
 .term-panel[hidden] { display: none; }
+.term-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.1rem 0.4rem;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  cursor: ns-resize;
+  user-select: none;
+}
+.term-head button { cursor: pointer; }
+.term-head-title {
+  margin-right: auto;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.term-head button {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0.1rem 0.35rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  display: inline-flex;
+  align-items: center;
+}
+.term-head button:hover { color: var(--text); background: var(--bg-hover); }
+#term-expand svg { transition: transform var(--duration-fast) var(--ease-out); }
+.term-panel--tall #term-expand svg { transform: rotate(180deg); }
+.term-panel--tall .term-screen { height: 45vh !important; }
 .term-screen {
   height: 11rem;
   overflow: auto;
@@ -1621,7 +1828,9 @@ pre.raw-markdown {
   background: #0d1117;
   border: none;
   border-bottom: none;
+  cursor: text;
 }
+.term-screen:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
 .term-grid {
   margin: 0;
   width: max-content;
@@ -2113,6 +2322,7 @@ pre.raw-markdown {
   cursor: pointer;
 }
 .new-field[data-backend="opencode"] .new-select { color: var(--opencode); }
+.new-field[data-backend="opencode2"] .new-select { color: var(--opencode2); }
 .new-field[data-backend="codex"] .new-select { color: var(--codex); }
 .new-field[data-backend="pi"] .new-select { color: var(--pi); }
 
@@ -2139,6 +2349,7 @@ pre.raw-markdown {
 .composer-model-pickers[data-backend="codex"] .composer-picker { color: var(--codex); }
 .composer-model-pickers[data-backend="pi"] .composer-picker { color: var(--pi); }
 .composer-model-pickers[data-backend="opencode"] .composer-picker { color: var(--opencode); }
+.composer-model-pickers[data-backend="opencode2"] .composer-picker { color: var(--opencode2); }
 .composer-backend { min-width: 4.5rem; }
 .picker-divider { width: 1px; height: 1em; background: var(--border); }
 .composer-picker:hover { background: rgba(110,118,129,0.1); }

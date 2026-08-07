@@ -1,7 +1,7 @@
 // usher SPA: entry point.
 // Hash-based routing between session list, detail view, new session, and main chat.
 
-import { closeES, clearListInterval, setEditorUrl } from './state.js';
+import { closeES, clearListInterval, setEditorUrl, loadModelCatalogs } from './state.js';
 import './render.js'; // side-effect: sets up marked, render-pill listeners
 import { loadSidebar, updateSidebarActive } from './sidebar.js';
 import { showList, loadList } from './list.js';
@@ -35,6 +35,9 @@ setInterval(loadSidebar, 5000);
 loadSidebar();
 
 route();
+
+// Warm the shared model catalog cache at boot so no picker ever waits.
+loadModelCatalogs();
 
 fetch('/api/config')
   .then(r => (r.ok ? r.json() : null))
