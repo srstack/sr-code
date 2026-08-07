@@ -184,6 +184,10 @@ func updateClaudeRuntime(runtime *core.SessionRuntime, raw json.RawMessage) {
 			CacheCreation int64 `json:"cache_creation_input_tokens"`
 			CacheRead     int64 `json:"cache_read_input_tokens"`
 			Output        int64 `json:"output_tokens"`
+			// Not a Claude field: opencode shadow writers stamp the model's
+			// context limit here so synced sessions (no live runtime event)
+			// still know their window.
+			ContextWindow int64 `json:"context_window"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(raw, &msg) != nil {
@@ -196,6 +200,9 @@ func updateClaudeRuntime(runtime *core.SessionRuntime, raw json.RawMessage) {
 	context := msg.Usage.Input + cached + msg.Usage.Output
 	if context > 0 {
 		runtime.ContextTokens = context
+	}
+	if msg.Usage.ContextWindow > 0 {
+		runtime.ContextWindow = msg.Usage.ContextWindow
 	}
 }
 
@@ -347,6 +354,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 			ToolName:   ti.name,
 			ToolTarget: ti.target,
 			ToolUseID:  ev.SourceToolUseID,
+			Time:       ev.Timestamp,
 		}
 		a.cur.Parts = append(a.cur.Parts, p)
 		return nil, &p
@@ -376,10 +384,10 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		// instead of appearing only when they finish.
 		collectToolUses(ev.Message, a.toolMap)
 		before := len(a.cur.Parts)
-		a.appendToolPlaceholders(ev.Message)
+		a.appendToolPlaceholders(ev.Message, ev.Timestamp)
 		// Append a text part (skip tool_use/thinking-only messages).
 		if text := extractAssistantText(ev.Message); text != "" {
-			p := TurnPart{Type: "text", Content: text}
+			p := TurnPart{Type: "text", Content: text, Time: ev.Timestamp}
 			a.cur.Parts = append(a.cur.Parts, p)
 			return nil, &p
 		}
@@ -402,10 +410,19 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 		ToolName:   ti.name,
 		ToolTarget: ti.target,
 		ToolUseID:  tuID,
+		Time:       ev.Timestamp,
 	}
 	if idx, ok := a.pendingTool[tuID]; ok && idx < len(a.cur.Parts) {
 		delete(a.pendingTool, tuID)
-		a.cur.Parts[idx] = p // fill the placeholder in place
+		// Fill the placeholder in place, keeping the call's start time so the
+		// card can show how long the tool ran.
+		if start := a.cur.Parts[idx].Time; !start.IsZero() {
+			p.Time = start
+			if d := ev.Timestamp.Sub(start); d > 0 {
+				p.DurationMs = d.Milliseconds()
+			}
+		}
+		a.cur.Parts[idx] = p
 		return nil, &a.cur.Parts[idx]
 	}
 	a.cur.Parts = append(a.cur.Parts, p)
@@ -416,7 +433,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 // assistant message and records card positions keyed by tool_use id, so the
 // matching tool_result replaces the card in place. Long-running tools become
 // visible at call time instead of at completion time.
-func (a *Assembler) appendToolPlaceholders(msg json.RawMessage) {
+func (a *Assembler) appendToolPlaceholders(msg json.RawMessage, ts time.Time) {
 	var m struct {
 		Content json.RawMessage `json:"content"`
 	}
@@ -443,6 +460,7 @@ func (a *Assembler) appendToolPlaceholders(msg json.RawMessage) {
 			ToolName:   ti.name,
 			ToolTarget: ti.target,
 			ToolUseID:  b.ID,
+			Time:       ts,
 		})
 		a.pendingTool[b.ID] = len(a.cur.Parts) - 1
 	}
@@ -490,7 +508,7 @@ func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPa
 	// Empty tool cards first so running tools are visible immediately; the
 	// result replaces them in place when it lands.
 	before := len(a.cur.Parts)
-	a.appendToolPlaceholders(ev.Message)
+	a.appendToolPlaceholders(ev.Message, ev.Timestamp)
 	for i := before; i < len(a.cur.Parts); i++ {
 		parts = append(parts, &a.cur.Parts[i])
 	}
@@ -498,10 +516,10 @@ func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPa
 		var p *TurnPart
 		switch b.kind {
 		case "thinking":
-			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "thinking", Content: b.text})
+			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "thinking", Content: b.text, Time: ev.Timestamp})
 			p = &a.cur.Parts[len(a.cur.Parts)-1]
 		case "text":
-			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "text", Content: b.text})
+			a.cur.Parts = append(a.cur.Parts, TurnPart{Type: "text", Content: b.text, Time: ev.Timestamp})
 			p = &a.cur.Parts[len(a.cur.Parts)-1]
 		}
 		if p != nil {
@@ -584,6 +602,7 @@ func (a *Assembler) Flush() *Turn {
 	if t == nil || len(t.Parts) == 0 {
 		return nil
 	}
+	t.StampPartDurations()
 	return t
 }
 

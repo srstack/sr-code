@@ -25,9 +25,36 @@ type TurnPart struct {
 	ToolName   string `json:"toolName,omitempty"`
 	ToolTarget string `json:"toolTarget,omitempty"`
 
+	// Time is the transcript timestamp of the record that produced the part.
+	Time time.Time `json:"ts,omitempty"`
+	// DurationMs is a thinking part's span: to the next part, or to the turn
+	// end when it is last. Stamped at turn completion, so live-streamed parts
+	// carry none yet — the UI shows a bare "thinking" until it lands.
+	DurationMs int64 `json:"duration_ms,omitempty"`
+
 	// ToolUseID is parser bookkeeping used to join metadata follow-ups to the
 	// tool part they enrich. It is never part of the public transcript shape.
 	ToolUseID string `json:"-"`
+}
+
+// StampPartDurations fills thinking parts' DurationMs at turn completion:
+// each spans to the next part's timestamp, the last to the turn's end.
+func (t *Turn) StampPartDurations() {
+	for i := range t.Parts {
+		if t.Parts[i].Type != "thinking" || t.Parts[i].Time.IsZero() {
+			continue
+		}
+		end := t.EndTime
+		if i+1 < len(t.Parts) && !t.Parts[i+1].Time.IsZero() {
+			end = t.Parts[i+1].Time
+		}
+		if end.IsZero() {
+			continue
+		}
+		if d := end.Sub(t.Parts[i].Time); d > 0 {
+			t.Parts[i].DurationMs = d.Milliseconds()
+		}
+	}
 }
 
 // Turn is a grouped, display-ready timeline entry shared by every backend.

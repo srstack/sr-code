@@ -192,25 +192,26 @@ func (d *Discovery) upsert(path string) {
 			}
 		}
 		if meta, err := src.ReadMeta(path); err == nil {
-			// Claude's status-line callback is the authoritative source because
-			// it includes the effective max window. Transcript usage is only a
-			// fallback; never let a later fsnotify scan erase a captured window.
+			// Claude's status-line callback is the authoritative source for the
+			// context window because it includes the effective max — a later
+			// fsnotify scan must not erase a captured window. That guard
+			// covers ONLY the window: model/effort/tokens still merge, or a
+			// turn whose runtime event arrived first would never show usage.
 			// MERGE rather than replace: a runtime event (e.g. opencode's
 			// step_finish) carries fresher usage than a meta read taken before
 			// the turn settled, and wholesale replacement erased it.
-			if existing.Backend != "claude" || existing.Runtime.ContextWindow == 0 {
-				if meta.Runtime.Model != "" {
-					existing.Runtime.Model = meta.Runtime.Model
-				}
-				if meta.Runtime.Effort != "" {
-					existing.Runtime.Effort = meta.Runtime.Effort
-				}
-				if meta.Runtime.ContextTokens > 0 {
-					existing.Runtime.ContextTokens = meta.Runtime.ContextTokens
-				}
-				if meta.Runtime.ContextWindow > 0 {
-					existing.Runtime.ContextWindow = meta.Runtime.ContextWindow
-				}
+			protectWindow := existing.Backend == "claude" && existing.Runtime.ContextWindow > 0
+			if meta.Runtime.Model != "" {
+				existing.Runtime.Model = meta.Runtime.Model
+			}
+			if meta.Runtime.Effort != "" {
+				existing.Runtime.Effort = meta.Runtime.Effort
+			}
+			if meta.Runtime.ContextTokens > 0 {
+				existing.Runtime.ContextTokens = meta.Runtime.ContextTokens
+			}
+			if !protectWindow && meta.Runtime.ContextWindow > 0 {
+				existing.Runtime.ContextWindow = meta.Runtime.ContextWindow
 			}
 			if existing.Cwd == "" || existing.Prompt == "" || existing.LastInputAt.IsZero() || needTitle {
 				applySubagentMeta(&existing, meta)

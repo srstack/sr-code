@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -263,9 +264,24 @@ func (m *Manager) readLoop(p *process, r io.Reader) {
 		if req != nil {
 			model := req.model
 			usage, ok := e.ModelUsage[model]
+			if !ok {
+				// Claude ≥2.1 tags usage keys with the context-variant suffix
+				// (claude-opus-5[1m]) while message.model stays bare — match
+				// on the base id so the window lookup survives the suffix,
+				// but keep displaying the bare model name.
+				for k, v := range e.ModelUsage {
+					if base, _, _ := strings.Cut(k, "["); base == model {
+						usage, ok = v, true
+						break
+					}
+				}
+			}
 			if !ok && len(e.ModelUsage) == 1 {
 				for fallbackModel, fallbackUsage := range e.ModelUsage {
-					model, usage = fallbackModel, fallbackUsage
+					// Strip the context-variant suffix for display: the pie
+					// should read claude-opus-5, not claude-opus-5[1m].
+					model, _, _ = strings.Cut(fallbackModel, "[")
+					usage = fallbackUsage
 				}
 			}
 			req.finish(Result{IsError: e.IsError, Subtype: e.Subtype, Model: model, ContextWindow: usage.ContextWindow})

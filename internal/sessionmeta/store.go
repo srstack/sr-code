@@ -24,6 +24,7 @@ type fileFormat struct {
 	Archived map[string]archiveDecision `json:"archived,omitempty"`
 	Pinned   []string                   `json:"pinned,omitempty"`
 	Titles   map[string]string          `json:"titles,omitempty"`
+	Windows  map[string]int64           `json:"windows,omitempty"`
 }
 
 type Store struct {
@@ -34,6 +35,7 @@ type Store struct {
 	archived map[string]archiveDecision
 	pinned   map[string]bool
 	titles   map[string]string
+	windows  map[string]int64
 }
 
 func New(path string, autoAfter time.Duration) *Store {
@@ -46,6 +48,7 @@ func New(path string, autoAfter time.Duration) *Store {
 		archived:  map[string]archiveDecision{},
 		pinned:    map[string]bool{},
 		titles:    map[string]string{},
+		windows:   map[string]int64{},
 	}
 	s.load()
 	return s
@@ -80,6 +83,11 @@ func (s *Store) load() {
 	for id, t := range f.Titles {
 		s.titles[id] = t
 	}
+	for id, w := range f.Windows {
+		if w > 0 {
+			s.windows[id] = w
+		}
+	}
 }
 
 func (s *Store) persist() {
@@ -94,7 +102,11 @@ func (s *Store) persist() {
 	if len(s.titles) > 0 {
 		titles = s.titles
 	}
-	data, err := json.Marshal(fileFormat{Archived: s.archived, Pinned: pinned, Titles: titles})
+	var windows map[string]int64
+	if len(s.windows) > 0 {
+		windows = s.windows
+	}
+	data, err := json.Marshal(fileFormat{Archived: s.archived, Pinned: pinned, Titles: titles, Windows: windows})
 	if err != nil {
 		slog.Warn("sessionmeta: encode", "err", err)
 		return
@@ -111,6 +123,30 @@ func (s *Store) persist() {
 	if err := os.Rename(tmp, s.path); err != nil {
 		slog.Warn("sessionmeta: rename", "err", err)
 	}
+}
+
+// SaveContextWindow remembers the session's last observed context limit, so
+// an usher restart doesn't blank the usage pie until the session's next
+// turn. Tokens are deliberately not persisted — the transcript refreshes
+// them on the next meta read, while a stale number would linger.
+func (s *Store) SaveContextWindow(id string, window int64) {
+	if id == "" || window <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.windows[id] == window {
+		return
+	}
+	s.windows[id] = window
+	s.persist()
+}
+
+// ContextWindow returns the remembered limit, 0 when never observed.
+func (s *Store) ContextWindow(id string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.windows[id]
 }
 
 func (s *Store) Archive(id string) {
@@ -205,11 +241,13 @@ func (s *Store) Forget(id string) {
 	_, hasArchive := s.archived[id]
 	hasPin := s.pinned[id]
 	_, hasTitle := s.titles[id]
-	if !hasArchive && !hasPin && !hasTitle {
+	_, hasWindow := s.windows[id]
+	if !hasArchive && !hasPin && !hasTitle && !hasWindow {
 		return
 	}
 	delete(s.archived, id)
 	delete(s.pinned, id)
 	delete(s.titles, id)
+	delete(s.windows, id)
 	s.persist()
 }
