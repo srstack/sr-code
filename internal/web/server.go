@@ -36,6 +36,7 @@ import (
 	"github.com/nexustar/usher/internal/auth"
 	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/core"
+	embedpkg "github.com/nexustar/usher/internal/embed"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/jsonl"
 	"github.com/nexustar/usher/internal/mainchat"
@@ -83,6 +84,10 @@ type Server struct {
 	editorURL string
 	uiDir     string
 	themePath string
+
+	// Embeds are the embedded agent UIs, each served on its own
+	// auth-guarded listener (set by main before Run).
+	Embeds []EmbedMount
 
 	// Main-chat delivery. The user message is persisted in the POST handler
 	// (202 means durable); the agent turn then runs on the chat's single
@@ -178,11 +183,62 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// EmbedMount wires one embedded agent UI process to its usher-side public
+// listener. ListenPort is bound on the same host exposure as the main
+// listener; the auth middleware guards it like the main UI.
+type EmbedMount struct {
+	Process    *embedpkg.Process
+	ListenPort int
+}
+
 // handleBackends is the cheap half of handleModels: just the enabled backend
 // names, so the new-session form can render its backend picker immediately
 // instead of waiting on every model catalog.
 func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]string{"backends": s.router.Backends()})
+}
+
+// embedDTO is the /api/embeds wire shape. The spec's Cmd/Args are
+// deliberately not exposed; Query (dsh's one-time ?token=) is omitted when
+// empty.
+type embedDTO struct {
+	Name  string `json:"name"`
+	Title string `json:"title"`
+	Port  int    `json:"port"`
+	Ready bool   `json:"ready"`
+	Query string `json:"query,omitempty"`
+}
+
+func (s *Server) handleEmbeds(w http.ResponseWriter, _ *http.Request) {
+	out := make([]embedDTO, 0, len(s.Embeds))
+	for _, m := range s.Embeds {
+		spec := m.Process.Spec()
+		out = append(out, embedDTO{
+			Name:  spec.Name,
+			Title: spec.Title,
+			Port:  m.ListenPort,
+			Ready: m.Process.Ready(),
+			Query: m.Process.StartQuery(),
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// embedBindHost mirrors the main listener's exposure for embed listeners:
+// a loopback main address keeps them loopback-only; anything else binds all
+// interfaces (the auth middleware is still the gate).
+func embedBindHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "0.0.0.0"
+	}
+	if host == "localhost" {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return "127.0.0.1"
+	}
+	return "0.0.0.0"
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -205,6 +261,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	webMux.HandleFunc("GET /api/models", s.handleModels)
 	webMux.HandleFunc("GET /api/backends", s.handleBackends)
+	webMux.HandleFunc("GET /api/embeds", s.handleEmbeds)
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)
@@ -281,7 +338,33 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("hook socket: %w", err)
 	}
 
-	errCh := make(chan error, 2)
+	// Each embedded agent UI gets its own auth-guarded listener, bound with
+	// the same exposure as the main listener.
+	embedHost := embedBindHost(s.addr)
+	embedSrvs := make([]*http.Server, 0, len(s.Embeds))
+	embedListeners := make([]net.Listener, 0, len(s.Embeds))
+	for _, m := range s.Embeds {
+		mux := http.NewServeMux()
+		mux.Handle("/", m.Process.Handler())
+		addr := net.JoinHostPort(embedHost, strconv.Itoa(m.ListenPort))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			_ = webListener.Close()
+			_ = sockListener.Close()
+			_ = os.Remove(s.hookSockPath)
+			for _, l := range embedListeners {
+				_ = l.Close()
+			}
+			return fmt.Errorf("embed %s listen %s: %w", m.Process.Spec().Name, addr, err)
+		}
+		embedSrvs = append(embedSrvs, &http.Server{
+			Handler:           gzipMiddleware(s.authMiddleware(mux)),
+			ReadHeaderTimeout: 5 * time.Second,
+		})
+		embedListeners = append(embedListeners, ln)
+	}
+
+	errCh := make(chan error, 2+len(embedSrvs))
 	go func() {
 		s.logger.Info("usher web listening", "addr", s.addr)
 		errCh <- webSrv.Serve(webListener)
@@ -290,12 +373,21 @@ func (s *Server) Run(ctx context.Context) error {
 		s.logger.Info("usher hook listening", "socket", s.hookSockPath)
 		errCh <- hookSrv.Serve(sockListener)
 	}()
+	for i, m := range s.Embeds {
+		go func(srv *http.Server, ln net.Listener, name string, port int) {
+			s.logger.Info("usher embed listening", "name", name, "port", port)
+			errCh <- srv.Serve(ln)
+		}(embedSrvs[i], embedListeners[i], m.Process.Spec().Name, m.ListenPort)
+	}
 
 	shutdown := func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = webSrv.Shutdown(shutdownCtx)
 		_ = hookSrv.Shutdown(shutdownCtx)
+		for _, srv := range embedSrvs {
+			_ = srv.Shutdown(shutdownCtx)
+		}
 		_ = os.Remove(s.hookSockPath)
 	}
 
@@ -485,11 +577,11 @@ func (s *Server) handleTotp(w http.ResponseWriter, r *http.Request) {
 		host = host[:i]
 	}
 	view := struct {
-		Enabled  bool
+		Enabled   bool
 		Enrolling bool
-		Secret   string
-		URI      string
-		Error    string
+		Secret    string
+		URI       string
+		Error     string
 	}{Enabled: s.auth.TotpEnabled()}
 
 	if r.Method == http.MethodPost && r.URL.Path == "/totp/enable" {
