@@ -284,6 +284,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("POST /api/sessions/{id}/terminal/type", s.handleTerminalType)
 	webMux.HandleFunc("GET /api/sessions/{id}/terminal/screen", s.handleTerminalScreen)
 	webMux.HandleFunc("GET /api/sessions/{id}/image", s.handleSessionImage)
+	webMux.HandleFunc("GET /api/sessions/{id}/files", s.handleSessionFiles)
 	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
 	webMux.HandleFunc("POST /api/sessions/{id}/terminal/control", s.handleTerminalControl)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
@@ -1057,6 +1058,87 @@ func (s *Server) handleSessionImage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	http.ServeContent(w, r, filepath.Base(full), info.ModTime(), f)
+}
+
+// maxFileEntries caps one directory listing; beyond it the response sets
+// truncated and the client sees only the first entries in readdir order.
+const maxFileEntries = 2000
+
+type fileEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type"` // file | directory | other
+	Size int64  `json:"size,omitempty"`
+}
+
+// handleSessionFiles lists one directory inside a session's working
+// directory — names and types only, never file contents. The dir parameter
+// is fenced by pathutil.ResolveWithinDir, and symlink entries escaping the
+// cwd report "other" rather than their target's type. Auth is the
+// surrounding cookie middleware.
+func (s *Server) handleSessionFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.router.GetSession(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	full := sess.Cwd
+	if dir != "" {
+		full, ok = pathutil.ResolveWithinDir(sess.Cwd, dir)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "outside workspace")
+			return
+		}
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "not a directory")
+		return
+	}
+	dirs, err := f.ReadDir(-1)
+	f.Close()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "not a directory")
+		return
+	}
+	truncated := len(dirs) > maxFileEntries
+	if truncated {
+		dirs = dirs[:maxFileEntries]
+	}
+	entries := make([]fileEntry, 0, len(dirs))
+	for _, d := range dirs {
+		entry := fileEntry{Name: d.Name(), Type: "other"}
+		target := filepath.Join(full, d.Name())
+		if d.Type()&os.ModeSymlink != 0 {
+			// The fence applies to link targets too: a symlink escaping
+			// the cwd (or dangling) reports "other".
+			real, ok := pathutil.ResolveWithinDir(sess.Cwd, target)
+			if !ok {
+				entries = append(entries, entry)
+				continue
+			}
+			target = real
+		}
+		info, err := os.Stat(target)
+		if err != nil {
+			entries = append(entries, entry)
+			continue
+		}
+		switch {
+		case info.IsDir():
+			entry.Type = "directory"
+		case info.Mode().IsRegular():
+			entry.Type = "file"
+			entry.Size = info.Size()
+		}
+		entries = append(entries, entry)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":      dir,
+		"entries":   entries,
+		"truncated": truncated,
+	})
 }
 
 const (

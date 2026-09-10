@@ -46,9 +46,12 @@ needed, vendor a popular, self-contained, minimal one.
   exception is one tmux shell per conversation, opened in its cwd and limited
   to keystroke-level input (typed text, pasted text, and an allow-listed set
   of tmux control keys) — whole-line submit is a convenience on top. It is
-  not a filesystem API or security boundary. Still decided and out of scope:
-  file-read or directory-listing endpoints, diff views, syntax highlighting,
-  path linkification in prose, a native VSCode extension.
+  not a filesystem API or security boundary. Directory listings are
+  read-only and fenced to the session's cwd (one endpoint, entry-capped,
+  no file contents, no navigation beyond the fence) — they exist to
+  render references in the transcript's own workspace, not to browse the
+  machine. Still decided and out of scope: diff views, syntax
+  highlighting, path linkification in prose, a native VSCode extension.
 - **The main-chat agent never answers substantive questions itself.** Its only
   local job is session management (list, route, focus, permission handling,
   create). Anything else — however trivial-looking — is forwarded to a
