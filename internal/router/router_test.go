@@ -565,7 +565,7 @@ func TestFlushSendQueueAborts(t *testing.T) {
 	r.sendMu.Unlock()
 
 	aborted := make(chan error, 1)
-	if err := r.enqueueSend("abc12345", "queued", nil, func(err error) { aborted <- err }); err != nil {
+	if err := r.enqueueSend("abc12345", "queued", "", nil, func(err error) { aborted <- err }); err != nil {
 		t.Fatal(err)
 	}
 	r.flushSendQueue("abc12345", errors.New("cancelled"))
