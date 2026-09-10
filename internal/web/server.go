@@ -366,7 +366,7 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("embed %s listen %s: %w", m.Process.Spec().Name, addr, err)
 		}
 		embedSrvs = append(embedSrvs, &http.Server{
-			Handler:           gzipMiddleware(s.authMiddleware(mux)),
+			Handler:           gzipMiddleware(s.embedAuthMiddleware(mux)),
 			ReadHeaderTimeout: 5 * time.Second,
 		})
 		embedListeners = append(embedListeners, ln)
@@ -485,6 +485,50 @@ func isAuthExempt(p string) bool {
 		return true
 	}
 	return strings.HasPrefix(p, "/icons/")
+}
+
+// embedAuthMiddleware gates embed listeners on the session cookie ONLY.
+// The main listener's path exemptions must not apply here: on an embed port
+// every path proxies to the child, so an exempt /login, /sw.js, or /healthz
+// would leak child bytes to unauthenticated clients — and the login redirect
+// itself would resolve to the child, so a logged-out user would never reach
+// usher's login form. Unauthenticated requests redirect to the MAIN UI's
+// /login instead: a relative /login redirect is wrong on an embed listener
+// (its root IS the child), so the target is absolute — the host the client
+// used with the main listener's port.
+func (s *Server) embedAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.auth == nil || !s.auth.IsConfigured() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if c, err := r.Cookie(auth.CookieName); err == nil && s.auth.VerifyCookie(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Redirect(w, r, s.mainLoginURL(r), http.StatusSeeOther)
+	})
+}
+
+// mainLoginURL builds the absolute URL of the main listener's login form:
+// the request's host with the port replaced by the main listener's (the
+// server knows its own addr). Falls back to a relative /login if either
+// side has no usable port — wrong on an embed listener, but unreachable in
+// practice (both listeners are TCP host:port).
+func (s *Server) mainLoginURL(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host // no port present
+	}
+	_, port, err := net.SplitHostPort(s.addr)
+	if err != nil || port == "" || host == "" {
+		return "/login"
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port) + "/login"
 }
 
 // safeNextEscape URL-encodes a path for use in ?next=. We don't accept

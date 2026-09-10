@@ -102,8 +102,37 @@ func TestEmbedListenersAndAPI(t *testing.T) {
 		if resp.StatusCode != http.StatusSeeOther {
 			t.Fatalf("status = %d, want 303", resp.StatusCode)
 		}
-		if loc := resp.Header.Get("Location"); loc != "/login" {
-			t.Errorf("Location = %q, want /login", loc)
+		// The embed listener's root is the child, so the redirect must point
+		// at the MAIN UI's login form (absolute URL, main port).
+		want := mainBase + "/login"
+		if loc := resp.Header.Get("Location"); loc != want {
+			t.Errorf("Location = %q, want %q", loc, want)
+		}
+	})
+
+	t.Run("embed listener has no auth-exempt paths", func(t *testing.T) {
+		// The main listener's exemptions must not leak onto the embed port:
+		// every path there proxies to the child, so an exempt path would
+		// serve child bytes to unauthenticated clients.
+		for _, p := range []string{"/login", "/logout", "/healthz", "/sw.js", "/manifest.webmanifest", "/icons/icon-192.png"} {
+			resp, err := noRedirect.Get(embedBase + p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusSeeOther {
+				t.Errorf("GET %s: status = %d, want 303", p, resp.StatusCode)
+			}
+			if loc := resp.Header.Get("Location"); loc != mainBase+"/login" {
+				t.Errorf("GET %s: Location = %q, want %q", p, loc, mainBase+"/login")
+			}
+			if strings.Contains(string(body), "embed upstream body") {
+				t.Errorf("GET %s: unauthenticated request reached the child", p)
+			}
 		}
 	})
 
