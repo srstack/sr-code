@@ -138,6 +138,8 @@ func serve(args []string) error {
 	dshPort := fs.Int("dsh-port", 7781, "usher-side port for the embedded dsh UI; 0 disables")
 	dshDir := fs.String("dsh-dir", "",
 		"working directory for the embedded dsh child; dsh scopes its session list to the cwd workspace, so set this to the project you usually run dsh in (empty inherits usher's cwd)")
+	dshSessionsDir := fs.String("dsh-sessions-dir", defaultDshSessionsDir(),
+		"dsh sessions directory ($DSH_HOME/sessions); dsh sessions are listed in the sidebar when it exists")
 	openCodeWebPort := fs.Int("opencode-web-port", 7782,
 		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
 	openCodeDir := fs.String("opencode-dir", "",
@@ -312,6 +314,17 @@ func serve(args []string) error {
 		return fmt.Errorf("no backend found: Claude %q, Codex %q, pi %q, and OpenCode %q are unavailable.\n"+
 			"  run a supported agent once first, or pass its sessions-directory flag.",
 			*projectsDir, *codexSessionsDir, *piSessionsDir, *openCodeCmd)
+	}
+
+	// dsh sessions are listed read-only in the sidebar (a click opens the
+	// embedded dsh UI, never usher's detail view). There is deliberately no
+	// backends["dsh"] entry: the dsh UI owns sending, and keeping dsh out of
+	// the backend map keeps it out of the new-session picker. The router's
+	// fallback-to-default sender never matches a dsh UUID, so listing and
+	// GetSession treat these as plain idle sessions.
+	if dir := *dshSessionsDir; dir != "" && isDir(dir) {
+		sources = append(sources, discovery.NewDshSource(dir))
+		logger.Info("dsh sessions enabled", "sessions_dir", dir)
 	}
 
 	// Pre-warm every backend's model catalog in the background so the first
@@ -539,7 +552,7 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		Name: "dsh", Title: "DeepSeek Harness",
 		Args:       []string{"--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "{port}"},
 		HealthPath: "/", URLPattern: `(http://\S+)`,
-		Dir:        dshDir,
+		Dir: dshDir,
 	})
 	add(ocCmd, ocPort, embed.Spec{
 		Name: "opencode", Title: "OpenCode",
@@ -612,6 +625,19 @@ func defaultPiSessionsDir() string {
 		return filepath.Join(dir, "sessions")
 	}
 	return filepath.Join(home, ".pi", "agent", "sessions")
+}
+
+// defaultDshSessionsDir resolves dsh's on-disk session tree:
+// ${DSH_HOME:-~/.dsh}/sessions.
+func defaultDshSessionsDir() string {
+	if dir := os.Getenv("DSH_HOME"); dir != "" {
+		return filepath.Join(dir, "sessions")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".dsh", "sessions")
 }
 
 func defaultPiCmd() string {

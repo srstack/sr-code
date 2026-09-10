@@ -28,7 +28,7 @@ func RolloutFilename(id string, ts time.Time) string {
 // pure file operation: no process is spawned, and the fork is resumed lazily on
 // its first send like any idle session.
 func ForkCopy(srcPath, dstPath, throughTurnID, newID, srcID string) error {
-	f, err := openRollout(srcPath)
+	f, err := Open(srcPath)
 	if err != nil {
 		return err
 	}

@@ -146,7 +146,7 @@ func IsTurnActivity(raw []byte) bool {
 // session_meta header, last-activity from the final timestamped line, and a
 // title from the first real user prompt.
 func ReadSessionMeta(path string) (core.SessionMeta, error) {
-	f, err := openRollout(path)
+	f, err := Open(path)
 	if err != nil {
 		return core.SessionMeta{}, err
 	}
@@ -250,7 +250,7 @@ func ReadSessionMeta(path string) (core.SessionMeta, error) {
 // matching jsonl.ReadTurns' contract (limit>0 keeps the most recent N; total is
 // the count before trimming).
 func ReadTurns(path string, limit int) (turns []core.Turn, total int, err error) {
-	f, err := openRollout(path)
+	f, err := Open(path)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1063,15 +1063,16 @@ func prettyToolName(name string) string {
 	}
 }
 
-// openRollout opens a rollout file, transparently decoding zstd when the
-// path ends .zst (Codex ≥0.137 compresses cold rollouts to .jsonl.zst).
-// Caller closes the returned ReadCloser.
-func openRollout(path string) (io.ReadCloser, error) {
+// Open opens a session log, transparently decoding zstd when the path ends
+// .zst or .zstd (Codex ≥0.137 compresses cold rollouts to .jsonl.zst; dsh
+// writes generation logs as .jsonl.zstd). A torn trailing frame degrades to a
+// clean EOF, like a torn trailing plain line. Caller closes the ReadCloser.
+func Open(path string) (io.ReadCloser, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasSuffix(path, ".zst") {
+	if !strings.HasSuffix(path, ".zst") && !strings.HasSuffix(path, ".zstd") {
 		return f, nil
 	}
 	zr, err := zstd.NewReader(f)
