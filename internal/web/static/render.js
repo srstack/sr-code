@@ -211,8 +211,9 @@ export function formatTokens(n) {
 // timestamp in an assistant turn's role line: total tokens, cache-hit
 // share, and turn duration. Returns '' when the turn carries no usage, so
 // pre-usage transcripts render byte-identical to before (no stray
-// separators, no layout shift).
-function turnMetaHTML(m) {
+// separators, no layout shift). Exported so detail.js can stamp the footer
+// onto a live-promoted turn once its usage arrives.
+export function turnMetaHTML(m) {
   const u = m && m.usage;
   if (!u) return '';
   const segs = [];

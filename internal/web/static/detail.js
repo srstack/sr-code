@@ -11,7 +11,7 @@ import {
 } from './state.js';
 import {
   renderMarkdown, appendChatMessage, renderToolPart, renderThinkingPart,
-  forkBtnHTML, updateMessageTs, turnCopyText,
+  forkBtnHTML, updateMessageTs, turnCopyText, turnMetaHTML,
   backendMark, formatTokens,
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
@@ -376,6 +376,7 @@ export async function showDetail(id) {
   liveTurn = null;
   liveTurnDirty = false;
   sessionTurns = [];
+  clearTimeout(usageRefreshTimer);
   lastBarDetailHTML = '';
   transcriptLimit = TRANSCRIPT_PAGE;
   transcriptTotal = 0;
@@ -1767,9 +1768,93 @@ function finalizeTurn(id, d) {
   renderedTurns.push({ key: turnKey({ role: 'assistant', ts, parts: lt.parts }), node: lt.node });
   transcriptTotal++;
   // The exit payload carries no usage, so the pill picks this turn's tokens
-  // up on the next fetch; counts and duration update now.
+  // up on the next fetch; counts and duration update now. The debounced
+  // tail refresh below backfills this turn's usage/footer shortly after.
   noteLiveTurn({ role: 'assistant', ts, parts: lt.parts });
+  scheduleUsageRefresh(id);
   updateLoadEarlier(id);
+}
+
+// A promoted live turn is committed before the jsonl carries its usage, so
+// its tok/duration footer (stamped only by appendChatMessage) and its share
+// of the status bar are missing until an unrelated full refetch — and even
+// then the reconcile keeps the promoted node when the key matches, so the
+// footer never appears. refreshTailUsage re-fetches just the transcript
+// tail (the smallest window covering the trailing usage-less turns) and
+// merges positionally, guarded by the same turnKey the reconcile uses (or
+// its parts fingerprint when the promoted ts diverged from the jsonl):
+// no duplicates, no wholesale sessionTurns replacement. Debounced so rapid
+// consecutive turns coalesce into one fetch.
+let usageRefreshTimer = 0;
+
+function scheduleUsageRefresh(id) {
+  clearTimeout(usageRefreshTimer);
+  usageRefreshTimer = setTimeout(() => { refreshTailUsage(id); }, 500);
+}
+
+async function refreshTailUsage(id) {
+  try {
+    // Trailing run of turns still missing usage (the promoted ones plus any
+    // steering echoes after them); canonical history ends the run.
+    let need = 0;
+    for (let i = sessionTurns.length - 1; i >= 0 && need < TRANSCRIPT_PAGE; i--) {
+      const t = sessionTurns[i];
+      if (t.role === 'assistant' && t.usage) break;
+      need++;
+    }
+    if (!need) return;
+    // Alignment anchor: transcripts are append-only, so fetched turn j pairs
+    // with sessionTurns[baseLen - tail.length + j]. Turns appended after this
+    // point are past the window; a wholesale refetch is caught by the
+    // usage/fingerprint guards below.
+    const baseLen = sessionTurns.length;
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/transcript?limit=' + Math.min(need + 2, TRANSCRIPT_PAGE));
+    if (!res.ok) return;
+    const tail = (await res.json()) || [];
+    // A late response must not merge into a view the user already left.
+    if (id !== currentDetailId) return;
+    let changed = false;
+    for (let j = 0; j < tail.length; j++) {
+      const ft = tail[j];
+      if (!ft.usage) continue;
+      const idx = baseLen - tail.length + j;
+      if (idx < 0 || idx >= sessionTurns.length) continue;
+      const st = sessionTurns[idx];
+      if (st.usage || st.role !== ft.role) continue;
+      // Same identity as the reconcile (turnKey) when it holds; the promoted
+      // key's ts comes from the exit payload, which can diverge by ms from a
+      // re-read of the jsonl — then the parts fingerprint decides.
+      if (turnKey(st) !== turnKey(ft) && turnFingerprint(st) !== turnFingerprint(ft)) continue;
+      const nodeKey = turnKey(st); // the key renderedTurns tracked at promotion
+      sessionTurns[idx] = ft;
+      stampTurnMeta(nodeKey, ft);
+      changed = true;
+    }
+    if (changed) {
+      updateSessionBar();
+      scheduleTrajRender();
+    }
+  } catch { /* ignore — the next promotion or full refetch retries */ }
+}
+
+// turnFingerprint is turnKey minus the timestamp: role plus the parts
+// fingerprint. Used to recognize a promoted turn whose ts (from the exit
+// payload) diverged from the canonical jsonl ts.
+function turnFingerprint(t) {
+  const key = turnKey(t);
+  return key.slice(0, key.indexOf('\x00')) + key.slice(key.indexOf('\x00', key.indexOf('\x00') + 1));
+}
+
+// stampTurnMeta adds the tok/duration footer segment to an already-rendered
+// assistant turn once its usage arrives. No-op when the node is gone or the
+// footer is already there.
+function stampTurnMeta(key, t) {
+  const r = renderedTurns.find(rt => rt.key === key);
+  if (!r || !r.node.isConnected) return;
+  const roleEl = r.node.querySelector('.role');
+  if (!roleEl || roleEl.querySelector('.turn-meta')) return;
+  const meta = turnMetaHTML(t);
+  if (meta) roleEl.insertAdjacentHTML('beforeend', meta);
 }
 
 async function loadTranscript(id, opts) {
