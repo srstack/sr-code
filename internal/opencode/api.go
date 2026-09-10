@@ -472,7 +472,7 @@ func v2FetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path strin
 					write(toolResultLine(sid, cwd, pp, ts))
 				}
 			}
-			write(turnCompleteLine(sid, ts))
+			write(turnCompleteLine(sid, ts, m.ID))
 		}
 	}
 	prev, _ := readSyncMeta(path)

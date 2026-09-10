@@ -181,7 +181,7 @@ func syncMetaLine(s sessionEntry, inflight bool, prev syncMeta, hash string) jso
 		"subtype":          "sync-meta",
 		"sessionId":        s.ID,
 		"timestamp":        eventTime(s.Updated),
-		"uuid":             randomHexID(),
+		"uuid":             stableUUID("sync-meta", s.ID, hash),
 		"metaV":            syncMetaVersion,
 		"sourceUpdated":    s.Updated,
 		"sourceActivity":   s.Activity,
@@ -627,7 +627,7 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 				write(toolResultLine(s.ID, cwd, pp, ts))
 			}
 		}
-		write(turnCompleteLine(s.ID, ts))
+		write(turnCompleteLine(s.ID, ts, msg.Info.ID))
 	}
 	prev, _ := readSyncMeta(path)
 	write(syncMetaLine(s, v1TurnInflight(last), prev, fetchHashSum(buf)))

@@ -453,7 +453,7 @@ func (t *turn) pump(stdout, stderr io.Reader, ctx context.Context, cwd, prompt s
 			return
 		}
 	}
-	systemRaw := turnCompleteLine(t.id, time.Now().UTC())
+	systemRaw := turnCompleteLine(t.id, time.Now().UTC(), "")
 	if !t.appendAndEmit(ctx, path, "system", systemRaw) {
 		return
 	}

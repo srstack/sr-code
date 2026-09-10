@@ -2,9 +2,11 @@ package opencode
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -101,7 +103,7 @@ func toolResultLine(sessionID, cwd string, p partPayload, ts time.Time) json.Raw
 		"sessionId": sessionID,
 		"cwd":       cwd,
 		"timestamp": ts,
-		"uuid":      randomHexID(),
+		"uuid":      stableUUID("tool-result", sessionID, p.CallID),
 		"message": map[string]any{
 			"role": "user",
 			"content": []map[string]any{{
@@ -188,13 +190,18 @@ func assistantLine(sessionID string, blocks []map[string]any, ts time.Time) json
 	})
 }
 
-func turnCompleteLine(sessionID string, ts time.Time) json.RawMessage {
+// turnCompleteLine closes a fetched assistant turn. turnKey is the stable
+// source identity of the turn (the opencode message ID); the live runtime
+// passes "" and gets a random uuid — determinism only matters for the
+// sync fetch path, where a random stamp would reset the settle clock on
+// every fetch (see fetchHashSum/shadowFresh).
+func turnCompleteLine(sessionID string, ts time.Time, turnKey string) json.RawMessage {
 	return mustMarshal(map[string]any{
 		"type":      "system",
 		"subtype":   "turn_duration",
 		"sessionId": sessionID,
 		"timestamp": ts,
-		"uuid":      randomHexID(),
+		"uuid":      stableUUID("turn-complete", sessionID, turnKey),
 	})
 }
 
@@ -212,6 +219,31 @@ func randomHexID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// stableUUID derives a deterministic line uuid from stable source identity
+// (e.g. an opencode message/part ID), in the same 32-hex shape randomHexID
+// produces. Synced shadows must be byte-identical across fetches of the same
+// native state: a random uuid stamps into every fetched body, so fetchHashSum
+// never matches, contentChangedAt resets every tick, and shadowFresh never
+// settles — every opencode session was re-exported and rewritten every 15s
+// forever. Downstream readers treat uuid as an opaque string (fork anchors,
+// turn dedup); the existing fetch path already uses raw message IDs, so a
+// hash of stable keys is compatible.
+func stableUUID(parts ...string) string {
+	for _, p := range parts {
+		if p == "" {
+			// No stable identity (live runtime path): fall back to random
+			// rather than collapsing distinct lines onto one uuid.
+			return randomHexID()
+		}
+	}
+	h := sha256.New()
+	for _, p := range parts {
+		_, _ = io.WriteString(h, p)
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 func max(a, b int) int {
