@@ -216,6 +216,78 @@ func TestAssemblerTurnCompleteV2Rename(t *testing.T) {
 	}
 }
 
+// Paginated rollouts (Codex ≥0.146) carry no user_message/agent_message
+// events; the conversation must still group into user/assistant turns from
+// item_completed UserMessage/AgentMessage items, with tools interleaved and
+// ContextCompaction surfacing as a system turn.
+func TestAssemblerPaginatedItemStream(t *testing.T) {
+	asm := NewAssembler()
+	var done []core.Turn
+	for _, ln := range []string{
+		`{"timestamp":"2026-06-15T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/repo","history_mode":"paginated"}}`,
+		`{"timestamp":"2026-06-15T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>…"}]}}`,
+		`{"timestamp":"2026-06-15T00:00:02Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"fix the bug"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:03Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"m1","phase":"commentary","content":[{"type":"Text","text":"looking into it"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":\"ls\"}"}}`,
+		`{"timestamp":"2026-06-15T00:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}`,
+		`{"timestamp":"2026-06-15T00:00:06Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"m2","phase":"final_answer","content":[{"type":"Text","text":"done"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+		`{"timestamp":"2026-06-15T00:00:08Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"ContextCompaction","id":"cc1"}}}`,
+	} {
+		completed, _ := asm.Feed([]byte(ln))
+		done = append(done, completed...)
+	}
+	if len(done) != 3 {
+		t.Fatalf("got %d completed turns, want 3 (user, assistant, system): %+v", len(done), done)
+	}
+	if done[0].Role != "user" || done[0].Content != "fix the bug" {
+		t.Errorf("turn 0 = %+v, want user 'fix the bug'", done[0])
+	}
+	a := done[1]
+	if a.Role != "assistant" {
+		t.Fatalf("turn 1 role = %q, want assistant", a.Role)
+	}
+	if len(a.Parts) != 3 || a.Parts[0].Type != "text" || a.Parts[0].Content != "looking into it" ||
+		a.Parts[1].Type != "tool" || a.Parts[2].Type != "text" || a.Parts[2].Content != "done" {
+		t.Errorf("assistant parts = %+v, want text/tool/text", a.Parts)
+	}
+	if done[2].Role != "system" || done[2].Content != "Context compacted" {
+		t.Errorf("turn 2 = %+v, want system 'Context compacted'", done[2])
+	}
+}
+
+// ReadSessionMeta must derive prompt and last-input time from item_completed
+// UserMessage items when a paginated rollout has no user_message events —
+// otherwise the session lists as "(untitled)" and sorts wrong.
+func TestReadSessionMetaPaginated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout-2026-06-15T00-00-00-019ffc18-128f-7473-968c-65e69495fdf1.jsonl")
+	lines := []string{
+		`{"timestamp":"2026-06-15T00:00:00Z","type":"session_meta","payload":{"id":"019ffc18-128f-7473-968c-65e69495fdf1","cwd":"/repo","history_mode":"paginated"}}`,
+		`{"timestamp":"2026-06-15T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo"}]}}`,
+		`{"timestamp":"2026-06-15T00:00:02Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"first prompt"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:03Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"reply"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:04Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u2","content":[{"type":"text","text":"second prompt"}]}}}`,
+		`{"timestamp":"2026-06-15T00:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadSessionMeta(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Prompt != "first prompt" {
+		t.Errorf("Prompt = %q, want %q", meta.Prompt, "first prompt")
+	}
+	if want := time.Date(2026, 6, 15, 0, 0, 4, 0, time.UTC); !meta.LastInputAt.Equal(want) {
+		t.Errorf("LastInputAt = %v, want %v (last UserMessage item)", meta.LastInputAt, want)
+	}
+	if meta.Cwd != "/repo" {
+		t.Errorf("Cwd = %q, want /repo", meta.Cwd)
+	}
+}
+
 func TestIsTaskCompleteV2Rename(t *testing.T) {
 	v2 := `{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"t1"}}`
 	if !isTaskComplete([]byte(v2), "t1") {

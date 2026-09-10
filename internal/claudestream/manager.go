@@ -203,95 +203,106 @@ func write(p *process, v any) error {
 	return err
 }
 func (m *Manager) readLoop(p *process, r io.Reader) {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 64<<10), 64<<20)
-	for s.Scan() {
-		var e struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			IsError bool   `json:"is_error"`
-			Message struct {
-				Model string `json:"model"`
-			} `json:"message"`
-			ModelUsage map[string]struct {
-				ContextWindow int64 `json:"contextWindow"`
-			} `json:"modelUsage"`
-			Event struct {
-				Type  string `json:"type"`
-				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"delta"`
-			} `json:"event"`
+	// ReadBytes grows per line, unlike Scanner whose token cap a single
+	// oversized stream-json message can exceed.
+	br := bufio.NewReaderSize(r, 64<<10)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			m.handleLine(p, line)
 		}
-		if json.Unmarshal(s.Bytes(), &e) != nil {
-			continue
-		}
-		if e.Type == "control_request" {
-			m.handleControlRequest(p, append([]byte(nil), s.Bytes()...))
-			continue
-		}
-		if e.Type == "control_cancel_request" {
-			m.cancelControlRequest(p, s.Bytes())
-			continue
-		}
-		if e.Type != "result" {
-			p.mu.Lock()
-			if len(p.turns) == 0 && marksSpontaneousTurn(e.Type, e.Subtype, e.Event.Type) {
-				p.turns = append(p.turns, nil)
-			}
-			if len(p.turns) > 0 && p.turns[0] != nil && e.Type == "stream_event" &&
-				e.Event.Type == "content_block_delta" && e.Event.Delta.Type == "text_delta" && e.Event.Delta.Text != "" {
-				select {
-				case p.turns[0].deltas <- Delta{Text: e.Event.Delta.Text}:
-				default: // preview may drop under backpressure; JSONL truth-up repairs it
+		if err != nil {
+			if err != io.EOF {
+				m.logger.Warn("claude stream-json read failed", "session", p.id, "err", err)
+				if p.cmd.Process != nil {
+					_ = procutil.KillGroup(p.cmd)
 				}
 			}
-			if len(p.turns) > 0 && p.turns[0] != nil && e.Message.Model != "" {
-				p.turns[0].model = e.Message.Model
-			}
-			p.mu.Unlock()
-			continue
-		}
-		p.mu.Lock()
-		var req *turnRequest
-		if len(p.turns) > 0 {
-			req = p.turns[0]
-			p.turns = p.turns[1:]
-		}
-		p.lastUsed = time.Now()
-		p.mu.Unlock()
-		if req != nil {
-			model := req.model
-			usage, ok := e.ModelUsage[model]
-			if !ok {
-				// Claude ≥2.1 tags usage keys with the context-variant suffix
-				// (claude-opus-5[1m]) while message.model stays bare — match
-				// on the base id so the window lookup survives the suffix,
-				// but keep displaying the bare model name.
-				for k, v := range e.ModelUsage {
-					if base, _, _ := strings.Cut(k, "["); base == model {
-						usage, ok = v, true
-						break
-					}
-				}
-			}
-			if !ok && len(e.ModelUsage) == 1 {
-				for fallbackModel, fallbackUsage := range e.ModelUsage {
-					// Strip the context-variant suffix for display: the pie
-					// should read claude-opus-5, not claude-opus-5[1m].
-					model, _, _ = strings.Cut(fallbackModel, "[")
-					usage = fallbackUsage
-				}
-			}
-			req.finish(Result{IsError: e.IsError, Subtype: e.Subtype, Model: model, ContextWindow: usage.ContextWindow})
+			return
 		}
 	}
-	if err := s.Err(); err != nil {
-		m.logger.Warn("claude stream-json read failed", "session", p.id, "err", err)
-		if p.cmd.Process != nil {
-			_ = procutil.KillGroup(p.cmd)
+}
+
+func (m *Manager) handleLine(p *process, line []byte) {
+	var e struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		IsError bool   `json:"is_error"`
+		Message struct {
+			Model string `json:"model"`
+		} `json:"message"`
+		ModelUsage map[string]struct {
+			ContextWindow int64 `json:"contextWindow"`
+		} `json:"modelUsage"`
+		Event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		} `json:"event"`
+	}
+	if json.Unmarshal(line, &e) != nil {
+		return
+	}
+	if e.Type == "control_request" {
+		m.handleControlRequest(p, append([]byte(nil), line...))
+		return
+	}
+	if e.Type == "control_cancel_request" {
+		m.cancelControlRequest(p, line)
+		return
+	}
+	if e.Type != "result" {
+		p.mu.Lock()
+		if len(p.turns) == 0 && marksSpontaneousTurn(e.Type, e.Subtype, e.Event.Type) {
+			p.turns = append(p.turns, nil)
 		}
+		if len(p.turns) > 0 && p.turns[0] != nil && e.Type == "stream_event" &&
+			e.Event.Type == "content_block_delta" && e.Event.Delta.Type == "text_delta" && e.Event.Delta.Text != "" {
+			select {
+			case p.turns[0].deltas <- Delta{Text: e.Event.Delta.Text}:
+			default: // preview may drop under backpressure; JSONL truth-up repairs it
+			}
+		}
+		if len(p.turns) > 0 && p.turns[0] != nil && e.Message.Model != "" {
+			p.turns[0].model = e.Message.Model
+		}
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Lock()
+	var req *turnRequest
+	if len(p.turns) > 0 {
+		req = p.turns[0]
+		p.turns = p.turns[1:]
+	}
+	p.lastUsed = time.Now()
+	p.mu.Unlock()
+	if req != nil {
+		model := req.model
+		usage, ok := e.ModelUsage[model]
+		if !ok {
+			// Claude ≥2.1 tags usage keys with the context-variant suffix
+			// (claude-opus-5[1m]) while message.model stays bare — match
+			// on the base id so the window lookup survives the suffix,
+			// but keep displaying the bare model name.
+			for k, v := range e.ModelUsage {
+				if base, _, _ := strings.Cut(k, "["); base == model {
+					usage, ok = v, true
+					break
+				}
+			}
+		}
+		if !ok && len(e.ModelUsage) == 1 {
+			for fallbackModel, fallbackUsage := range e.ModelUsage {
+				// Strip the context-variant suffix for display: the pie
+				// should read claude-opus-5, not claude-opus-5[1m].
+				model, _, _ = strings.Cut(fallbackModel, "[")
+				usage = fallbackUsage
+			}
+		}
+		req.finish(Result{IsError: e.IsError, Subtype: e.Subtype, Model: model, ContextWindow: usage.ContextWindow})
 	}
 }
 

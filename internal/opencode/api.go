@@ -175,6 +175,17 @@ type v2Session struct {
 	Location struct {
 		Directory string `json:"directory"`
 	} `json:"location"`
+	Tokens *tokenUsage `json:"tokens"`
+}
+
+// activityTotal is the session's cumulative token sum — a liveness signal
+// that moves at step boundaries while time.updated stays frozen mid-turn.
+func (s v2Session) activityTotal() int64 {
+	if s.Tokens == nil {
+		return 0
+	}
+	t := s.Tokens
+	return t.Input + t.Output + t.Reasoning + t.Cache.Read + t.Cache.Write
 }
 
 type v2Page struct {
@@ -220,6 +231,7 @@ func v2ListSessions(ctx context.Context, cmd string) ([]sessionEntry, error) {
 				Directory: s.Location.Directory,
 				Created:   s.Time.Created,
 				Updated:   s.Time.Updated,
+				Activity:  s.activityTotal(),
 			})
 		}
 		if page.Cursor.Next == "" || len(page.Data) == 0 || added == 0 {
@@ -287,19 +299,23 @@ func v2ModelRef(providerID, modelID, variant string) string {
 }
 
 // v2SessionModel is the v2 store lookup for Runtime.sessionModel: the
-// session's own model ref from GET /api/session/{id}.
+// session's own model ref from GET /api/session/{id} (payload wrapped in
+// {"data": …} like every single-object endpoint).
 func v2SessionModel(ctx context.Context, cmd, id string) string {
-	var s struct {
-		Model *struct {
-			ID         string `json:"id"`
-			ProviderID string `json:"providerID"`
-			Variant    string `json:"variant"`
-		} `json:"model"`
+	var resp struct {
+		Data struct {
+			Model *struct {
+				ID         string `json:"id"`
+				ProviderID string `json:"providerID"`
+				Variant    string `json:"variant"`
+			} `json:"model"`
+		} `json:"data"`
 	}
-	if apiGetJSON(ctx, cmd, "/api/session/"+id, &s) != nil || s.Model == nil {
+	if apiGetJSON(ctx, cmd, "/api/session/"+id, &resp) != nil || resp.Data.Model == nil {
 		return ""
 	}
-	return v2ModelRef(s.Model.ProviderID, s.Model.ID, s.Model.Variant)
+	m := resp.Data.Model
+	return v2ModelRef(m.ProviderID, m.ID, m.Variant)
 }
 
 // v2ContextWindows maps provider/model → context limit from GET /api/model.
@@ -459,7 +475,8 @@ func v2FetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path strin
 			write(turnCompleteLine(sid, ts))
 		}
 	}
-	write(syncMetaLine(s))
+	prev, _ := readSyncMeta(path)
+	write(syncMetaLine(s, v2TurnInflight(messages), prev, fetchHashSum(buf)))
 	if len(buf) == 0 {
 		return nil
 	}
@@ -472,4 +489,34 @@ func v2FetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path strin
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// v2TurnInflight is the v2 counterpart of v1TurnInflight: the last message
+// is an unanswered user prompt, an assistant message with no content yet, or
+// one with a tool still streaming/running/pending. (v2's API exposes no step
+// markers; long pure-text streaming phases are additionally caught by the
+// Activity token drift check in shadowFresh.)
+func v2TurnInflight(messages []v2Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	switch last.Type {
+	case "user":
+		return true
+	case "assistant":
+		if len(last.Content) == 0 {
+			return true
+		}
+		for _, c := range last.Content {
+			if c.State == nil {
+				continue
+			}
+			switch c.State.Status {
+			case "streaming", "running", "pending":
+				return true
+			}
+		}
+	}
+	return false
 }

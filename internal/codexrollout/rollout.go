@@ -10,6 +10,10 @@
 // function_call_output, linked by call_id). A turn is finished by an event_msg
 // task_complete, the analog of Claude Code's system/turn_duration marker.
 //
+// Codex ≥0.146 "paginated" rollouts (history_mode in session_meta) drop the
+// user_message/agent_message events; their clean UI stream is event_msg
+// item_completed UserMessage/AgentMessage items, handled alongside.
+//
 // Shared display and metadata types live in package core; this package owns
 // only the Codex wire format and its projection into that contract.
 package codexrollout
@@ -208,6 +212,17 @@ func ReadSessionMeta(path string) (core.SessionMeta, error) {
 					meta.LastInputAt = l.Timestamp
 				}
 			}
+			// Paginated rollouts have no user_message events; their clean user
+			// stream is item_completed UserMessage items (context envelopes
+			// like the AGENTS.md injection are already excluded there).
+			if msg, ok := completedUserMessage(l.Payload); ok {
+				if firstPrompt == "" {
+					firstPrompt = msg
+				}
+				if !l.Timestamp.IsZero() {
+					meta.LastInputAt = l.Timestamp
+				}
+			}
 		case "turn_context":
 			var p struct {
 				Model  string `json:"model"`
@@ -371,7 +386,7 @@ func (a *Assembler) feedEvent(l line) (completed []core.Turn, part *core.TurnPar
 		// Normalize both wires into the same tool TurnPart consumed by web/IM.
 		return nil, a.mcpToolPart(l)
 	case "item_completed":
-		return nil, a.completedMCPToolPart(l)
+		return a.completedItemPart(l)
 	case "patch_apply_end":
 		return nil, a.patchApplyPart(l)
 	case "exec_command_end":
@@ -586,6 +601,78 @@ func (a *Assembler) mcpToolPart(l line) *core.TurnPart {
 	}
 	a.cur.Parts = append(a.cur.Parts, tp)
 	return &tp
+}
+
+// completedItem is the item payload of an event_msg item_completed line.
+type completedItem struct {
+	Type    string `json:"type"`
+	Content []struct {
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+// text joins the item's text blocks; empty when the item carries none.
+func (it completedItem) text() string {
+	var texts []string
+	for _, c := range it.Content {
+		if strings.TrimSpace(c.Text) != "" {
+			texts = append(texts, c.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// completedItemPart dispatches event_msg item_completed lines. Paginated
+// rollouts (Codex ≥0.146, history_mode "paginated") carry no
+// user_message/agent_message events at all — their clean UI text stream is
+// item_completed UserMessage/AgentMessage items, so those drive turn grouping
+// there the way the legacy events do in older rollouts. ContextCompaction is
+// the paginated analog of the context_compacted event. MCP tool calls keep
+// their existing normalization; every other item type (Reasoning,
+// CommandExecution, FileChange, …) duplicates a response_item the assembler
+// already renders and is ignored.
+func (a *Assembler) completedItemPart(l line) (completed []core.Turn, part *core.TurnPart) {
+	var p struct {
+		Item completedItem `json:"item"`
+	}
+	if err := json.Unmarshal(l.Payload, &p); err != nil {
+		return nil, nil
+	}
+	switch p.Item.Type {
+	case "UserMessage":
+		// Real user prompt — flush any in-progress assistant turn, then commit.
+		if t := a.Flush(); t != nil {
+			completed = append(completed, *t)
+		}
+		if text := p.Item.text(); text != "" {
+			completed = append(completed, core.Turn{
+				Role:    "user",
+				Content: text,
+				Time:    l.Timestamp,
+			})
+		}
+		return completed, nil
+	case "AgentMessage":
+		text := p.Item.text()
+		if text == "" {
+			return nil, nil
+		}
+		a.ensureTurn(l.Timestamp)
+		tp := core.TurnPart{Type: "text", Content: text}
+		a.cur.Parts = append(a.cur.Parts, tp)
+		return nil, &tp
+	case "ContextCompaction":
+		if t := a.Flush(); t != nil {
+			completed = append(completed, *t)
+		}
+		return append(completed, core.Turn{
+			Role:    "system",
+			Content: "Context compacted",
+			Time:    l.Timestamp,
+		}), nil
+	default:
+		return nil, a.completedMCPToolPart(l)
+	}
 }
 
 func (a *Assembler) completedMCPToolPart(l line) *core.TurnPart {
@@ -805,6 +892,20 @@ func userMessage(payload json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return p.Message, p.Message != ""
+}
+
+// completedUserMessage returns the text of an event_msg item_completed payload
+// carrying a UserMessage item (the paginated rollouts' user-prompt stream).
+func completedUserMessage(payload json.RawMessage) (string, bool) {
+	var p struct {
+		Type string         `json:"type"`
+		Item completedItem `json:"item"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil || p.Type != "item_completed" || p.Item.Type != "UserMessage" {
+		return "", false
+	}
+	text := p.Item.text()
+	return text, text != ""
 }
 
 // toolTarget pulls the most informative argument out of a function_call's

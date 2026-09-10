@@ -156,8 +156,76 @@ func TestDiscovery_ConcurrentUpsert(t *testing.T) {
 	wg.Wait()
 }
 
-func TestDiscovery_Remove(t *testing.T) {
-	tmp := t.TempDir()
+// TestDiscovery_RebindsToNewerDuplicateMirror covers the opencode v1/v2
+// layout: both CLIs share the ses_ id space with independent native stores,
+// and each store's sync mirrors the session into its own tree. The binding
+// (path + backend) must follow the newest mirror so the transcript and send
+// routing track the CLI the user is actually driving, and events from the
+// stale mirror must not contaminate the cached metadata.
+func TestDiscovery_RebindsToNewerDuplicateMirror(t *testing.T) {
+	root1 := t.TempDir()
+	root2 := t.TempDir()
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)),
+		NewOpenCodeSource(root1), NewOpenCode2Source(root2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+
+	id := "ses_shared"
+	p1 := filepath.Join(root1, "-tmp-x", id+".jsonl")
+	p2 := filepath.Join(root2, "-tmp-x", id+".jsonl")
+
+	// v1 mirror first, older.
+	writeJSONL(t, p1, id, "/tmp/x", "hi")
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p1, old, old); err != nil {
+		t.Fatal(err)
+	}
+	d.Upsert(p1)
+	if got, _ := d.Path(id); got != p1 {
+		t.Fatalf("initial binding = %q, want %q", got, p1)
+	}
+	if s, _ := d.Get(id); s.Backend != "opencode" {
+		t.Fatalf("initial backend = %q", s.Backend)
+	}
+
+	// A newer v2 mirror appears (user drove the session in v2): rebind.
+	writeJSONL(t, p2, id, "/tmp/x", "hi")
+	d.Upsert(p2)
+	if got, _ := d.Path(id); got != p2 {
+		t.Errorf("after newer mirror: path = %q, want %q", got, p2)
+	}
+	if s, _ := d.Get(id); s.Backend != "opencode2" {
+		t.Errorf("after newer mirror: backend = %q", s.Backend)
+	}
+	boundLastEvent, _ := d.Get(id)
+
+	// A write on the now-stale v1 mirror (still older on disk) is ignored:
+	// no rebind, no LastEventAt contamination.
+	d.Upsert(p1)
+	if got, _ := d.Path(id); got != p2 {
+		t.Errorf("stale mirror stole the binding: %q", got)
+	}
+	if s, _ := d.Get(id); !s.LastEventAt.Equal(boundLastEvent.LastEventAt) {
+		t.Errorf("stale mirror moved LastEventAt: %v → %v", boundLastEvent.LastEventAt, s.LastEventAt)
+	}
+
+	// The v1 mirror becomes newest again (user went back to v1): rebind.
+	newer := time.Now().Add(time.Minute)
+	if err := os.Chtimes(p1, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	d.Upsert(p1)
+	if got, _ := d.Path(id); got != p1 {
+		t.Errorf("did not follow the newer mirror: %q", got)
+	}
+	if s, _ := d.Get(id); s.Backend != "opencode" {
+		t.Errorf("backend after rebind = %q", s.Backend)
+	}
+}
+
+func TestDiscovery_Remove(t *testing.T) {	tmp := t.TempDir()
 	path := filepath.Join(tmp, "-tmp-x", "abc.jsonl")
 	writeJSONL(t, path, "abc", "/tmp/x", "hi")
 

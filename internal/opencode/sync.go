@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -126,29 +127,77 @@ type sessionEntry struct {
 	Updated   int64  `json:"updated"`
 	Created   int64  `json:"created"`
 	Directory string `json:"directory"`
+	// Activity is an extra liveness signal alongside Updated: v2's cumulative
+	// session token total, which moves at step boundaries while Updated stays
+	// frozen for whole turns. 0 for v1 (no cheap equivalent) — the check is
+	// skipped then.
+	Activity int64 `json:"activity"`
 }
+
+// syncMeta is the parsed footer of a full shadow rewrite. Beyond the native
+// timestamps it records whether the fetch observed a turn in flight, because
+// opencode freezes session.updated (and every message/part timestamp) for the
+// whole duration of a turn — proven on both v1 and v2 — so a timestamp-only
+// freshness check stops syncing minutes into any long turn and the UI freezes
+// at the turn's start.
+type syncMeta struct {
+	version          int
+	sourceUpdated    int64
+	sourceActivity   int64
+	inflight         bool
+	inflightSince    int64  // ms; last time the fetched content changed while inflight
+	contentChangedAt int64  // ms; last time the fetched content changed at all
+	fetchHash        string // FNV-1a of the rewritten body, detects content progress
+}
+
+// syncMetaVersion bumps force one rewrite per session after an upgrade, so
+// shadows synced by an older format (no inflight tracking) get re-evaluated
+// instead of sitting "settled" behind a frozen native updated.
+const syncMetaVersion = 2
 
 // syncMetaLine is the footer every full shadow rewrite ends with. The
 // freshness check compares sourceUpdated against the native session's
 // updated timestamp — file mtime is NOT trustworthy (a runtime append or an
 // unrelated touch looks like a fresh sync and permanently suppresses it).
-func syncMetaLine(s sessionEntry) json.RawMessage {
+func syncMetaLine(s sessionEntry, inflight bool, prev syncMeta, hash string) json.RawMessage {
+	// Any content change (not just native timestamps — those freeze mid-turn)
+	// resets the settle clock; an unchanged body keeps it running.
+	changedAt := prev.contentChangedAt
+	if prev.fetchHash != hash || changedAt == 0 {
+		changedAt = time.Now().UnixMilli()
+	}
+	var since int64
+	if inflight {
+		// Keep the clock from the previous fetch when the content didn't move
+		// (stalled/dead turn); reset it on progress so a long live turn keeps
+		// refetching indefinitely while a dead one settles after the ceiling.
+		since = prev.inflightSince
+		if !prev.inflight || prev.fetchHash != hash || since == 0 {
+			since = time.Now().UnixMilli()
+		}
+	}
 	return mustMarshal(map[string]any{
-		"type":          "system",
-		"subtype":       "sync-meta",
-		"sessionId":     s.ID,
-		"timestamp":     eventTime(s.Updated),
-		"uuid":          randomHexID(),
-		"sourceUpdated": s.Updated,
+		"type":             "system",
+		"subtype":          "sync-meta",
+		"sessionId":        s.ID,
+		"timestamp":        eventTime(s.Updated),
+		"uuid":             randomHexID(),
+		"metaV":            syncMetaVersion,
+		"sourceUpdated":    s.Updated,
+		"sourceActivity":   s.Activity,
+		"inflight":         inflight,
+		"inflightSince":    since,
+		"contentChangedAt": changedAt,
+		"fetchHash":        hash,
 	})
 }
 
-// readSyncMeta returns the sourceUpdated marker from a shadow's tail.
+// readSyncMeta returns the marker from a shadow's tail.
 // ok=false: no marker (pre-marker shadow) → treat as stale and rewrite once.
-func readSyncMeta(path string) (updated int64, ok bool) {
+func readSyncMeta(path string) (meta syncMeta, ok bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
-		return 0, false
+		return syncMeta{}, false
 	}
 	const tail = 8192
 	start := int64(0)
@@ -157,7 +206,7 @@ func readSyncMeta(path string) (updated int64, ok bool) {
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, false
+		return syncMeta{}, false
 	}
 	defer f.Close()
 	_, _ = f.Seek(start, 0)
@@ -168,42 +217,87 @@ func readSyncMeta(path string) (updated int64, ok bool) {
 	}
 	for sc.Scan() {
 		var ev struct {
-			Subtype       string `json:"subtype"`
-			SourceUpdated int64  `json:"sourceUpdated"`
+			Subtype          string `json:"subtype"`
+			MetaV            int    `json:"metaV"`
+			SourceUpdated    int64  `json:"sourceUpdated"`
+			SourceActivity   int64  `json:"sourceActivity"`
+			Inflight         bool   `json:"inflight"`
+			InflightSince    int64  `json:"inflightSince"`
+			ContentChangedAt int64  `json:"contentChangedAt"`
+			FetchHash        string `json:"fetchHash"`
 		}
 		if json.Unmarshal(sc.Bytes(), &ev) != nil {
 			continue
 		}
 		if ev.Subtype == "sync-meta" && ev.SourceUpdated > 0 {
-			updated, ok = ev.SourceUpdated, true
+			meta = syncMeta{
+				version:          ev.MetaV,
+				sourceUpdated:    ev.SourceUpdated,
+				sourceActivity:   ev.SourceActivity,
+				inflight:         ev.Inflight,
+				inflightSince:    ev.InflightSince,
+				contentChangedAt: ev.ContentChangedAt,
+				fetchHash:        ev.FetchHash,
+			}
+			ok = true
 		}
 	}
-	return updated, ok
+	return meta, ok
 }
 
 // shadowFresh reports whether the shadow at path already mirrors the native
-// session state (updated ms).
+// session state.
 //
-// The native `updated` can LAG the final message commit — observed on v2:
-// the last assistant message lands ~1s after the last updated bump, so a
-// fetch that races turn end permanently loses the reply. A recently-active
-// session is therefore never considered settled; it keeps re-fetching each
-// tick until it has been quiet for syncSettleWindow.
+// The native `updated` LAGS real activity badly: it freezes for the whole
+// duration of a turn (both v1 and v2) and on v2 trails the final message
+// commit by minutes. Timestamps alone therefore cannot declare a shadow
+// settled; the settle clock is driven by the fetched CONTENT instead:
+//   - contentChangedAt: the shadow keeps refetching until its body has been
+//     byte-identical for syncSettleWindow — a turn in progress keeps changing
+//     the content (step finishes, tool completions), however frozen updated
+//     and the token counter are.
+//   - the inflight flag: the last fetch saw the turn still running
+//     (unanswered user message, unfinished step, running tool) — long tool
+//     calls produce no new content, so this keeps polling until they finish;
+//     bounded by inflightRefetchCeiling after the last content change so a
+//     dead turn (killed mid-tool, status frozen "running") settles.
+//   - sourceActivity (v2's cumulative tokens) and sourceUpdated drift always
+//     force a refetch, catching step boundaries the content check precedes.
 const syncSettleWindow = 2 * time.Minute
+const inflightRefetchCeiling = 30 * time.Minute
 
-func shadowFresh(path string, updated int64) bool {
+func shadowFresh(path string, s sessionEntry) bool {
 	m, ok := readSyncMeta(path)
-	if !ok || m < updated {
+	if !ok || m.version < syncMetaVersion || m.sourceUpdated < s.Updated {
 		return false
 	}
-	return time.Since(time.UnixMilli(updated)) > syncSettleWindow
+	if s.Activity > 0 && m.sourceActivity > 0 && m.sourceActivity != s.Activity {
+		return false
+	}
+	if m.inflight && time.Since(time.UnixMilli(m.inflightSince)) < inflightRefetchCeiling {
+		return false
+	}
+	return time.Since(time.UnixMilli(m.contentChangedAt)) > syncSettleWindow
+}
+
+// fetchHashSum is a cheap content fingerprint of one shadow rewrite, recorded
+// in the sync meta to tell "turn stalled" apart from "turn progressing".
+func fetchHashSum(buf []byte) string {
+	h := fnv.New64a()
+	_, _ = h.Write(buf)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func syncOnce(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 	// `opencode session list` only covers a slice of projects (observed: a
-	// few directories' worth); the session table is global. Query it directly
+	// few directories' worth); the session table is global. Read it directly
 	// so sessions from every project show up, not just recent ones.
-	rows, err := queryRows(ctx, rt.Cmd(),
+	db, err := rt.v1DB(ctx)
+	if err != nil {
+		logger.Warn("opencode sync: store open failed", "err", err)
+		return
+	}
+	rows, err := queryTextRows(ctx, db,
 		"SELECT id, title, directory, time_created, time_updated FROM session WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT 500")
 	if err != nil {
 		logger.Warn("opencode sync: session query failed", "err", err)
@@ -229,12 +323,9 @@ func syncOnce(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 			continue // live turn owns the shadow file
 		}
 		path := logPath(rt.Root(), s.Directory, s.ID)
-		if shadowFresh(path, s.Updated) {
+		if shadowFresh(path, s) {
 			continue
 		}
-		// Transcripts are fetched with SQL via `opencode db` (paged rows, no
-		// size cap) rather than `opencode export`, whose stdout caps at 128KiB
-		// and loses every larger session — including long-running ones.
 		if rt.failures.load(s.ID, s.Updated) {
 			continue
 		}
@@ -264,7 +355,7 @@ func syncOnceV2(ctx context.Context, rt *Runtime, logger *slog.Logger) {
 			continue
 		}
 		path := logPath(rt.Root(), s.Directory, s.ID)
-		if shadowFresh(path, s.Updated) {
+		if shadowFresh(path, s) {
 			continue
 		}
 		if rt.failures.load(s.ID, s.Updated) {
@@ -292,7 +383,7 @@ func (r *Runtime) RefreshSession(id string) error {
 		return err
 	}
 	path := logPath(r.root, s.Directory, id)
-	if shadowFresh(path, s.Updated) {
+	if shadowFresh(path, *s) {
 		return nil
 	}
 	if r.v2 {
@@ -307,20 +398,30 @@ func (r *Runtime) sessionEntryFor(ctx context.Context, id string) (*sessionEntry
 		return nil, fmt.Errorf("refusing unexpected session id %q", id)
 	}
 	if r.v2 {
-		var s v2Session
-		if err := apiGetJSON(ctx, r.cmd, "/api/session/"+id, &s); err != nil {
+		// The single-session endpoint wraps its payload in {"data": …} like
+		// the list endpoint (and returns an error object for unknown ids).
+		var resp struct {
+			Data v2Session `json:"data"`
+		}
+		if err := apiGetJSON(ctx, r.cmd, "/api/session/"+id, &resp); err != nil {
 			return nil, err
 		}
+		s := resp.Data
 		if s.ID == "" || s.Location.Directory == "" {
 			return nil, nil
 		}
 		return &sessionEntry{
 			ID: s.ID, Title: s.Title, Directory: s.Location.Directory,
 			Created: s.Time.Created, Updated: s.Time.Updated,
+			Activity: s.activityTotal(),
 		}, nil
 	}
-	rows, err := queryRows(ctx, r.cmd,
-		"SELECT id, title, directory, time_created, time_updated FROM session WHERE id = '"+id+"' LIMIT 1")
+	db, err := r.v1DB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := queryTextRows(ctx, db,
+		"SELECT id, title, directory, time_created, time_updated FROM session WHERE id = ? LIMIT 1", id)
 	if err != nil {
 		return nil, err
 	}
@@ -369,29 +470,9 @@ func (f *failedSync) store(id string, updated int64) {
 	f.entries[id] = failedEntry{updated: updated, at: time.Now()}
 }
 
-// sessionIDPattern guards the SQL interpolation below — session ids come from
-// `opencode session list` and are always ses_<alphanum>, but a defensive check
-// keeps a malformed id out of the query string.
+// sessionIDPattern guards against malformed ids even though queries are now
+// parameterized — it also rejects ids that were never ses_-shaped early.
 var sessionIDPattern = regexp.MustCompile(`^ses_[A-Za-z0-9]+$`)
-
-// queryRows runs `opencode db <sql> --format tsv` and returns the rows with
-// all columns. TSV has a header line and tab-separated columns; JSON payload
-// columns are single-line blobs (newlines/tabs stay escaped), so a naive
-// split is safe.
-func queryRows(ctx context.Context, cmd, sql string) ([][]string, error) {
-	out, err := exec.CommandContext(ctx, cmd, "db", sql, "--format", "tsv").Output()
-	if err != nil {
-		return nil, err
-	}
-	var rows [][]string
-	for i, line := range strings.Split(string(out), "\n") {
-		if line == "" || i == 0 {
-			continue // header / trailing blank
-		}
-		rows = append(rows, strings.Split(line, "\t"))
-	}
-	return rows, nil
-}
 
 type exportMessage struct {
 	Info struct {
@@ -436,34 +517,39 @@ type messageData struct {
 	} `json:"time"`
 }
 
-// fetchSession mirrors one session's full transcript into its shadow jsonl by
-// querying opencode's SQLite store through `opencode db`. The JSON output
-// format caps at 64KiB; TSV streams unbounded, one row per line, with the
-// message/part payload as a single-line JSON blob in the last column.
+// fetchSession mirrors one session's full transcript into its shadow jsonl,
+// reading opencode's SQLite store directly (see db.go). The old `opencode db`
+// shell-out could silently truncate the newest rows under store contention;
+// direct reads are complete by construction, so no paging or completeness
+// machinery is needed here.
 func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string) error {
 	if !sessionIDPattern.MatchString(s.ID) {
 		return fmt.Errorf("refusing unexpected session id %q", s.ID)
 	}
-	messages, err := queryRows(ctx, rt.Cmd(),
-		"SELECT id, data FROM message WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC LIMIT 100000")
+	db, err := rt.v1DB(ctx)
 	if err != nil {
 		return err
 	}
-	partRows, err := queryRows(ctx, rt.Cmd(),
-		"SELECT message_id, data FROM part WHERE session_id = '"+s.ID+"' ORDER BY time_created ASC LIMIT 100000")
+	messages, err := queryTextRows(ctx, db,
+		"SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC LIMIT 100000", s.ID)
+	if err != nil {
+		return err
+	}
+	partRows, err := queryTextRows(ctx, db,
+		"SELECT id, message_id, data FROM part WHERE session_id = ? ORDER BY time_created ASC LIMIT 100000", s.ID)
 	if err != nil {
 		return err
 	}
 	partsByMsg := make(map[string][]exportPart, len(messages))
 	for _, row := range partRows {
-		if len(row) < 2 {
+		if len(row) < 3 {
 			continue
 		}
 		var p exportPart
-		if json.Unmarshal([]byte(row[1]), &p) != nil {
+		if json.Unmarshal([]byte(row[2]), &p) != nil {
 			continue
 		}
-		partsByMsg[row[0]] = append(partsByMsg[row[0]], p)
+		partsByMsg[row[1]] = append(partsByMsg[row[1]], p)
 	}
 
 	var buf []byte
@@ -489,6 +575,7 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 			"timestamp": eventTime(s.Created),
 		}))
 	}
+	var last exportMessage // last raw message row, for inflight detection
 	for _, row := range messages {
 		if len(row) < 2 {
 			continue
@@ -506,6 +593,7 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		msg.Info.Tokens = md.Tokens
 		msg.Info.Time.Created = md.Time.Created
 		msg.Parts = partsByMsg[row[0]]
+		last = msg
 
 		if md.Role == "user" {
 			var texts []string
@@ -541,7 +629,8 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		}
 		write(turnCompleteLine(s.ID, ts))
 	}
-	write(syncMetaLine(s))
+	prev, _ := readSyncMeta(path)
+	write(syncMetaLine(s, v1TurnInflight(last), prev, fetchHashSum(buf)))
 	if len(buf) == 0 {
 		return nil
 	}
@@ -554,6 +643,40 @@ func fetchSession(ctx context.Context, rt *Runtime, s sessionEntry, path string)
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// v1TurnInflight reports whether a session's native transcript ends mid-turn:
+// the last message is an unanswered user prompt, or the last assistant
+// message has an unfinished step (step-start without step-finish) or a
+// running/pending tool. Native timestamps freeze while a turn runs, so this
+// content signal is what keeps the sync refetching until the turn completes.
+func v1TurnInflight(last exportMessage) bool {
+	if last.Info.ID == "" {
+		return false
+	}
+	if last.Info.Role == "user" {
+		return true
+	}
+	if last.Info.Role != "assistant" {
+		return false
+	}
+	var starts, finishes int
+	for _, p := range last.Parts {
+		switch p.Type {
+		case "step-start":
+			starts++
+		case "step-finish":
+			finishes++
+		case "tool":
+			if p.State != nil && (p.State.Status == "running" || p.State.Status == "pending") {
+				return true
+			}
+		}
+	}
+	// A completed assistant message closes every step it opened; zero
+	// finishes means the message row exists but its first step hasn't
+	// committed yet (turn just started).
+	return starts > finishes || finishes == 0
 }
 
 func joinTexts(texts []string) string {

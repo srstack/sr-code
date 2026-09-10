@@ -216,20 +216,22 @@ func (c *Client) call(ctx context.Context, method string, params any, dst any) e
 }
 
 func (c *Client) readLoop(cmd *exec.Cmd, r io.Reader) {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 64<<10), 64<<20)
-	for s.Scan() {
-		var m rpcMessage
-		if json.Unmarshal(s.Bytes(), &m) != nil {
-			continue
+	// ReadBytes grows per line, unlike Scanner whose token cap a single
+	// oversized JSON-RPC message can exceed (codex updates keep growing it).
+	br := bufio.NewReaderSize(r, 64<<10)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var m rpcMessage
+			if json.Unmarshal(line, &m) == nil {
+				c.dispatch(m)
+			}
 		}
-		c.dispatch(m)
+		if err != nil {
+			c.stopProcess(cmd, fmt.Errorf("app-server stdout closed: %w", err))
+			return
+		}
 	}
-	err := s.Err()
-	if err == nil {
-		err = io.EOF
-	}
-	c.stopProcess(cmd, fmt.Errorf("app-server stdout closed: %w", err))
 }
 func idString(raw json.RawMessage) string {
 	var n json.Number

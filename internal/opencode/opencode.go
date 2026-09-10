@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,10 @@ type Runtime struct {
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
+
+	storeOnce sync.Once
+	store     *sql.DB // v1 native store (direct read-only handle); v2 uses HTTP
+	storeErr  error
 
 	cwMu  sync.Mutex
 	cwMap map[string]int64
@@ -539,6 +544,9 @@ func (r *Runtime) Shutdown() {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	if r.store != nil {
+		_ = r.store.Close()
+	}
 }
 
 // contextWindow returns the model's context limit, cached for the process
@@ -622,22 +630,24 @@ func (r *Runtime) sessionModel(id string) string {
 	if r.v2 {
 		return v2SessionModel(context.Background(), r.cmd, id)
 	}
-	out, err := exec.Command(r.cmd, "db",
-		"SELECT id, data FROM message WHERE session_id = '"+id+"' AND json_extract(data, '$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1",
-		"--format", "tsv").Output()
+	db, err := r.v1DB(context.Background())
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		_, payload, ok := strings.Cut(line, "\t")
-		if !ok {
+	rows, err := queryTextRows(context.Background(), db,
+		"SELECT id, data FROM message WHERE session_id = ? AND json_extract(data, '$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1", id)
+	if err != nil {
+		return ""
+	}
+	for _, row := range rows {
+		if len(row) < 2 {
 			continue
 		}
 		var d struct {
 			ProviderID string `json:"providerID"`
 			ModelID    string `json:"modelID"`
 		}
-		if json.Unmarshal([]byte(payload), &d) == nil && d.ModelID != "" {
+		if json.Unmarshal([]byte(row[1]), &d) == nil && d.ModelID != "" {
 			if d.ProviderID != "" {
 				return d.ProviderID + "/" + d.ModelID
 			}

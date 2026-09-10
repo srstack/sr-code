@@ -153,9 +153,25 @@ func (d *Discovery) upsert(path string) {
 
 	d.mu.RLock()
 	existing, known := d.sessions[id]
+	bound := d.paths[id]
 	d.mu.RUnlock()
 
 	if known {
+		// opencode v1 and v2 share the ses_ id space with independent native
+		// stores, and each store's sync mirrors into its own tree — the same
+		// id can have a file per source. The binding follows the newest file,
+		// so the transcript (and send routing, via Backend) tracks whichever
+		// CLI is actually being driven; events from an older mirror are
+		// ignored entirely so they can't contaminate the cached metadata.
+		if bound != "" && path != bound {
+			if bfi, statErr := os.Stat(bound); statErr == nil && !info.ModTime().After(bfi.ModTime()) {
+				return
+			}
+			d.mu.Lock()
+			d.paths[id] = path
+			d.mu.Unlock()
+			existing.Backend = src.Backend()
+		}
 		existing.LastEventAt = info.ModTime()
 		// cwd/prompt/title land in jsonl written after the file appears; re-read
 		// while any is empty. Codex has no ai-title, so exclude it from the
