@@ -15,10 +15,16 @@ import (
 // compressible set, and the wrapper forwards Flush, so the /events and
 // terminal screen handlers behave as they do unwrapped. Range requests
 // bypass compression entirely (a gzipped 206 would corrupt the byte math).
+//
+// Upgrade requests (WebSocket) also bypass wrapping: browsers always send
+// Accept-Encoding: gzip on the WS handshake, a 101 must never be gzipped,
+// and the reverse proxy hijacks via http.NewResponseController, which
+// needs the unwrapped connection.
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
-			r.Header.Get("Range") != "" {
+			r.Header.Get("Range") != "" ||
+			r.Header.Get("Upgrade") != "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -100,6 +106,16 @@ func (w *gzipWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Unwrap lets http.NewResponseController reach the underlying writer (Go
+// 1.25's ReverseProxy hijacks WebSocket upgrades this way). Defense in depth:
+// Upgrade requests already bypass the wrapper entirely, so this only matters
+// for future ResponseController uses. It cannot corrupt the gzip state — a
+// controller that hijacks the connection owns it from then on, and Flush is
+// already forwarded above.
+func (w *gzipWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *gzipWriter) close() {

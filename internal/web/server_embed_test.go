@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -192,4 +194,53 @@ func TestEmbedListenersAndAPI(t *testing.T) {
 			t.Errorf("Content-Security-Policy = %q, want stripped", got)
 		}
 	})
+}
+
+// TestEmbedWebSocketUpgradeThroughGzip is the regression test for embed
+// listeners 502ing every real-browser WebSocket upgrade: browsers always
+// send Accept-Encoding: gzip on the WS handshake, and gzipMiddleware must
+// not wrap (and thereby de-Hijack) the upgrade's ResponseWriter — Go 1.25's
+// ReverseProxy hijacks via http.NewResponseController.
+func TestEmbedWebSocketUpgradeThroughGzip(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("upstream ResponseWriter is not a Hijacker")
+			return
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintf(bufrw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+		bufrw.Flush()
+		// Hold the tunnel briefly so the client can read the 101.
+		buf := make([]byte, 1)
+		conn.Read(buf) // blocks until client closes or sends a frame
+	}))
+	defer upstream.Close()
+
+	// The embed listener's real middleware stack, minus auth (not under test).
+	srv := httptest.NewServer(gzipMiddleware(embed.NewForTest(upstream).Handler()))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Raw client modeled on a real browser handshake — including the
+	// Accept-Encoding: gzip that triggered the 502.
+	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nAccept-Encoding: gzip\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", addr)
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "HTTP/1.1 101") {
+		t.Errorf("status line = %q, want it to start with %q", line, "HTTP/1.1 101")
+	}
 }
