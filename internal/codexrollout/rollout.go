@@ -401,6 +401,14 @@ func (a *Assembler) feedEvent(l line) (completed []core.Turn, part *core.TurnPar
 		return nil, a.simpleEventToolPart(l, "ViewImage")
 	case "dynamic_tool_call_response":
 		return nil, a.dynamicToolPart(l)
+	case "token_count":
+		// token_count fires once per model response within the turn;
+		// last_token_usage is that response's accounting. Sum them onto the
+		// in-progress turn (usher's display unit is the turn, not the
+		// response), mirroring jsonl's per-message sum. A token_count with no
+		// turn in flight attaches nowhere.
+		a.addUsage(l.Payload)
+		return nil, nil
 	case "task_complete", "turn_complete": // kept explicit for the switch; predicate is shared elsewhere
 		// End-of-turn marker: stamp the turn with its turn_id (the fork point a
 		// client passes back to ForkCopy) and flush the assistant turn it closes.
@@ -414,6 +422,31 @@ func (a *Assembler) feedEvent(l line) (completed []core.Turn, part *core.TurnPar
 		return completed, nil
 	}
 	return nil, nil
+}
+
+// addUsage sums one token_count event's last_token_usage into the in-progress
+// turn's running total. Codex names its fields like Claude's input/output side
+// (input_tokens, output_tokens, cached_input_tokens) but has no cache-write
+// accounting, so CacheWrite stays zero.
+func (a *Assembler) addUsage(payload json.RawMessage) {
+	var p struct {
+		Info *struct {
+			Last *struct {
+				Input  int64 `json:"input_tokens"`
+				Output int64 `json:"output_tokens"`
+				Cached int64 `json:"cached_input_tokens"`
+			} `json:"last_token_usage"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil || p.Info == nil || p.Info.Last == nil || a.cur == nil {
+		return
+	}
+	if a.cur.Usage == nil {
+		a.cur.Usage = &core.TokenUsage{}
+	}
+	a.cur.Usage.Input += p.Info.Last.Input
+	a.cur.Usage.Output += p.Info.Last.Output
+	a.cur.Usage.CacheRead += p.Info.Last.Cached
 }
 
 func (a *Assembler) appendTool(ts time.Time, name, target, body string) *core.TurnPart {

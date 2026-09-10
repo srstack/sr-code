@@ -563,6 +563,48 @@ func writeZstRollout(t *testing.T, data []byte) string {
 	return path
 }
 
+// TestReadTurns_PerTurnUsage pins the per-turn usage contract, mirroring
+// jsonl's: a token_count event's last_token_usage maps onto Turn.Usage
+// (input_tokens→Input, output_tokens→Output, cached_input_tokens→CacheRead);
+// a turn spanning several token_count events carries the SUM of their
+// last_token_usage; a turn with no token_count keeps nil. Codex has no
+// cache-write accounting, so CacheWrite stays zero.
+func TestReadTurns_PerTurnUsage(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"one"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"total_tokens":110}}}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"two"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":50,"output_tokens":30,"total_tokens":330},"last_token_usage":{"input_tokens":200,"output_tokens":20,"total_tokens":220}}}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+		`{"type":"event_msg","payload":{"type":"user_message","message":"again"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"no usage here"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t2"}}`,
+	}, "\n")
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	turns, _, err := ReadTurns(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 4 {
+		t.Fatalf("got %d turns, want 4: %+v", len(turns), turns)
+	}
+	u := turns[1].Usage
+	if u == nil {
+		t.Fatalf("turns[1].Usage is nil, want summed usage")
+	}
+	want := core.TokenUsage{Input: 300, Output: 30, CacheRead: 50}
+	if *u != want {
+		t.Errorf("turns[1].Usage = %+v, want %+v (sum across the turn's token_count events)", *u, want)
+	}
+	if turns[3].Usage != nil {
+		t.Errorf("turns[3].Usage = %+v, want nil (no token_count in the turn)", turns[3].Usage)
+	}
+}
+
 func TestReadSessionMetaUsesLatestCodexUsageSnapshot(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout.jsonl")
 	data := strings.Join([]string{
