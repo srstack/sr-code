@@ -425,9 +425,12 @@ func (a *Assembler) feedEvent(l line) (completed []core.Turn, part *core.TurnPar
 }
 
 // addUsage sums one token_count event's last_token_usage into the in-progress
-// turn's running total. Codex names its fields like Claude's input/output side
-// (input_tokens, output_tokens, cached_input_tokens) but has no cache-write
-// accounting, so CacheWrite stays zero.
+// turn's running total. The wire's input_tokens INCLUDES cached_input_tokens,
+// but core.TokenUsage follows the Claude convention (Input is UNCACHED input,
+// cache is separate), so normalize here: Input = input_tokens -
+// cached_input_tokens (clamped at 0 for malformed wires), CacheRead =
+// cached_input_tokens. Codex has no cache-write accounting, so CacheWrite
+// stays zero.
 func (a *Assembler) addUsage(payload json.RawMessage) {
 	var p struct {
 		Info *struct {
@@ -444,7 +447,8 @@ func (a *Assembler) addUsage(payload json.RawMessage) {
 	if a.cur.Usage == nil {
 		a.cur.Usage = &core.TokenUsage{}
 	}
-	a.cur.Usage.Input += p.Info.Last.Input
+	uncached := max(p.Info.Last.Input-p.Info.Last.Cached, 0)
+	a.cur.Usage.Input += uncached
 	a.cur.Usage.Output += p.Info.Last.Output
 	a.cur.Usage.CacheRead += p.Info.Last.Cached
 }

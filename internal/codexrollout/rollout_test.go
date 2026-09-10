@@ -564,11 +564,13 @@ func writeZstRollout(t *testing.T, data []byte) string {
 }
 
 // TestReadTurns_PerTurnUsage pins the per-turn usage contract, mirroring
-// jsonl's: a token_count event's last_token_usage maps onto Turn.Usage
-// (input_tokens→Input, output_tokens→Output, cached_input_tokens→CacheRead);
-// a turn spanning several token_count events carries the SUM of their
-// last_token_usage; a turn with no token_count keeps nil. Codex has no
-// cache-write accounting, so CacheWrite stays zero.
+// jsonl's: a token_count event's last_token_usage maps onto Turn.Usage.
+// The wire's input_tokens INCLUDES cached_input_tokens; the mapping
+// normalizes to the shared convention (Input = UNCACHED input, cache
+// separate), so Input = input_tokens - cached_input_tokens and CacheRead =
+// cached_input_tokens. A turn spanning several token_count events carries
+// the SUM of their last_token_usage; a turn with no token_count keeps nil.
+// Codex has no cache-write accounting, so CacheWrite stays zero.
 func TestReadTurns_PerTurnUsage(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout.jsonl")
 	data := strings.Join([]string{
@@ -596,9 +598,9 @@ func TestReadTurns_PerTurnUsage(t *testing.T) {
 	if u == nil {
 		t.Fatalf("turns[1].Usage is nil, want summed usage")
 	}
-	want := core.TokenUsage{Input: 300, Output: 30, CacheRead: 50}
+	want := core.TokenUsage{Input: 250, Output: 30, CacheRead: 50}
 	if *u != want {
-		t.Errorf("turns[1].Usage = %+v, want %+v (sum across the turn's token_count events)", *u, want)
+		t.Errorf("turns[1].Usage = %+v, want %+v (uncached input summed across the turn's token_count events)", *u, want)
 	}
 	if turns[3].Usage != nil {
 		t.Errorf("turns[3].Usage = %+v, want nil (no token_count in the turn)", turns[3].Usage)

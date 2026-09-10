@@ -59,6 +59,10 @@ func (t *Turn) StampPartDurations() {
 
 // TokenUsage is one turn's token accounting, mapped from the backend's
 // per-message usage records. The JSON names are a frontend contract.
+//
+// Convention (both backends normalize to it): Input is UNCACHED input tokens;
+// CacheRead/CacheWrite are counted separately, never inside Input. A turn's
+// total input is Input + CacheRead + CacheWrite.
 type TokenUsage struct {
 	Input      int64 `json:"input"`
 	Output     int64 `json:"output"`
