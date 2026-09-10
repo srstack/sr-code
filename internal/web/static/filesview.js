@@ -2,8 +2,11 @@
 //
 // Read-only directory listing of the session's cwd, served one level at a
 // time by GET /api/sessions/{id}/files?dir=<rel> (cwd-fenced, entry-capped,
-// names/types only). Per the product boundary this panel never fetches file
-// contents: clicking a file only raises a subtle "not available" tooltip.
+// names/types only). Clicking a file swaps the panel body to a read-only
+// preview from GET /api/sessions/{id}/file?path=<rel> (size-capped,
+// binaries rejected); the tree DOM is only hidden, so back restores
+// expansion and scroll state. A drag handle on the panel's left edge
+// resizes it (persisted in localStorage).
 
 import { esc } from './state.js';
 
@@ -29,7 +32,12 @@ const ICONS = {
   json: svg(`<path d="${ICON_DOC}"/><text x="7.4" y="11.4" font-size="5.5" text-anchor="middle" fill="currentColor" stroke="none">{}</text>`),
   image: svg('<rect x="2" y="3" width="12" height="10" rx="1"/><circle cx="5.6" cy="6.4" r="1.1"/><path d="M2.5 11.5 6 8l2.4 2.4L10.5 8l3 3"/>'),
   reload: svg('<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.2v2.6H10.9"/>', 13),
+  back: svg('<path d="M9.5 3.5 5 8l4.5 4.5M5.5 8h8"/>', 13),
 };
+
+// Panel width bounds: hard floor, and a ceiling of 60% of the detail row.
+const MIN_PANEL_W = 160;
+const PANEL_W_KEY = 'usher.files.width';
 
 // iconFor picks the extension class for a file entry. Anything that isn't a
 // regular file ("other": escaping symlinks, sockets, …) gets the generic icon.
@@ -61,12 +69,27 @@ export function setupFilesPanel(id, cwd) {
   const dirPart = idx >= 0 ? clean.slice(0, idx + 1) : '';
   const basePart = clean ? (idx >= 0 ? clean.slice(idx + 1) : clean) : '/';
   panel.innerHTML = `
+    <div class="files-resizer" role="separator" aria-orientation="vertical" aria-label="resize file panel"></div>
     <div class="files-head">
       <span class="files-root" title="${esc(cwd || '')}"><span class="files-root-dir">${esc(dirPart)}</span><span class="files-root-base">${esc(basePart)}</span></span>
       <button type="button" class="files-iconbtn" title="reload file list" aria-label="reload file list">${ICONS.reload}</button>
     </div>
     <div class="files-tree"></div>
+    <div class="files-preview" hidden>
+      <div class="files-preview-head">
+        <button type="button" class="files-iconbtn files-back" title="back to file list" aria-label="back to file list">${ICONS.back}</button>
+        <span class="files-preview-name"></span>
+      </div>
+      <pre class="files-preview-body"></pre>
+      <div class="files-preview-note" hidden>… truncated</div>
+    </div>
   `;
+
+  // Restore the user's panel width (set by the resizer drag below).
+  try {
+    const w = parseInt(localStorage.getItem(PANEL_W_KEY), 10);
+    if (w >= MIN_PANEL_W) panel.style.width = w + 'px';
+  } catch {/* private mode */}
 
   view = {
     epoch,
@@ -74,10 +97,14 @@ export function setupFilesPanel(id, cwd) {
     panel,
     treeEl: panel.querySelector('.files-tree'),
     rootEl: panel.querySelector('.files-root'),
+    previewEl: panel.querySelector('.files-preview'),
+    previewName: panel.querySelector('.files-preview-name'),
+    previewBody: panel.querySelector('.files-preview-body'),
+    previewNote: panel.querySelector('.files-preview-note'),
+    previewReq: 0, // bumped per open/close so stale fetches can't write
     expanded: new Set(), // relative dir paths; survives reload, not navigation
     levels: new Map(),   // path → {status:'loading'} | {status:'error', error} | {status:'ready', entries, truncated}
     lastTreeHTML: '',
-    tipTimer: 0,
     ro: null,
   };
 
@@ -85,9 +112,11 @@ export function setupFilesPanel(id, cwd) {
     const dir = e.target.closest('.files-dir');
     if (dir) { toggleDir(dir.dataset.path); return; }
     const file = e.target.closest('.files-file');
-    if (file) showFileTip(file);
+    if (file && file.dataset.path) openFile(file.dataset.path);
   });
   panel.querySelector('.files-iconbtn').addEventListener('click', reload);
+  panel.querySelector('.files-back').addEventListener('click', closePreview);
+  wireResizer(panel.querySelector('.files-resizer'), panel);
 
   // Fade the clipped START of the root path when it overflows. The element
   // is scrolled to its end (scrollLeft clamps even with overflow:hidden), so
@@ -228,31 +257,81 @@ function rowHTML(entry, parentPath, depth) {
     if (open) html += levelHTML(childPath, depth + 1);
     return html;
   }
-  return `<button type="button" class="files-row files-file" style="--depth:${depth}">` +
+  return `<button type="button" class="files-row files-file" data-path="${esc(childPath)}" style="--depth:${depth}">` +
     iconFor(entry) +
     `<span class="files-name">${esc(entry.name)}</span></button>`;
 }
 
-// showFileTip is the entire file-click behavior in v1: a subtle, self-dismissing
-// "not available" tooltip. No file contents ever leave the server (boundary).
-function showFileTip(row) {
+// wireResizer drags the panel's left-edge handle: pointer capture on the
+// handle, width follows the pointer (clamped), persisted on release. The
+// panel sits at the row's right edge, so dragging left widens it.
+function wireResizer(handle, panel) {
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const row = panel.closest('.detail-row') || panel.parentElement;
+    const startX = e.clientX;
+    const startW = panel.getBoundingClientRect().width;
+    const move = (ev) => {
+      const maxW = Math.max(MIN_PANEL_W, Math.floor(row.getBoundingClientRect().width * 0.6));
+      const w = Math.min(maxW, Math.max(MIN_PANEL_W, startW + (startX - ev.clientX)));
+      panel.style.width = w + 'px';
+    };
+    const up = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      try {
+        localStorage.setItem(PANEL_W_KEY, String(Math.round(panel.getBoundingClientRect().width)));
+      } catch {/* private mode */}
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+}
+
+// openFile swaps the panel body to the preview view and fetches the file.
+// The tree stays mounted (only hidden), so closePreview restores expanded
+// levels and scroll position for free.
+async function openFile(path) {
   const v = view;
   if (!v) return;
-  let tip = v.panel.querySelector('.files-tip');
-  if (!tip) {
-    tip = document.createElement('div');
-    tip.className = 'files-tip';
-    tip.setAttribute('role', 'status');
-    v.panel.appendChild(tip);
+  const epoch = v.epoch;
+  const req = ++v.previewReq;
+  v.treeEl.hidden = true;
+  v.previewEl.hidden = false;
+  v.previewName.textContent = path;
+  v.previewName.title = path;
+  v.previewBody.textContent = 'loading…';
+  v.previewBody.classList.remove('files-error');
+  v.previewNote.hidden = true;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(v.id) + '/file?path=' + encodeURIComponent(path));
+    const body = await res.json().catch(() => ({}));
+    if (!view || view.epoch !== epoch || view.previewReq !== req) return;
+    if (!res.ok) {
+      // The server's reason ("not a regular file", "binary file", …) is
+      // shown plainly as the preview's content.
+      v.previewBody.textContent = body.error || ('HTTP ' + res.status);
+      v.previewBody.classList.add('files-error');
+      return;
+    }
+    v.previewBody.textContent = body.content || '';
+    v.previewNote.hidden = !body.truncated;
+  } catch (e) {
+    if (!view || view.epoch !== epoch || view.previewReq !== req) return;
+    v.previewBody.textContent = String((e && e.message) || e);
+    v.previewBody.classList.add('files-error');
   }
-  tip.textContent = 'file preview not available';
-  const pr = v.panel.getBoundingClientRect();
-  const rr = row.getBoundingClientRect();
-  tip.style.top = Math.max(0, rr.bottom - pr.top + 2) + 'px';
-  tip.style.left = Math.min(rr.left - pr.left + 8, Math.max(0, pr.width - 160)) + 'px';
-  tip.classList.add('show');
-  clearTimeout(v.tipTimer);
-  v.tipTimer = setTimeout(() => tip.classList.remove('show'), 1600);
+}
+
+function closePreview() {
+  const v = view;
+  if (!v) return;
+  v.previewReq++; // cancel any in-flight preview fetch
+  v.previewEl.hidden = true;
+  v.treeEl.hidden = false;
 }
 
 // The header toggle is persistent chrome (index.html) but only meaningful on

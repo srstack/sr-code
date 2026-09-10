@@ -2811,3 +2811,68 @@ body.embed-route .main-wrap > header { display: none; }
 .content h2 { font-size: 1.12rem; }
 .content h3 { font-size: 1rem; }
 .content h4, .content h5, .content h6 { font-size: 0.94rem; }
+
+/* Files panel resize handle: a thin strip over the panel's left border.
+   Pointer capture (filesview.js) keeps the drag alive off-handle. */
+.files-resizer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  touch-action: none;
+  z-index: 1;
+}
+.files-resizer:hover { background: var(--border-strong, var(--border)); }
+/* Resized width is an inline style; the floor is enforced here and in JS. */
+.files-panel { min-width: 160px; }
+
+/* File preview view (read-only). The tree is only hidden while this shows,
+   so back restores expansion and scroll state. */
+.files-preview {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.files-preview[hidden] { display: none; }
+.files-preview-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.files-preview-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* clip the leading dirs, keep the file name visible */
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.files-preview-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--text);
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-disabled) transparent;
+}
+.files-preview-note {
+  padding: var(--space-1) var(--space-2);
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
