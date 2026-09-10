@@ -199,6 +199,48 @@ export function formatDuration(ms) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
+// formatTokens compacts a token count dsh-style: one decimal M at ≥1M,
+// one decimal K at ≥1000, raw below.
+export function formatTokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+// turnMetaHTML renders the dsh-style footer segment that follows the
+// timestamp in an assistant turn's role line: total tokens, cache-hit
+// share, and turn duration. Returns '' when the turn carries no usage, so
+// pre-usage transcripts render byte-identical to before (no stray
+// separators, no layout shift).
+function turnMetaHTML(m) {
+  const u = m && m.usage;
+  if (!u) return '';
+  const segs = [];
+  const input = u.input || 0, output = u.output || 0;
+  const cacheRead = u.cache_read || 0, cacheWrite = u.cache_write || 0;
+  const total = input + output + cacheRead + cacheWrite;
+  if (total > 0) segs.push(formatTokens(total) + ' tok');
+  if (cacheRead > 0) segs.push('cache ' + Math.round(cacheRead / (input + cacheRead) * 100) + '%');
+  const dur = turnDuration(m);
+  if (dur) segs.push(dur);
+  if (!segs.length) return '';
+  return '<span class="turn-meta">· ' + segs.join(' · ') + '</span>';
+}
+
+// turnDuration derives a turn's span from fields the transcript already
+// carries: the turn's start ts to the last part's ts. '' when not derivable.
+function turnDuration(m) {
+  if (!m.ts || !m.parts || !m.parts.length) return '';
+  const start = Date.parse(m.ts);
+  let last = 0;
+  for (const p of m.parts) {
+    const t = p.ts ? Date.parse(p.ts) : 0;
+    if (t > last) last = t;
+  }
+  if (!start || !last || last <= start) return '';
+  return formatDuration(last - start);
+}
+
 export function renderToolPart(p) {
   const name = p.toolName || 'tool';
   const target = p.toolTarget || '';
@@ -335,7 +377,7 @@ export function appendChatMessage(m) {
     // it (a flat .content div here would misrender the first tool part).
     // Completed turns close with the fork control at the card's bottom edge.
     div.innerHTML =
-      `<div class="role"${modelAttr}>${roleLabel}${ts}</div>` +
+      `<div class="role"${modelAttr}>${roleLabel}${ts}${turnMetaHTML(m)}</div>` +
       renderAssistantParts(m.parts) +
       copyBtnHTML() +
       (m.uuid ? forkBtnHTML(m.uuid) : '');

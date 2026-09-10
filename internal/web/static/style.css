@@ -2403,3 +2403,14 @@ body.embed-route .main-wrap > header { display: none; }
   margin: auto;
   color: var(--text-muted);
 }
+
+/* Per-turn token/cache/duration meta in the assistant role line (dsh style).
+ * Mirrors .ts: low-contrast small type that never competes with the reply. */
+.chat-message .role .turn-meta {
+  font-size: 0.65rem;
+  color: var(--text-disabled);
+  margin-left: 0.4rem;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
