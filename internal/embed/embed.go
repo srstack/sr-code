@@ -87,21 +87,21 @@ func Start(ctx context.Context, spec Spec, logger *slog.Logger) (*Process, error
 		logger:   logger,
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("embed %s: stdout pipe: %w", spec.Name, err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("embed %s: stderr pipe: %w", spec.Name, err)
-	}
+	// Feed each stream through an io.Pipe: cmd.Wait waits for the
+	// stdlib-internal copies into these writers to finish, and a writer only
+	// completes once our scanner has consumed every line — so trailing output
+	// printed just before a quick exit is never truncated.
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("embed %s: start: %w", spec.Name, err)
 	}
 
 	var captureOnce sync.Once
-	p.scanStream(spec.Name, urlRe, &captureOnce, stdout)
-	p.scanStream(spec.Name, urlRe, &captureOnce, stderr)
+	p.scanStream(spec.Name, urlRe, &captureOnce, stdoutR)
+	p.scanStream(spec.Name, urlRe, &captureOnce, stderrR)
 	go p.pollReady(ctx)
 	go func() {
 		err := cmd.Wait()
