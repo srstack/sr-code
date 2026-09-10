@@ -455,7 +455,7 @@ func newQueueTestRouter(t *testing.T) *Router {
 		sendQueue:      map[string][]pendingSend{},
 		creating:       map[string]core.Session{},
 	}
-	r.runTurn = func(_ context.Context, sessionID, prompt, _ string, tok *sendToken) {
+	r.runTurn = func(_ context.Context, sessionID, prompt, _, _ string, tok *sendToken) {
 		r.broker.Publish(partEvent(sessionID, "assistant", "text", "re: "+prompt))
 		r.broker.Publish(broker.Event{SessionID: sessionID, Type: "subprocess.exit", Raw: json.RawMessage(`{}`)})
 		r.releaseSend(sessionID, tok)
