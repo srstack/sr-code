@@ -439,6 +439,7 @@ export function statusDot(status) {
 // codex: 6 outward 144deg arcs (radius 3.68) joining hexagon vertices on a
 //   radius-7 circle, filled, tilted 15deg clockwise.
 // pi: official press-kit pixel badge, adapted to currentColor.
+// dsh: terminal prompt — a chevron with an underscore caret.
 export const BACKEND_MARKS = {
   claude: '<g stroke="currentColor" stroke-width="2.1" stroke-linecap="round">'
     + '<line x1="12" y1="12" x2="12.84" y2="2.44"/><line x1="12" y1="12" x2="18.30" y2="4.75"/>'
@@ -457,6 +458,8 @@ export const BACKEND_MARKS = {
   opencode2: '<path d="M12 3.2 19.6 7.6v8.8L12 20.8 4.4 16.4V7.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="2"/>'
     + '<path d="M9.25 9.3 6.85 12l2.4 2.7M14.75 9.3l2.4 2.7-2.4 2.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
     + '<circle cx="12" cy="12" r="1.6" fill="currentColor"/>',
+  dsh: '<path d="M6 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '<line x1="13" y1="18" x2="19" y2="18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
 };
 
 // Unknown/empty backend falls back to claude, mirroring the router default.

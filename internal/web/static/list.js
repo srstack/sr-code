@@ -183,7 +183,7 @@ export async function loadList() {
       const dot = statusDot(s.status);
       const checked = selected.has(s.id) ? ' checked' : '';
       return `
-      <tr data-id="${esc(s.id)}" data-cwd="${esc(s.cwd || '')}" data-archived="${s.archived ? '1' : ''}" class="${s.archived ? 'archived' : ''}">
+      <tr data-id="${esc(s.id)}" data-cwd="${esc(s.cwd || '')}" data-backend="${esc(s.backend || '')}" data-archived="${s.archived ? '1' : ''}" class="${s.archived ? 'archived' : ''}">
         <td class="sel"><input type="checkbox" class="row-check" data-id="${esc(s.id)}"${checked}></td>
         <td class="title" title="${esc(title)}">${backendMark(s.backend)}${dot ? dot + ' ' : ''}${esc(title)}</td>
         <td class="cwd" title="${esc(s.cwd || '')}">${esc(s.cwd || '')}</td>
@@ -201,7 +201,10 @@ export async function loadList() {
           // Kebab clicks are taken by its own (document-level) popover handler;
           // the row listener runs first while bubbling, so skip them here.
           if (e.target.closest('.kebab-btn')) return;
-          location.hash = '#/s/' + encodeURIComponent(tr.dataset.id);
+          // dsh sessions open in dsh's own embedded UI, not the detail view.
+          location.hash = tr.dataset.backend === 'dsh'
+            ? '#/ui/dsh'
+            : '#/s/' + encodeURIComponent(tr.dataset.id);
         });
       });
       rowsEl.querySelectorAll('.row-check').forEach(cb => {

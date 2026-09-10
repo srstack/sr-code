@@ -108,7 +108,11 @@ export function renderSidebarSessions(allSessions) {
   // no kebab. A root row carries the kebab, which offers "Show subagents"
   // when the session has any — the only way to reveal its children.
   const renderRow = (s, child = false) => {
-    const href = '#/s/' + encodeURIComponent(s.id);
+    // dsh sessions are owned by dsh's own embedded UI, not usher's detail
+    // view — the row links straight to the #/ui/dsh iframe route.
+    const href = s.backend === 'dsh'
+      ? '#/ui/dsh'
+      : '#/s/' + encodeURIComponent(s.id);
     const permissions = pendingPermissionCount(s.id);
     const dot = permissions
       ? `<span class="running-dot permission" title="${permissions} permission request${permissions === 1 ? '' : 's'} pending">●</span>`
