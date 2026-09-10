@@ -16,6 +16,7 @@ import {
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
 import { setupFilesPanel } from './filesview.js';
+import { render as renderTrajectory } from './trajectory.js';
 import { loadSidebar } from './sidebar.js';
 import { loadList } from './list.js';
 import { makeDropdown } from './dropdown.js';
@@ -79,6 +80,92 @@ let liveTurnDirty = false;
 const TRANSCRIPT_PAGE = 50;
 let transcriptLimit = TRANSCRIPT_PAGE;
 let transcriptTotal = 0;
+
+// --- trajectory view (dsh-style compact rows) ---
+// Per-session view mode (chat | trajectory), in memory only. The trajectory
+// is a projection of sessionTurns + the in-flight live turn — trajectory.js
+// re-projects on a rAF throttle from the same update points the chat uses;
+// it never fetches.
+const detailViewModes = new Map();
+let trajRAF = 0;
+let viewToggleWired = false;
+
+function detailViewMode() {
+  return detailViewModes.get(currentDetailId) || 'chat';
+}
+
+function setupViewToggle() {
+  const pill = document.getElementById('view-pill');
+  if (!pill) return;
+  pill.hidden = false;
+  if (!viewToggleWired) {
+    viewToggleWired = true;
+    document.getElementById('view-pill-chat').addEventListener('click', () => setViewMode('chat'));
+    document.getElementById('view-pill-traj').addEventListener('click', () => setViewMode('trajectory'));
+  }
+  paintViewToggle();
+}
+
+function paintViewToggle() {
+  const mode = detailViewMode();
+  const chatBtn = document.getElementById('view-pill-chat');
+  const trajBtn = document.getElementById('view-pill-traj');
+  if (chatBtn) chatBtn.setAttribute('aria-pressed', mode === 'chat' ? 'true' : 'false');
+  if (trajBtn) trajBtn.setAttribute('aria-pressed', mode === 'trajectory' ? 'true' : 'false');
+}
+
+function setViewMode(mode) {
+  if (!currentDetailId) return;
+  detailViewModes.set(currentDetailId, mode);
+  paintViewToggle();
+  applyViewMode();
+}
+
+// applyViewMode swaps which pane fills the detail column. The chat keeps
+// rendering underneath either way (its reconcile is incremental), so
+// switching back is instant.
+function applyViewMode() {
+  const mode = detailViewMode();
+  const chat = document.getElementById('chat-scroll');
+  const traj = document.getElementById('traj-root');
+  if (!chat || !traj) return;
+  chat.hidden = mode !== 'chat';
+  traj.hidden = mode !== 'trajectory';
+  if (mode === 'chat') chat.scrollTop = chat.scrollHeight;
+  else renderTrajectoryNow();
+}
+
+function trajTurns() {
+  if (liveTurn && liveTurn.parts.length) {
+    return sessionTurns.concat([{ role: 'assistant', ts: liveTurn.ts, parts: liveTurn.parts }]);
+  }
+  return sessionTurns;
+}
+
+function renderTrajectoryNow() {
+  const el = document.getElementById('traj-root');
+  if (!el || el.hidden) return;
+  renderTrajectory(el, trajTurns());
+}
+
+// scheduleTrajRender re-projects on transcript/SSE updates. rAF-throttled:
+// a streaming turn fires one part event per server group, and the full
+// re-project is cheap — paint still only rewrites the visible window.
+function scheduleTrajRender() {
+  if (detailViewMode() !== 'trajectory' || trajRAF) return;
+  trajRAF = requestAnimationFrame(() => {
+    trajRAF = 0;
+    renderTrajectoryNow();
+  });
+}
+
+// The view pill is detail-route chrome (like the files toggle); hide it
+// everywhere else. hashchange listeners run before app.js's route().
+window.addEventListener('hashchange', () => {
+  if (location.hash.startsWith('#/s/')) return;
+  const pill = document.getElementById('view-pill');
+  if (pill) pill.hidden = true;
+});
 
 // ---------- New session view ----------
 //
@@ -315,11 +402,13 @@ export async function showDetail(id) {
   if (sess.is_subagent) {
     root.innerHTML = `
       <div class="detail-row">
-      <div class="detail-col"><div id="chat-scroll" class="chat-area"></div></div>
+      <div class="detail-col"><div id="chat-scroll" class="chat-area"></div><div id="traj-root" class="traj-root" hidden></div></div>
       <aside id="files-panel" class="files-panel" hidden></aside>
       </div>
     `;
     setupFilesPanel(id, sess.cwd);
+    setupViewToggle();
+    applyViewMode();
     openSubagentEventStream(id);
     await loadTranscript(id);
     return;
@@ -411,12 +500,15 @@ export async function showDetail(id) {
         </div>
       </section>
     </div>
+    <div id="traj-root" class="traj-root" hidden></div>
     </div>
     <aside id="files-panel" class="files-panel" hidden></aside>
     </div>
   `;
 
   setupFilesPanel(id, sess.cwd);
+  setupViewToggle();
+  applyViewMode();
 
   await loadTranscript(id);
   if (epoch !== detailEpoch) return; // superseded before we wired the streams
@@ -1584,6 +1676,7 @@ function appendLivePart(d) {
   const enrichTool = enrichIndex >= 0;
   if (enrichTool) lt.parts[enrichIndex] = p;
   else lt.parts.push(p);
+  scheduleTrajRender();
   if (!lt.ts && d.ts) lt.ts = d.ts;
   const chat = document.getElementById('chat-scroll');
   const stick = chat && isNearBottom(chat);
@@ -1727,6 +1820,7 @@ async function loadTranscript(id, opts) {
       sessionTurns = turns;
       updateSessionBar();
       updateLoadEarlier(id);
+      scheduleTrajRender();
       return;
     }
     // Reconcile against what's already rendered. Transcripts are append-only,
@@ -1763,6 +1857,7 @@ async function loadTranscript(id, opts) {
     sessionTurns = turns;
     updateSessionBar();
     updateLoadEarlier(id);
+    scheduleTrajRender();
   } catch {/* ignore — lastTranscriptSig stays put, so the next call retries */}
 }
 
@@ -1802,6 +1897,7 @@ function formatTokenCount(n) {
 function noteLiveTurn(t) {
   sessionTurns.push(t);
   updateSessionBar();
+  scheduleTrajRender();
 }
 
 // turnActiveMs is one assistant turn's active span in milliseconds: turn start

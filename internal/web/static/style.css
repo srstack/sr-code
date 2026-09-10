@@ -2612,3 +2612,93 @@ body.embed-route .main-wrap > header { display: none; }
   white-space: nowrap;
 }
 .files-tip.show { opacity: 0.92; }
+
+/* --- Trajectory view: dsh-style compact fixed-height transcript rows --- */
+
+.chat-area[hidden] { display: none; }
+
+.traj-root {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.traj-root[hidden] { display: none; }
+
+.traj-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-bottom: 1px solid var(--border-hr);
+  flex-shrink: 0;
+}
+.traj-collapse-all {
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--space-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.traj-collapse-all:hover { background: var(--bg-hover); color: var(--text); }
+.traj-count { font-size: 12px; }
+
+.traj-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-disabled) transparent;
+  font-size: 13px;
+  line-height: 1.4;
+  outline: none;
+}
+
+.traj-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  white-space: nowrap;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.traj-header { cursor: pointer; }
+.traj-header:hover, .traj-summary:hover { background: var(--bg-hover); }
+.traj-badge {
+  flex-shrink: 0;
+  width: 44px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.traj-user .traj-badge { color: var(--text); }
+.traj-tool .traj-badge { color: var(--purple); }
+.traj-compaction .traj-badge { color: var(--warning-text); }
+.traj-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.traj-user .traj-text { font-weight: 500; }
+.traj-compaction .traj-text, .traj-system .traj-text { color: var(--text-muted); }
+.traj-error .traj-text { color: var(--danger-text); }
+.traj-dim { flex-shrink: 0; color: var(--text-faint); }
+.traj-right {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding-left: var(--space-2);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.traj-summary {
+  padding-left: calc(var(--space-3) + 44px + var(--space-2));
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: pointer;
+}
+.traj-spacer { flex-shrink: 0; }
