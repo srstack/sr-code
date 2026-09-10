@@ -73,10 +73,10 @@ type Hash struct {
 type Store struct {
 	dataDir string
 
-	mu         sync.RWMutex
-	hash       *Hash  // nil ⇒ auth disabled
-	secret     []byte // HMAC key, always non-nil after Load
-	totpSecret []byte // nil ⇒ TOTP disabled
+	mu          sync.RWMutex
+	hash        *Hash  // nil ⇒ auth disabled
+	secret      []byte // HMAC key, always non-nil after Load
+	totpSecret  []byte // nil ⇒ TOTP disabled
 	totpPending []byte // enrollment in progress, not yet active
 
 	// Limiter gates /login attempts. Callers acquire before verifying and
