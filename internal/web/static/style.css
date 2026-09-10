@@ -2414,3 +2414,57 @@ body.embed-route .main-wrap > header { display: none; }
   letter-spacing: 0;
   font-weight: 400;
 }
+
+/* Session status bar: slim strip above the composer with turn/step counts,
+ * output rate, and the aggregate usage pill. Hidden entirely unless the
+ * loaded turns carry usage. */
+.session-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-bottom: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-faint);
+}
+.session-bar[hidden] { display: none; }
+.session-bar-stats {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-bar-usage-wrap { position: relative; display: flex; align-items: center; flex: none; }
+.session-bar-usage {
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  border-radius: var(--radius-pill);
+  padding: 0.1rem 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.session-bar-usage:hover { color: var(--text); border-color: var(--border-strong); }
+.session-bar-usage[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+/* Cache-breakdown popover, anchored to the pill (opens upward-right). */
+.session-bar-usage-detail {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.4rem);
+  z-index: 20;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+}
+.session-bar-usage-detail[hidden] { display: none; }
+.session-bar-usage-detail > div { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.session-bar-usage-detail strong { font-weight: 500; color: var(--text-faint); }
+.session-bar-usage-detail span { white-space: nowrap; }

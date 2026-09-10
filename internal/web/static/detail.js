@@ -12,7 +12,7 @@ import {
 import {
   renderMarkdown, appendChatMessage, renderToolPart, renderThinkingPart,
   forkBtnHTML, updateMessageTs, turnCopyText,
-  backendMark,
+  backendMark, formatTokens,
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
 import { loadSidebar } from './sidebar.js';
@@ -34,6 +34,14 @@ import { makeDropdown } from './dropdown.js';
 // (ignore a re-fetch that resolves after the user navigated away).
 let detailStreaming = false;
 let lastTranscriptSig = '';
+
+// The transcript turns the session status bar aggregates over: the last
+// fetched window, extended live by noteLiveTurn as turns stream in (the next
+// fetch replaces it wholesale, so live pushes never double-count).
+let sessionTurns = [];
+// innerHTML cache for the usage popover — rewriting identical HTML would
+// restart CSS animations for no reason.
+let lastBarDetailHTML = '';
 
 // Bumped on every showDetail entry. showDetail awaits (session fetch, transcript)
 // before opening its /events stream; a newer mount started during those awaits
@@ -276,6 +284,8 @@ export async function showDetail(id) {
   renderedTurns = [];
   liveTurn = null;
   liveTurnDirty = false;
+  sessionTurns = [];
+  lastBarDetailHTML = '';
   transcriptLimit = TRANSCRIPT_PAGE;
   transcriptTotal = 0;
   detailStreaming = false;
@@ -312,6 +322,15 @@ export async function showDetail(id) {
     <div class="detail-col">
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
+        <div id="session-bar" class="session-bar" hidden>
+          <span id="session-bar-stats" class="session-bar-stats"></span>
+          <div class="session-bar-usage-wrap">
+            <button id="session-bar-usage" class="session-bar-usage" type="button"
+              aria-expanded="false" aria-controls="session-bar-usage-detail"
+              title="session token usage; show cache breakdown"></button>
+            <div id="session-bar-usage-detail" class="session-bar-usage-detail" hidden></div>
+          </div>
+        </div>
         <div class="composer">
           <div id="attach-chips" class="attach-chips" hidden></div>
           <textarea id="prompt" rows="1" placeholder="message…"></textarea>
@@ -547,6 +566,27 @@ export async function showDetail(id) {
     usageBtn.addEventListener('blur', () => {
       usageDetail.hidden = true;
       usageBtn.setAttribute('aria-expanded', 'false');
+    });
+  }
+  // Status-bar usage pill: click opens the cache-breakdown popover; closes on
+  // outside click (same pattern as the model settings popover above).
+  const barUsageBtn = document.getElementById('session-bar-usage');
+  const barUsageDetail = document.getElementById('session-bar-usage-detail');
+  if (barUsageBtn && barUsageDetail) {
+    const onDocClick = (e) => {
+      if (!e.target.isConnected) return;
+      if (!barUsageDetail.contains(e.target) && !barUsageBtn.contains(e.target)) closeBarPop();
+    };
+    const closeBarPop = () => {
+      barUsageDetail.hidden = true;
+      barUsageBtn.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('click', onDocClick);
+    };
+    barUsageBtn.addEventListener('click', () => {
+      if (!barUsageDetail.hidden) { closeBarPop(); return; }
+      barUsageDetail.hidden = false;
+      barUsageBtn.setAttribute('aria-expanded', 'true');
+      document.addEventListener('click', onDocClick);
     });
   }
   renderSessionRuntime(sess.runtime);
@@ -1162,6 +1202,7 @@ function openEventStream(id, chatEl, renderAction, confirmRunningAction) {
         echo.classList.remove('optimistic');
         renderedTurns.push({ key: turnKey(t), node: echo });
         transcriptTotal++;
+        noteLiveTurn(t);
         return;
       }
       const node = appendChatMessage(t);
@@ -1171,6 +1212,7 @@ function openEventStream(id, chatEl, renderAction, confirmRunningAction) {
         }
         renderedTurns.push({ key: turnKey(t), node });
         transcriptTotal++;
+        noteLiveTurn(t);
       }
       liveTurnDirty = true;
     },
@@ -1616,6 +1658,9 @@ function finalizeTurn(id, d) {
   lt.node.classList.remove('optimistic');
   renderedTurns.push({ key: turnKey({ role: 'assistant', ts, parts: lt.parts }), node: lt.node });
   transcriptTotal++;
+  // The exit payload carries no usage, so the pill picks this turn's tokens
+  // up on the next fetch; counts and duration update now.
+  noteLiveTurn({ role: 'assistant', ts, parts: lt.parts });
   updateLoadEarlier(id);
 }
 
@@ -1667,6 +1712,8 @@ async function loadTranscript(id, opts) {
       if (sendAnchor) el.insertBefore(empty, sendAnchor);
       else el.appendChild(empty);
       lastTranscriptSig = sig;
+      sessionTurns = turns;
+      updateSessionBar();
       updateLoadEarlier(id);
       return;
     }
@@ -1701,6 +1748,8 @@ async function loadTranscript(id, opts) {
     // Mark this state rendered only now — a successful render — so any earlier
     // bail-out leaves the signature stale and the next call retries.
     lastTranscriptSig = sig;
+    sessionTurns = turns;
+    updateSessionBar();
     updateLoadEarlier(id);
   } catch {/* ignore — lastTranscriptSig stays put, so the next call retries */}
 }
@@ -1733,6 +1782,77 @@ function formatTokenCount(n) {
   if (n < 1000) return String(n);
   if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, '') + 'k';
   return (n / 1000000).toFixed(n < 10000000 ? 1 : 0).replace(/\.0$/, '') + 'm';
+}
+
+// noteLiveTurn folds a turn that arrived over the live stream (user echo
+// adopted, assistant bubble promoted) into the status bar's aggregate without
+// waiting for the next transcript fetch.
+function noteLiveTurn(t) {
+  sessionTurns.push(t);
+  updateSessionBar();
+}
+
+// turnActiveMs is one assistant turn's active span in milliseconds: turn start
+// to the last part's timestamp (same derivation as the per-turn footer in
+// render.js). 0 when not derivable — such turns simply don't feed tok/s.
+function turnActiveMs(t) {
+  if (!t.ts || !t.parts || !t.parts.length) return 0;
+  const start = Date.parse(t.ts);
+  let last = 0;
+  for (const p of t.parts) {
+    const x = p.ts ? Date.parse(p.ts) : 0;
+    if (x > last) last = x;
+  }
+  if (!start || !last || last <= start) return 0;
+  return last - start;
+}
+
+// updateSessionBar re-aggregates the loaded transcript turns into the status
+// strip above the composer: user-turn / assistant-step counts, output rate,
+// and the usage pill with its cache-breakdown popover. Purely client-side.
+// A session whose turns carry no usage at all (old transcripts, paginated
+// codex windows) renders no strip — nothing new appears.
+function updateSessionBar() {
+  const bar = document.getElementById('session-bar');
+  if (!bar) return;
+  let turns = 0, steps = 0, activeMs = 0;
+  let input = 0, output = 0, cacheRead = 0, cacheWrite = 0;
+  for (const t of sessionTurns) {
+    if (t.role === 'user') { turns++; continue; }
+    if (t.role !== 'assistant') continue;
+    steps += (t.parts || []).length;
+    const u = t.usage;
+    if (u) {
+      input += u.input || 0;
+      output += u.output || 0;
+      cacheRead += u.cache_read || 0;
+      cacheWrite += u.cache_write || 0;
+    }
+    activeMs += turnActiveMs(t);
+  }
+  const total = input + output + cacheRead + cacheWrite;
+  if (total <= 0) { bar.hidden = true; return; }
+  bar.hidden = false;
+  let stats = turns + ' turns ' + steps + ' steps';
+  const secs = activeMs / 1000;
+  if (secs > 0 && output > 0) stats += ' · ' + formatTokens(Math.round(output / secs)) + ' tok/s';
+  document.getElementById('session-bar-stats').textContent = stats;
+  let label = formatTokens(total) + ' tok';
+  if (cacheRead > 0 && input + cacheRead > 0) {
+    label += ' · cache ' + Math.round(cacheRead / (input + cacheRead) * 100) + '%';
+  }
+  document.getElementById('session-bar-usage').textContent = label;
+  const rows = [
+    ['Uncached input', input],
+    ['Cache read', cacheRead],
+  ];
+  if (cacheWrite > 0) rows.push(['Cache write', cacheWrite]); // codex never writes
+  rows.push(['Output', output]);
+  const html = rows.map(r => `<div><strong>${r[0]}</strong><span>${formatTokens(r[1])}</span></div>`).join('');
+  if (html !== lastBarDetailHTML) {
+    lastBarDetailHTML = html;
+    document.getElementById('session-bar-usage-detail').innerHTML = html;
+  }
 }
 
 // updateLoadEarlier shows a "load earlier" control at the top of the transcript
