@@ -200,8 +200,10 @@ export function formatDuration(ms) {
 }
 
 // formatTokens compacts a token count dsh-style: one decimal M at ≥1M,
-// one decimal K at ≥1000, raw below.
+// one decimal K at ≥1000, raw below. Non-numeric input coerces to 0 — the
+// raw branch flows into innerHTML, so it must never echo input through.
 export function formatTokens(n) {
+  n = Number(n) || 0;
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
