@@ -24,6 +24,8 @@ approve or deny tool-permission prompts — without being at the keyboard.
   by default, or plain language ("run the tests in the auth session and tell me
   what fails") once you enable the optional LLM agent ([Main chat](#main-chat)).
 - Open a lightweight tmux shell in a session's working directory.
+- Use the dsh, OpenCode, or Kimi Code native web UIs inside usher — usher
+  spawns them as loopback-only children behind the same auth and iframes them.
 
 ## Install
 
@@ -98,6 +100,11 @@ most common:
 | `--pi-sessions-dir` | `~/.pi/agent/sessions` | pi coding-agent session dir; enables the pi backend when present. |
 | `--pi` | `pi` | pi executable used for RPC workers. |
 | `--pi-args` | empty | Extra flags passed to spawned pi RPC workers. |
+| `--dsh` | `dsh` | dsh binary for the embedded DeepSeek Harness UI; empty disables. |
+| `--dsh-port` | `7781` | usher-side port for the embedded dsh UI; `0` disables. |
+| `--opencode-web-port` | `7782` | usher-side port for the embedded OpenCode web UI (reuses the `--opencode` binary); `0` disables. |
+| `--kimi` | empty | Moonshot kimi-cli binary for the embedded Kimi Code web UI; off by default. |
+| `--kimi-port` | `7783` | usher-side port for the embedded Kimi Code UI; `0` disables. |
 | `--permission-mode` | `default` | Claude only. `default` uses the hook UI; `bypassPermissions` skips prompting. |
 | `--tmux-socket` | `usher` | Socket prefix for optional session terminals (`<name>-terminal`). |
 | `--terminal-shell` | `$SHELL` or `bash` | Shell executable used by session terminals. |

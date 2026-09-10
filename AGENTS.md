@@ -57,5 +57,11 @@ needed, vendor a popular, self-contained, minimal one.
   against the authenticated user.** The real boundary is web auth (password,
   cookie, socket isolation). Don't add in-tool gates to protect users from
   themselves; real isolation is perimeter-level (container/VM/separate user).
+- **Embedded native UIs: for agents that ship their own local web UI (dsh,
+  opencode, kimi), usher spawns the UI as a loopback-only child and
+  reverse-proxies it on a dedicated port behind the same web auth.** The
+  embedded UI is the agent's own product surface — usher does not
+  re-implement its features (permissions, interrupts, model pickers) and
+  does not treat anything inside the iframe as usher's UI to style.
 - Sessions are a derived view of the jsonl files on disk — no SQLite, no
   session registry.
