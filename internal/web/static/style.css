@@ -2625,6 +2625,13 @@ body.embed-route .main-wrap > header { display: none; }
 }
 .traj-root[hidden] { display: none; }
 
+/* Trajectory mode hides only the transcript content inside .chat-area, not
+ * the area itself: .send-anchor (composer, status bar, terminal drawer)
+ * stays visible and functional. The area shrinks to the anchor so
+ * .traj-root takes the freed space. */
+.chat-area--trajectory { flex: 0 0 auto; overflow-y: visible; }
+.chat-area--trajectory > :not(.send-anchor) { display: none; }
+
 .traj-toolbar {
   display: flex;
   align-items: center;
@@ -2768,7 +2775,8 @@ body.embed-route .main-wrap > header { display: none; }
  * rendered inside .content. Deliberately NOT touched: the trajectory view
  * (.traj-root is a full-width sibling of .chat-area inside .detail-col),
  * the files panel (sits beside the column in .detail-row), the terminal
- * drawer (full-width below .chat-area), and the embed iframe route
+ * drawer (docked at the bottom of .chat-area, inside .send-anchor), and
+ * the embed iframe route
  * (.embed-view fills its own route). The composer lives in .send-anchor
  * inside .chat-area, so it follows the column automatically.
  */

@@ -123,13 +123,16 @@ function setViewMode(mode) {
 
 // applyViewMode swaps which pane fills the detail column. The chat keeps
 // rendering underneath either way (its reconcile is incremental), so
-// switching back is instant.
+// switching back is instant. Trajectory mode hides only the transcript
+// content (via .chat-area--trajectory): .send-anchor — composer, status
+// bar, terminal drawer — stays visible and functional, so a running turn
+// can still be steered or interrupted while inspecting the trajectory.
 function applyViewMode() {
   const mode = detailViewMode();
   const chat = document.getElementById('chat-scroll');
   const traj = document.getElementById('traj-root');
   if (!chat || !traj) return;
-  chat.hidden = mode !== 'chat';
+  chat.classList.toggle('chat-area--trajectory', mode === 'trajectory');
   traj.hidden = mode !== 'trajectory';
   if (mode === 'chat') chat.scrollTop = chat.scrollHeight;
   else renderTrajectoryNow();
