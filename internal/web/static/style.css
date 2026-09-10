@@ -2468,3 +2468,147 @@ body.embed-route .main-wrap > header { display: none; }
 .session-bar-usage-detail > div { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
 .session-bar-usage-detail strong { font-weight: 500; color: var(--text-faint); }
 .session-bar-usage-detail span { white-space: nowrap; }
+
+/* ===== Files panel (session detail file tree) ===== */
+
+/* Detail layout row: transcript column + optional right-side files panel. */
+.detail-row {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+.detail-row > .detail-col { min-width: 0; }
+
+/* Header toggle (persistent chrome, shown only on session detail routes). */
+.files-toggle {
+  background: none;
+  border: none;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast) var(--ease-out);
+}
+.files-toggle:hover { color: var(--text); background: var(--bg-hover); }
+.files-toggle[aria-pressed="true"] { color: var(--text); background: var(--bg-active); }
+.files-toggle[hidden] { display: none; }
+
+.files-panel {
+  width: 240px;
+  flex-shrink: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-base);
+  position: relative;
+  font-size: 13px;
+}
+.files-panel[hidden] { display: none; }
+.files-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+/* Root path: greyed directory + full-ink last segment. JS scrolls the
+   element to its end, so overflow clips the START; data-clipped then fades
+   that clipped edge (set from a ResizeObserver measurement). */
+.files-root {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  scrollbar-width: none;
+}
+.files-root::-webkit-scrollbar { display: none; }
+.files-root-base { color: var(--text); font-weight: 600; }
+.files-root[data-clipped="start"] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 1.5rem);
+  mask-image: linear-gradient(to right, transparent, #000 1.5rem);
+}
+.files-iconbtn {
+  background: none;
+  border: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast) var(--ease-out);
+}
+.files-iconbtn:hover { color: var(--text); background: var(--bg-hover); }
+
+.files-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--space-1) 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-disabled) transparent;
+}
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 2px var(--space-2);
+  padding-left: calc(var(--space-2) + var(--depth, 0) * 14px);
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  line-height: 1.4;
+}
+.files-row:hover { background: var(--bg-hover); }
+.files-row svg { flex-shrink: 0; color: var(--text-muted); }
+.files-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files-note {
+  padding: 2px var(--space-2);
+  padding-left: calc(var(--space-2) + var(--depth, 0) * 14px);
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.4;
+}
+.files-error { color: var(--danger-text); }
+
+/* File-click tooltip: subtle, self-dismissing (files never open in v1). */
+.files-tip {
+  position: absolute;
+  z-index: 5;
+  background: var(--text);
+  color: var(--bg-base);
+  font-size: 12px;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--ease-out);
+  white-space: nowrap;
+}
+.files-tip.show { opacity: 0.92; }

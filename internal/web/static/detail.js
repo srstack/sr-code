@@ -15,6 +15,7 @@ import {
   backendMark, formatTokens,
 } from './render.js';
 import { openTerminalScreen, wireTerminalControls, measureCols } from './terminal.js';
+import { setupFilesPanel } from './filesview.js';
 import { loadSidebar } from './sidebar.js';
 import { loadList } from './list.js';
 import { makeDropdown } from './dropdown.js';
@@ -312,13 +313,20 @@ export async function showDetail(id) {
   renderSessionSubtitle(sess);
 
   if (sess.is_subagent) {
-    root.innerHTML = `<div id="chat-scroll" class="chat-area"></div>`;
+    root.innerHTML = `
+      <div class="detail-row">
+      <div class="detail-col"><div id="chat-scroll" class="chat-area"></div></div>
+      <aside id="files-panel" class="files-panel" hidden></aside>
+      </div>
+    `;
+    setupFilesPanel(id, sess.cwd);
     openSubagentEventStream(id);
     await loadTranscript(id);
     return;
   }
 
   root.innerHTML = `
+    <div class="detail-row">
     <div class="detail-col">
     <div id="chat-scroll" class="chat-area">
       <section class="send-anchor">
@@ -404,7 +412,11 @@ export async function showDetail(id) {
       </section>
     </div>
     </div>
+    <aside id="files-panel" class="files-panel" hidden></aside>
+    </div>
   `;
+
+  setupFilesPanel(id, sess.cwd);
 
   await loadTranscript(id);
   if (epoch !== detailEpoch) return; // superseded before we wired the streams
