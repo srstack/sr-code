@@ -224,18 +224,26 @@ func (s *Server) handleEmbeds(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// AddrIsLoopback reports whether the host part of addr binds only on
+// loopback interfaces. Empty host (e.g. ":7777") means all interfaces ⇒
+// not loopback.
+func AddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // embedBindHost mirrors the main listener's exposure for embed listeners:
 // a loopback main address keeps them loopback-only; anything else binds all
 // interfaces (the auth middleware is still the gate).
 func embedBindHost(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "0.0.0.0"
-	}
-	if host == "localhost" {
-		return "127.0.0.1"
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+	if AddrIsLoopback(addr) {
 		return "127.0.0.1"
 	}
 	return "0.0.0.0"

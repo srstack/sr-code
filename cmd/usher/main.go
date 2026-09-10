@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +20,7 @@ import (
 	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/discovery"
+	"github.com/nexustar/usher/internal/embed"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/modelcatalog"
@@ -134,6 +134,12 @@ func serve(args []string) error {
 	openCode2Cmd := fs.String("opencode2", "opencode2", "path to the opencode2 binary (OpenCode 2 backend)")
 	openCode2SessionsDir := fs.String("opencode2-sessions-dir", "",
 		"usher-owned OpenCode 2 shadow transcript directory; empty uses <data-dir>/opencode2-sessions")
+	dshCmd := fs.String("dsh", "dsh", "path to the dsh binary (embedded DeepSeek Harness UI); empty disables")
+	dshPort := fs.Int("dsh-port", 7781, "usher-side port for the embedded dsh UI; 0 disables")
+	openCodeWebPort := fs.Int("opencode-web-port", 7782,
+		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
+	kimiCmd := fs.String("kimi", "kimi", "path to the kimi binary (embedded Kimi Code UI); empty disables")
+	kimiPort := fs.Int("kimi-port", 7783, "usher-side port for the embedded Kimi Code UI; 0 disables")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
 	tmuxSocket := fs.String("tmux-socket", "usher",
@@ -193,7 +199,7 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load auth: %w", err)
 	}
-	if !authStore.IsConfigured() && !addrIsLoopback(*addr) {
+	if !authStore.IsConfigured() && !web.AddrIsLoopback(*addr) {
 		return fmt.Errorf(
 			"refusing to bind non-loopback %q without a password.\n"+
 				"  run `usher set-password` first, or bind to 127.0.0.1 / localhost for local-only access.",
@@ -360,6 +366,23 @@ func serve(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Embedded agent UIs (dsh/opencode/kimi): optional children spawned on
+	// free loopback ports, each surfaced on its own auth-guarded listener.
+	// Their lifetimes are bound to ctx (CommandContext kills them on
+	// shutdown); a missing binary or failed start just skips that embed.
+	var embedMounts []web.EmbedMount
+	specs, mounts := embedSpecs(*dshCmd, *dshPort, *openCodeCmd, *openCodeWebPort, *kimiCmd, *kimiPort)
+	for i, spec := range specs {
+		proc, err := embed.Start(ctx, spec, logger)
+		if err != nil {
+			logger.Warn("embed disabled", "name", spec.Name, "err", err)
+			continue
+		}
+		mounts[i].Process = proc
+		embedMounts = append(embedMounts, mounts[i])
+		logger.Info("embed started", "name", spec.Name, "listen_port", mounts[i].ListenPort)
+	}
+
 	if ocSync != nil {
 		ocSync.LoadTombstones()
 		go opencode.SyncLoop(ctx, ocSync, logger)
@@ -385,7 +408,7 @@ func serve(args []string) error {
 	)
 	logger.Info("auth",
 		"configured", authStore.IsConfigured(),
-		"loopback_bind", addrIsLoopback(*addr),
+		"loopback_bind", web.AddrIsLoopback(*addr),
 	)
 
 	if err := startTelegramHub(ctx, r, *tgGroupID, *tgAllowedUsers, *dataDir, logger); err != nil {
@@ -403,6 +426,7 @@ func serve(args []string) error {
 
 	themePath := filepath.Join(*dataDir, "theme.css")
 	srv := web.NewServer(*addr, hookSockPath(*dataDir), attachmentsDir, authStore, r, mainStore, agent, pushMgr, *editorURL, *uiDir, themePath, logger)
+	srv.Embeds = embedMounts
 
 	// Foreign-turn watcher: turns usher didn't start (background workflow
 	// continuations, pane-typed prompts) get relayed to the chats that
@@ -477,18 +501,42 @@ func parseUserIDs(s string) ([]int64, error) {
 var _ telegram.RouterAPI = (*router.Router)(nil)
 var _ pluginapi.RouterAPI = (*router.Router)(nil)
 
-// addrIsLoopback reports whether the host part of addr binds only on loopback
-// interfaces. Empty host (e.g. ":7777") means all interfaces ⇒ not loopback.
-func addrIsLoopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
+// embedSpecs maps the serve flags to embedded agent UI specs and their
+// usher-side listen ports. A UI is included only when its binary name is
+// non-empty AND its port is non-zero. Mounts are returned aligned with
+// specs; Process is filled in by serve() once each child starts.
+func embedSpecs(dshCmd string, dshPort int, ocCmd string, ocPort int, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
+	var specs []embed.Spec
+	var mounts []web.EmbedMount
+	add := func(cmd string, port int, spec embed.Spec) {
+		if cmd == "" || port == 0 {
+			return
+		}
+		spec.Cmd = cmd
+		specs = append(specs, spec)
+		mounts = append(mounts, web.EmbedMount{ListenPort: port})
 	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	// dsh binds 127.0.0.1:3080 by default; do NOT pass a port flag (its
+	// webserver port is config-file driven). If 3080 is taken, dsh's own
+	// error surfaces in the log — acceptable for v1.
+	add(dshCmd, dshPort, embed.Spec{
+		Name: "dsh", Title: "DeepSeek Harness",
+		Args:       []string{"--profile", "web", "--no-open"},
+		HealthPath: "/", URLPattern: `(http://\S+)`,
+	})
+	add(ocCmd, ocPort, embed.Spec{
+		Name: "opencode", Title: "OpenCode",
+		Args:       []string{"web", "--port", "{port}", "--hostname", "127.0.0.1"},
+		HealthPath: "/",
+	})
+	add(kimiCmd, kimiPort, embed.Spec{
+		Name: "kimi", Title: "Kimi Code",
+		// TODO(Task 5): exact kimi web flags are unverified; {port}
+		// placeholder is required whichever form they take.
+		Args:       []string{"web", "--port", "{port}"},
+		HealthPath: "/",
+	})
+	return specs, mounts
 }
 
 // hookSockPath returns the Unix socket path for the hook listener.
