@@ -20,10 +20,11 @@ func TestEmbedSpecsAllEnabled(t *testing.T) {
 	if dsh.URLPattern == "" {
 		t.Error("dsh URLPattern empty; want a capture pattern for the start URL")
 	}
-	for _, a := range dsh.Args {
-		if a == "{port}" {
-			t.Error("dsh Args must not carry the {port} placeholder (dsh port is config-driven)")
-		}
+	if !hasArg(dsh.Args, "{port}") {
+		t.Errorf("dsh Args %v missing the {port} placeholder (--port is passed explicitly)", dsh.Args)
+	}
+	if !hasArg(dsh.Args, "127.0.0.1") {
+		t.Errorf("dsh Args %v must pin --host 127.0.0.1", dsh.Args)
 	}
 
 	oc := specs[1]

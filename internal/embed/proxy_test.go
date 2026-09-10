@@ -41,7 +41,30 @@ func TestProxyStripsFramingHeaders(t *testing.T) {
 		t.Errorf("X-Frame-Options = %q, want stripped", got)
 	}
 	if got := resp.Header.Get("Content-Security-Policy"); got != "" {
-		t.Errorf("Content-Security-Policy = %q, want stripped", got)
+		t.Errorf("Content-Security-Policy = %q, want stripped (only directive was frame-ancestors)", got)
+	}
+}
+
+func TestProxyKeepsCSPBeyondFrameAncestors(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.Handler())
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	want := "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+	if got := resp.Header.Get("Content-Security-Policy"); got != want {
+		t.Errorf("Content-Security-Policy = %q, want %q (frame-ancestors rewritten out)", got, want)
 	}
 }
 

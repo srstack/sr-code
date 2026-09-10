@@ -138,7 +138,9 @@ func serve(args []string) error {
 	dshPort := fs.Int("dsh-port", 7781, "usher-side port for the embedded dsh UI; 0 disables")
 	openCodeWebPort := fs.Int("opencode-web-port", 7782,
 		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
-	kimiCmd := fs.String("kimi", "kimi", "path to the kimi binary (embedded Kimi Code UI); empty disables")
+	kimiCmd := fs.String("kimi", "",
+		"path to the Moonshot kimi-cli binary (embedded Kimi Code web UI); empty disables. "+
+			"Off by default: the \"kimi\" on PATH here is the unrelated kimi-code npm wrapper with no web UI")
 	kimiPort := fs.Int("kimi-port", 7783, "usher-side port for the embedded Kimi Code UI; 0 disables")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
@@ -516,12 +518,13 @@ func embedSpecs(dshCmd string, dshPort int, ocCmd string, ocPort int, kimiCmd st
 		specs = append(specs, spec)
 		mounts = append(mounts, web.EmbedMount{ListenPort: port})
 	}
-	// dsh binds 127.0.0.1:3080 by default; do NOT pass a port flag (its
-	// webserver port is config-file driven). If 3080 is taken, dsh's own
-	// error surfaces in the log — acceptable for v1.
+	// dsh web takes --host/--port (verified: dsh 0.1.5-rc.1 `dsh --profile
+	// web --help`). Pin both so it never collides with a user-run dsh on its
+	// config-file port (3080). It prints "dsh web: http://…/?token=…" — the
+	// URLPattern captures the token query for the iframe src.
 	add(dshCmd, dshPort, embed.Spec{
 		Name: "dsh", Title: "DeepSeek Harness",
-		Args:       []string{"--profile", "web", "--no-open"},
+		Args:       []string{"--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "{port}"},
 		HealthPath: "/", URLPattern: `(http://\S+)`,
 	})
 	add(ocCmd, ocPort, embed.Spec{
@@ -529,12 +532,15 @@ func embedSpecs(dshCmd string, dshPort int, ocCmd string, ocPort int, kimiCmd st
 		Args:       []string{"web", "--port", "{port}", "--hostname", "127.0.0.1"},
 		HealthPath: "/",
 	})
+	// Flags per Moonshot kimi-cli docs (`kimi web --port N --no-open`,
+	// loopback by default, prints an access URL carrying the auth token).
+	// NOTE: not smoke-tested — this machine's `kimi` on PATH is the
+	// unrelated whitesmith/kimi-code npm wrapper (no web subcommand), so
+	// the --kimi flag defaults to empty (disabled).
 	add(kimiCmd, kimiPort, embed.Spec{
 		Name: "kimi", Title: "Kimi Code",
-		// TODO(Task 5): exact kimi web flags are unverified; {port}
-		// placeholder is required whichever form they take.
-		Args:       []string{"web", "--port", "{port}"},
-		HealthPath: "/",
+		Args:       []string{"web", "--no-open", "--port", "{port}"},
+		HealthPath: "/", URLPattern: `(http://\S+)`,
 	})
 	return specs, mounts
 }
