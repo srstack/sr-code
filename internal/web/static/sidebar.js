@@ -212,6 +212,8 @@ export function updateSidebarActive() {
   let sessionKey = '';
   if (hash.startsWith('#/s/')) {
     sessionKey = 's:' + decodeURIComponent(hash.slice(4));
+  } else if (hash.startsWith('#/ui/')) {
+    sessionKey = 'ui:' + decodeURIComponent(hash.slice(5));
   }
   document.querySelectorAll('#sidebar a[data-route]').forEach(a => {
     a.classList.toggle('active', a.dataset.route === sessionKey);

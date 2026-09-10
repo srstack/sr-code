@@ -8,11 +8,16 @@ import { showList, loadList } from './list.js';
 import { showDetail, showNewSession, showMainChat } from './detail.js';
 import { pollInteractions } from './interaction.js';
 import { initServiceWorker } from './push.js';
+import { loadEmbeds, showEmbed, leaveEmbed } from './embedview.js';
 
 window.addEventListener('hashchange', route);
 
 function route() {
   const hash = location.hash || '#/';
+  // Embedded agent UIs take over the whole main wrap (no header chrome);
+  // the body class is what style.css keys the header-hiding rule off.
+  document.body.classList.toggle('embed-route', hash.startsWith('#/ui/'));
+  if (!hash.startsWith('#/ui/')) leaveEmbed();
   if (hash === '#/' || hash === '') {
     showList();
   } else if (hash === '#/new') {
@@ -24,6 +29,8 @@ function route() {
     showMainChat(id);
   } else if (hash.startsWith('#/s/')) {
     showDetail(decodeURIComponent(hash.slice(4)));
+  } else if (hash.startsWith('#/ui/')) {
+    showEmbed(decodeURIComponent(hash.slice('#/ui/'.length)));
   }
   updateSidebarActive();
 }
@@ -33,6 +40,11 @@ pollInteractions();
 
 setInterval(loadSidebar, 5000);
 loadSidebar();
+
+// Embedded agent UIs change rarely (a child flip to ready is the only live
+// transition), so a slow 30s poll suffices — no SSE.
+setInterval(loadEmbeds, 30000);
+loadEmbeds();
 
 route();
 
