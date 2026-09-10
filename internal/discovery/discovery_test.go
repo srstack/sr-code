@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -11,8 +12,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/nexustar/usher/internal/core"
 )
+
+// writeZstFile zstd-compresses content into path, mirroring how Codex ≥0.137
+// stores cold rollouts (.jsonl.zst).
+func writeZstFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func newTestDiscovery(t *testing.T, root string) *Discovery {
 	t.Helper()
@@ -225,7 +251,8 @@ func TestDiscovery_RebindsToNewerDuplicateMirror(t *testing.T) {
 	}
 }
 
-func TestDiscovery_Remove(t *testing.T) {	tmp := t.TempDir()
+func TestDiscovery_Remove(t *testing.T) {
+	tmp := t.TempDir()
 	path := filepath.Join(tmp, "-tmp-x", "abc.jsonl")
 	writeJSONL(t, path, "abc", "/tmp/x", "hi")
 
@@ -441,6 +468,65 @@ func TestDiscovery_WatchPicksUpNestedMkdirAll(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("codex session in new month dir not discovered; list=%v", d.List())
+}
+
+// TestDiscovery_CodexZstAndArchived covers Codex ≥0.137's cold-storage
+// layout: rollouts are zstd-compressed in place (.jsonl.zst) and eventually
+// moved to a sibling archived_sessions root (registered as a second
+// CodexSource). Discovery must list .zst rollouts and archived sessions, and
+// a rollout present in both plain and compressed forms must appear once,
+// bound to the plain .jsonl (the live/materialized file).
+func TestDiscovery_CodexZstAndArchived(t *testing.T) {
+	live := t.TempDir()
+	archived := t.TempDir()
+
+	const (
+		uuidBoth    = "11111111-2222-3333-4444-555555555555"
+		uuidZstOnly = "66666666-7777-4888-8999-000000000000"
+		uuidArchive = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+	)
+	rolloutFor := func(id string) string {
+		return `{"timestamp":"2026-06-14T00:00:00Z","type":"session_meta","payload":{"id":"` + id + `","cwd":"/tmp/proj","timestamp":"2026-06-14T00:00:00Z"}}` + "\n"
+	}
+
+	// Both forms of the same rollout id: dedupe to the plain .jsonl.
+	bothPlain := filepath.Join(live, "2026", "06", "14",
+		"rollout-2026-06-14T00-00-00-"+uuidBoth+".jsonl")
+	writeFile(t, bothPlain, rolloutFor(uuidBoth))
+	writeZstFile(t, bothPlain+".zst", rolloutFor(uuidBoth))
+	// Compressed-only rollout.
+	writeZstFile(t, filepath.Join(live, "2026", "06", "15",
+		"rollout-2026-06-15T00-00-00-"+uuidZstOnly+".jsonl.zst"), rolloutFor(uuidZstOnly))
+	// One rollout under the archived root.
+	writeFile(t, filepath.Join(archived, "2026", "05", "01",
+		"rollout-2026-05-01T00-00-00-"+uuidArchive+".jsonl"), rolloutFor(uuidArchive))
+
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)),
+		NewCodexSource(live), NewCodexSource(archived))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+	if err := d.scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := d.List()
+	if len(got) != 3 {
+		t.Fatalf("got %d sessions, want 3 (both-forms deduped); %+v", len(got), got)
+	}
+	byID := map[string]bool{}
+	for _, s := range got {
+		byID[s.ID] = true
+	}
+	for _, want := range []string{uuidBoth, uuidZstOnly, uuidArchive} {
+		if !byID[want] {
+			t.Errorf("missing session %q", want)
+		}
+	}
+	if p, ok := d.Path(uuidBoth); !ok || p != bothPlain {
+		t.Errorf("Path(%q) = %q ok=%v, want plain .jsonl %q", uuidBoth, p, ok, bothPlain)
+	}
 }
 
 func TestDiscovery_ListSorted(t *testing.T) {

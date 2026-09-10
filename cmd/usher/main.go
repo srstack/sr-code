@@ -227,6 +227,14 @@ func serve(args []string) error {
 	}
 	if dir := *codexSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewCodexSource(dir))
+		// Codex moves cold rollouts to a sibling archived_sessions tree (same
+		// YYYY/MM/DD layout); scan it as a second root of the same source so
+		// archived sessions stay listed. Only when it exists — it appears the
+		// first time Codex archives something.
+		if archived := filepath.Join(filepath.Dir(dir), "archived_sessions"); isDir(archived) {
+			sources = append(sources, discovery.NewCodexSource(archived))
+			logger.Info("codex archived sessions enabled", "sessions_dir", archived)
+		}
 		modelsPath := filepath.Join(filepath.Dir(dir), "models_cache.json")
 		codexCfgPath := filepath.Join(filepath.Dir(dir), "config.toml")
 		backends["codex"] = backend.Backend{Runtime: sender.NewCodex(*codexCmd, dir, *tmuxSocket+"-codex", hookSockPath(*dataDir), strings.Fields(*codexArgs), *maxLiveSessions, !*disableUsherTools, h, logger), Transcript: transcript.Codex{}, Forker: transcript.CodexForker{}, Models: &modelcatalog.Codex{Path: modelsPath, ConfigPath: codexCfgPath}}

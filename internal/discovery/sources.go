@@ -126,15 +126,27 @@ func NewCodexSource(root string) CodexSource { return CodexSource{root: root} }
 func (s CodexSource) Backend() string { return "codex" }
 func (s CodexSource) Root() string    { return s.root }
 
-// IsSessionFile accepts rollout files by their name (rollout-…-<uuid>.jsonl).
-// Codex keeps archived sessions under a sibling ~/.codex/archived_sessions, a
-// different root that is simply not scanned, so every rollout under Root is a
-// live session.
+// IsSessionFile accepts rollout files by their name, both plain
+// (rollout-…-<uuid>.jsonl) and zstd-compressed (.jsonl.zst, Codex ≥0.137
+// compresses cold rollouts in place). When both forms of the same rollout id
+// exist, the plain .jsonl is the live/materialized file, so a .zst whose
+// plain sibling exists is not a session file — dedupe by rollout-id stem,
+// never list twice. Codex eventually moves cold rollouts to a sibling
+// ~/.codex/archived_sessions tree (same layout); main wires that as a second
+// CodexSource instance rather than widening the single-Root Source contract.
 func (s CodexSource) IsSessionFile(path string) bool {
 	base := filepath.Base(path)
-	return strings.HasPrefix(base, "rollout-") &&
-		strings.HasSuffix(base, ".jsonl") &&
-		codexrollout.SessionIDFromPath(base) != ""
+	if !strings.HasPrefix(base, "rollout-") || codexrollout.SessionIDFromPath(base) == "" {
+		return false
+	}
+	if strings.HasSuffix(base, ".jsonl") {
+		return true
+	}
+	if strings.HasSuffix(base, ".jsonl.zst") {
+		_, err := os.Stat(strings.TrimSuffix(path, ".zst"))
+		return err != nil
+	}
+	return false
 }
 
 func (s CodexSource) SessionID(path string) string {
