@@ -1,11 +1,14 @@
 package jsonl
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexustar/usher/internal/core"
 )
 
 func TestParseLine_User(t *testing.T) {
@@ -535,6 +538,60 @@ func TestReadSessionMetaUsesLatestClaudeContext(t *testing.T) {
 	u := meta.Runtime
 	if u.ContextTokens != 30 || u.Model != "claude-opus-4-6" {
 		t.Fatalf("usage = %+v", u)
+	}
+}
+
+// TestReadTurns_PerTurnUsage pins the per-turn usage contract: an assistant
+// message's message.usage maps onto Turn.Usage (input_tokens→Input,
+// output_tokens→Output, cache_read_input_tokens→CacheRead,
+// cache_creation_input_tokens→CacheWrite); a turn spanning several assistant
+// messages carries the SUM across them; a turn with no usage keeps nil.
+func TestReadTurns_PerTurnUsage(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "session.jsonl")
+	data := strings.Join([]string{
+		`{"type":"user","timestamp":"2026-09-01T10:00:00.000Z","message":{"role":"user","content":"hi"}}`,
+		`{"type":"assistant","timestamp":"2026-09-01T10:00:05.000Z","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":50,"cache_creation_input_tokens":5},"content":[{"type":"text","text":"one"}]}}`,
+		`{"type":"assistant","timestamp":"2026-09-01T10:00:07.000Z","message":{"role":"assistant","usage":{"input_tokens":200,"output_tokens":20},"content":[{"type":"text","text":"two"}]}}`,
+		`{"type":"user","timestamp":"2026-09-01T10:00:10.000Z","message":{"role":"user","content":"again"}}`,
+		`{"type":"assistant","timestamp":"2026-09-01T10:00:15.000Z","message":{"role":"assistant","content":[{"type":"text","text":"no usage here"}]}}`,
+	}, "\n")
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	turns, _, err := ReadTurns(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 4 {
+		t.Fatalf("got %d turns, want 4: %+v", len(turns), turns)
+	}
+	u := turns[1].Usage
+	if u == nil {
+		t.Fatalf("turns[1].Usage is nil, want summed usage")
+	}
+	want := core.TokenUsage{Input: 300, Output: 30, CacheRead: 50, CacheWrite: 5}
+	if *u != want {
+		t.Errorf("turns[1].Usage = %+v, want %+v (sum across the turn's assistant messages)", *u, want)
+	}
+	if turns[3].Usage != nil {
+		t.Errorf("turns[3].Usage = %+v, want nil (no usage in any message)", turns[3].Usage)
+	}
+
+	// The wire names are a frontend contract: input/output/cache_read/
+	// cache_write, with the cache fields omitted when zero.
+	raw, err := json.Marshal(turns[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Usage map[string]int64 `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := wire.Usage; got["input"] != 300 || got["output"] != 30 ||
+		got["cache_read"] != 50 || got["cache_write"] != 5 {
+		t.Errorf("wire usage = %v", got)
 	}
 }
 

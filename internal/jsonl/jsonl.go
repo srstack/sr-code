@@ -217,6 +217,48 @@ func messageModel(msg json.RawMessage) string {
 	return m.Model
 }
 
+// messageUsage maps a Claude message.usage block onto core.TokenUsage, or nil
+// when the message carries no usage object. The field mapping matches the
+// session-level path in updateClaudeRuntime; opencode shadow sessions write
+// the same shape, so they flow through here unchanged.
+func messageUsage(msg json.RawMessage) *core.TokenUsage {
+	var m struct {
+		Usage *struct {
+			Input         int64 `json:"input_tokens"`
+			Output        int64 `json:"output_tokens"`
+			CacheRead     int64 `json:"cache_read_input_tokens"`
+			CacheCreation int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil || m.Usage == nil {
+		return nil
+	}
+	return &core.TokenUsage{
+		Input:      m.Usage.Input,
+		Output:     m.Usage.Output,
+		CacheRead:  m.Usage.CacheRead,
+		CacheWrite: m.Usage.CacheCreation,
+	}
+}
+
+// addUsage sums one assistant message's usage into the turn's running total
+// (usher's display unit is the turn; a turn spanning several assistant
+// messages carries their sum).
+func addUsage(t *Turn, msg json.RawMessage) {
+	u := messageUsage(msg)
+	if u == nil {
+		return
+	}
+	if t.Usage == nil {
+		t.Usage = u
+		return
+	}
+	t.Usage.Input += u.Input
+	t.Usage.Output += u.Output
+	t.Usage.CacheRead += u.CacheRead
+	t.Usage.CacheWrite += u.CacheWrite
+}
+
 // extractUserContent pulls a representative text from a user message body. The
 // body's content can be either a plain string or an array of content blocks.
 func extractUserContent(msg json.RawMessage) string {
@@ -379,6 +421,7 @@ func (a *Assembler) Feed(ev Event) (completed []Turn, part *TurnPart) {
 	a.cur.Touch(ev.Timestamp)
 
 	if ev.Type == "assistant" {
+		addUsage(a.cur, ev.Message)
 		// Collect tool_use id→info for later matching, and stand up an empty
 		// card for each call so long-running tools are visible while running
 		// instead of appearing only when they finish.
@@ -505,6 +548,7 @@ func (a *Assembler) FeedLineParts(raw []byte) (completed []Turn, parts []*TurnPa
 		a.cur.UUID = ev.UUID
 	}
 	a.cur.Touch(ev.Timestamp)
+	addUsage(a.cur, ev.Message)
 	// Empty tool cards first so running tools are visible immediately; the
 	// result replaces them in place when it lands.
 	before := len(a.cur.Parts)

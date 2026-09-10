@@ -57,6 +57,15 @@ func (t *Turn) StampPartDurations() {
 	}
 }
 
+// TokenUsage is one turn's token accounting, mapped from the backend's
+// per-message usage records. The JSON names are a frontend contract.
+type TokenUsage struct {
+	Input      int64 `json:"input"`
+	Output     int64 `json:"output"`
+	CacheRead  int64 `json:"cache_read,omitempty"`
+	CacheWrite int64 `json:"cache_write,omitempty"`
+}
+
 // Turn is a grouped, display-ready timeline entry shared by every backend.
 type Turn struct {
 	Role    string     `json:"role"`
@@ -65,7 +74,11 @@ type Turn struct {
 	Time    time.Time  `json:"ts"`
 	Model   string     `json:"model,omitempty"`
 	UUID    string     `json:"uuid,omitempty"`
-	EndTime time.Time  `json:"-"`
+	// Usage is the turn's token accounting: the SUM across the turn's
+	// assistant messages (usher's display unit is the turn, not the
+	// message). Nil when no message in the turn carried usage.
+	Usage   *TokenUsage `json:"usage,omitempty"`
+	EndTime time.Time   `json:"-"`
 }
 
 // Touch advances the server-side end timestamp when ts is usable.
