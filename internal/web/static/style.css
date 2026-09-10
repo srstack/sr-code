@@ -2762,3 +2762,44 @@ body.embed-route .main-wrap > header { display: none; }
 .traj-span-err { background: var(--danger-text); opacity: 1; }
 
 .traj-dimrow { opacity: 0.35; }
+
+/* ===== Transcript typography polish (dsh-inspired) =====
+ * Append-only refinements to the chat content column and to markdown
+ * rendered inside .content. Deliberately NOT touched: the trajectory view
+ * (.traj-root is a full-width sibling of .chat-area inside .detail-col),
+ * the files panel (sits beside the column in .detail-row), the terminal
+ * drawer (full-width below .chat-area), and the embed iframe route
+ * (.embed-view fills its own route). The composer lives in .send-anchor
+ * inside .chat-area, so it follows the column automatically.
+ */
+
+/* Chat content column: a touch wider than the shared --content-max the
+ * session list uses — rendered tables and side-by-side diffs read better
+ * at 800px — while keeping the same centered-padding technique. The list
+ * route keeps --content-max; this override is chat-only. */
+:root { --chat-max: 800px; }
+.chat-area {
+  padding-inline: max(var(--space-6), calc((100% - var(--chat-max)) / 2));
+}
+
+/* Markdown tables: the global table rules are written for the session
+ * list (clickable rows, small-caps header chrome) and leak into rendered
+ * markdown. Give .content tables a plain reading: normal-case header in
+ * full ink, no pointer cursor, no row hover. */
+.content tbody tr { cursor: default; }
+.content tbody tr:hover { background: transparent; }
+.content th {
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* Heading scale inside assistant text: h3-h6 previously sat within ~4% of
+ * the 0.94rem body size, flattening the hierarchy. A modest step-up reads
+ * as structure without shouting; weight/letter-spacing stay inherited
+ * from the base .content h1-h6 rule. */
+.content h2 { font-size: 1.12rem; }
+.content h3 { font-size: 1rem; }
+.content h4, .content h5, .content h6 { font-size: 0.94rem; }
