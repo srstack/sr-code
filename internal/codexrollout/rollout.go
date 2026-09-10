@@ -21,6 +21,7 @@ package codexrollout
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/nexustar/usher/internal/core"
 )
 
@@ -144,7 +146,7 @@ func IsTurnActivity(raw []byte) bool {
 // session_meta header, last-activity from the final timestamped line, and a
 // title from the first real user prompt.
 func ReadSessionMeta(path string) (core.SessionMeta, error) {
-	f, err := os.Open(path)
+	f, err := openRollout(path)
 	if err != nil {
 		return core.SessionMeta{}, err
 	}
@@ -248,7 +250,7 @@ func ReadSessionMeta(path string) (core.SessionMeta, error) {
 // matching jsonl.ReadTurns' contract (limit>0 keeps the most recent N; total is
 // the count before trimming).
 func ReadTurns(path string, limit int) (turns []core.Turn, total int, err error) {
-	f, err := os.Open(path)
+	f, err := openRollout(path)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -898,7 +900,7 @@ func userMessage(payload json.RawMessage) (string, bool) {
 // carrying a UserMessage item (the paginated rollouts' user-prompt stream).
 func completedUserMessage(payload json.RawMessage) (string, bool) {
 	var p struct {
-		Type string         `json:"type"`
+		Type string        `json:"type"`
 		Item completedItem `json:"item"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil || p.Type != "item_completed" || p.Item.Type != "UserMessage" {
@@ -1024,8 +1026,56 @@ func prettyToolName(name string) string {
 	}
 }
 
-func newScanner(f *os.File) *bufio.Scanner {
-	sc := bufio.NewScanner(f)
+// openRollout opens a rollout file, transparently decoding zstd when the
+// path ends .zst (Codex ≥0.137 compresses cold rollouts to .jsonl.zst).
+// Caller closes the returned ReadCloser.
+func openRollout(path string) (io.ReadCloser, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasSuffix(path, ".zst") {
+		return f, nil
+	}
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &zstRollout{r: tornTail{zr.IOReadCloser()}, zr: zr, f: f}, nil
+}
+
+// zstRollout couples a zstd decoder to the file it reads so Close releases
+// both (the decoder's own Close leaves the underlying reader alone).
+type zstRollout struct {
+	r  io.Reader
+	zr *zstd.Decoder
+	f  *os.File
+}
+
+func (z *zstRollout) Read(p []byte) (int, error) { return z.r.Read(p) }
+
+func (z *zstRollout) Close() error {
+	z.zr.Close()
+	return z.f.Close()
+}
+
+// tornTail turns a truncated final zstd frame into a clean EOF, mirroring how
+// the plain path tolerates a torn trailing line: the decoder has already
+// emitted every complete frame, and the partial tail — like a partial last
+// line — is dropped by the JSON parse downstream.
+type tornTail struct{ r io.Reader }
+
+func (t tornTail) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func newScanner(r io.Reader) *bufio.Scanner {
+	sc := bufio.NewScanner(r)
 	// session_meta (base_instructions) and large tool outputs blow past 64K.
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	return sc

@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0
+	github.com/klauspost/compress v1.20.0
 	golang.org/x/crypto v0.51.0
 	golang.org/x/term v0.43.0
 	modernc.org/sqlite v1.56.0

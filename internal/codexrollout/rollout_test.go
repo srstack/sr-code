@@ -1,12 +1,15 @@
 package codexrollout
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/nexustar/usher/internal/core"
 )
 
@@ -462,6 +465,102 @@ func TestAssemblerCustomWrapperDeduplicatesCanonicalPatch(t *testing.T) {
 	if part == nil || turn == nil || len(turn.Parts) != 1 || turn.Parts[0].ToolName != "Edit" {
 		t.Fatalf("canonical patch dedup failed: part=%+v turn=%+v", part, turn)
 	}
+}
+
+// Codex ≥0.137 compresses cold rollouts to .jsonl.zst; the reader must
+// transparently decode them to the same turns/meta as the plain file.
+func TestReadTurnsZstRollout(t *testing.T) {
+	plain, err := os.ReadFile(toolFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeZstRollout(t, plain)
+
+	wantTurns, wantTotal, err := ReadTurns(toolFixture, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotTurns, gotTotal, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTotal != wantTotal || len(gotTurns) != len(wantTurns) {
+		t.Fatalf("zst turns = %d (total %d), want %d (total %d)", len(gotTurns), gotTotal, len(wantTurns), wantTotal)
+	}
+	for i := range wantTurns {
+		if !reflect.DeepEqual(gotTurns[i], wantTurns[i]) {
+			t.Errorf("turn %d differs:\n got %+v\nwant %+v", i, gotTurns[i], wantTurns[i])
+		}
+	}
+
+	wantMeta, err := ReadSessionMeta(toolFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotMeta, err := ReadSessionMeta(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMeta != wantMeta {
+		t.Errorf("zst meta = %+v, want %+v", gotMeta, wantMeta)
+	}
+}
+
+// A torn trailing zstd frame (e.g. a live rollout mid-write) must degrade the
+// way a torn trailing plain line does: no error, the valid prefix returned.
+func TestReadTurnsZstTornTail(t *testing.T) {
+	plain, err := os.ReadFile(toolFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeZstRollout(t, plain)
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, fi.Size()-7); err != nil {
+		t.Fatal(err)
+	}
+
+	turns, _, err := ReadTurns(path, 0)
+	if err != nil {
+		t.Fatalf("torn zst tail: %v", err)
+	}
+	if len(turns) == 0 {
+		t.Fatal("torn zst tail returned no turns, want the decoded prefix")
+	}
+	if turns[0].Role != "user" || !strings.Contains(turns[0].Content, "how many lines") {
+		t.Errorf("prefix turn 0 = %+v, want the user prompt", turns[0])
+	}
+}
+
+// writeZstRollout zstd-compresses data into a temp file named like a Codex
+// compressed rollout and returns its path. It flushes per line the way a
+// streaming writer does, so a truncated tail only loses the trailing chunk.
+func writeZstRollout(t *testing.T, data []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ln := range strings.SplitAfter(string(data), "\n") {
+		if _, err := zw.Write([]byte(ln)); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "rollout-2026-06-13T15-32-29-019ec19c-f453-7153-a442-3d7239446e01.jsonl.zst")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestReadSessionMetaUsesLatestCodexUsageSnapshot(t *testing.T) {
