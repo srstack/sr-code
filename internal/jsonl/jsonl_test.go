@@ -537,3 +537,32 @@ func TestReadSessionMetaUsesLatestClaudeContext(t *testing.T) {
 		t.Fatalf("usage = %+v", u)
 	}
 }
+
+// TestReasoningEffortFieldTolerated pins compat with claude 2026-Q3, whose
+// assistant lines stamp a reasoningEffort field. Tolerant struct parsing must
+// ignore it: model, usage, and text extraction are unchanged.
+func TestReasoningEffortFieldTolerated(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "session.jsonl")
+	data := strings.Join([]string{
+		`{"type":"user","timestamp":"2026-09-01T10:00:00.000Z","message":{"role":"user","content":"hi"}}`,
+		`{"type":"assistant","reasoningEffort":"high","timestamp":"2026-09-01T10:00:05.000Z","message":{"id":"m1","model":"claude-opus-4-6","reasoningEffort":"high","usage":{"input_tokens":13,"output_tokens":17},"content":[{"type":"text","text":"hello"}]}}`,
+	}, "\n")
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadSessionMeta(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Runtime.Model != "claude-opus-4-6" || meta.Runtime.ContextTokens != 30 {
+		t.Fatalf("runtime = %+v", meta.Runtime)
+	}
+	turns, _, err := ReadTurns(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 2 || turns[1].Model != "claude-opus-4-6" ||
+		len(turns[1].Parts) != 1 || turns[1].Parts[0].Content != "hello" {
+		t.Fatalf("turns = %+v", turns)
+	}
+}

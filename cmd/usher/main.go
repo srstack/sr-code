@@ -143,7 +143,8 @@ func serve(args []string) error {
 			"Off by default: the \"kimi\" on PATH here is the unrelated kimi-code npm wrapper with no web UI")
 	kimiPort := fs.Int("kimi-port", 7783, "usher-side port for the embedded Kimi Code UI; 0 disables")
 	permissionMode := fs.String("permission-mode", "default",
-		"--permission-mode passed to claude (default|acceptEdits|bypassPermissions|plan)")
+		"--permission-mode passed to claude (default|manual|acceptEdits|bypassPermissions|plan); "+
+			"claude 2.1.200 renamed default→manual, both names still accepted")
 	tmuxSocket := fs.String("tmux-socket", "usher",
 		"tmux socket prefix for session terminals")
 	terminalShell := fs.String("terminal-shell", defaultTerminalShell(),
