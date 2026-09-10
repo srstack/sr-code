@@ -529,6 +529,53 @@ func TestDiscovery_CodexZstAndArchived(t *testing.T) {
 	}
 }
 
+// TestDiscovery_RemoveRebindsToZstTwin covers Codex ≥0.137's in-place
+// compression event sequence: the plain rollout is live, Codex writes
+// X.jsonl.zst (skipped while its plain sibling exists) and then deletes
+// X.jsonl. No further event fires for the surviving .zst, so remove must
+// rebind the session to the compressed twin instead of unlisting it.
+func TestDiscovery_RemoveRebindsToZstTwin(t *testing.T) {
+	root := t.TempDir()
+	id := codexUUID
+	plain := filepath.Join(root, "2026", "06", "14",
+		"rollout-2026-06-14T00-00-00-"+id+".jsonl")
+
+	d, err := NewMulti(slog.New(slog.NewTextHandler(io.Discard, nil)), NewCodexSource(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.watcher.Close() })
+
+	// 1. Plain rollout created (live session).
+	writeFile(t, plain, codexRollout)
+	d.upsert(plain)
+	if got, ok := d.Path(id); !ok || got != plain {
+		t.Fatalf("after plain create: path = %q ok=%v, want %q", got, ok, plain)
+	}
+
+	// 2. Codex compresses in place: X.jsonl.zst appears, but is skipped while
+	// its plain sibling exists.
+	writeZstFile(t, plain+".zst", codexRollout)
+	d.upsert(plain + ".zst")
+	if got, _ := d.Path(id); got != plain {
+		t.Fatalf("after zst create: path = %q, want still %q", got, plain)
+	}
+
+	// 3. Codex deletes the plain file. The session must stay listed, rebound
+	// to the surviving .zst.
+	if err := os.Remove(plain); err != nil {
+		t.Fatal(err)
+	}
+	d.remove(plain)
+
+	if _, ok := d.Get(id); !ok {
+		t.Fatalf("session %q unlisted after plain rollout removed", id)
+	}
+	if got, ok := d.Path(id); !ok || got != plain+".zst" {
+		t.Errorf("path = %q ok=%v, want rebound to %q", got, ok, plain+".zst")
+	}
+}
+
 func TestDiscovery_ListSorted(t *testing.T) {
 	tmp := t.TempDir()
 	older := filepath.Join(tmp, "-p", "older.jsonl")

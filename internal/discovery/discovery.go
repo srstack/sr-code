@@ -48,9 +48,9 @@ func NewMulti(logger *slog.Logger, sources ...Source) (*Discovery, error) {
 		logger = slog.Default()
 	}
 	return &Discovery{
-		sources:  sources,
-		logger:   logger,
-		watcher:  w,
+		sources:        sources,
+		logger:         logger,
+		watcher:        w,
 		sessions:       map[string]core.Session{},
 		paths:          map[string]string{},
 		pendingUpserts: map[string]*time.Timer{},
@@ -313,9 +313,23 @@ func applySubagentMeta(sess *core.Session, meta core.SessionMeta) {
 }
 
 func (d *Discovery) remove(path string) {
-	if src := d.sourceFor(path); src != nil {
-		d.Remove(src.SessionID(path))
+	src := d.sourceFor(path)
+	if src == nil {
+		return
 	}
+	// Codex ≥0.137 compresses rollouts in place: it writes X.jsonl.zst (skipped
+	// while the plain sibling exists) and then deletes X.jsonl. No event fires
+	// for the surviving .zst, so removing outright would unlist the session
+	// until the next scan — rebind to the alternate form instead.
+	if strings.HasSuffix(path, ".jsonl") {
+		if twin := path + ".zst"; src.IsSessionFile(twin) {
+			if _, err := os.Stat(twin); err == nil {
+				d.upsert(twin)
+				return
+			}
+		}
+	}
+	d.Remove(src.SessionID(path))
 }
 
 // Remove forgets a session by id. fsnotify would pick a file deletion up
