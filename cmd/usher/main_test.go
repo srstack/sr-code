@@ -5,7 +5,7 @@ import (
 )
 
 func TestEmbedSpecsAllEnabled(t *testing.T) {
-	specs, mounts := embedSpecs("dsh", 7781, "/home/user/project", "opencode", 7782, "kimi", 7783)
+	specs, mounts := embedSpecs("dsh", 7781, "/home/user/project", "opencode", 7782, "/home/user/oc-project", "kimi", 7783)
 	if len(specs) != 3 || len(mounts) != 3 {
 		t.Fatalf("got %d specs, %d mounts; want 3 each", len(specs), len(mounts))
 	}
@@ -33,6 +33,9 @@ func TestEmbedSpecsAllEnabled(t *testing.T) {
 	oc := specs[1]
 	if oc.Name != "opencode" || oc.Title != "OpenCode" || oc.Cmd != "opencode" {
 		t.Errorf("opencode spec identity wrong: %+v", oc)
+	}
+	if oc.Dir != "/home/user/oc-project" {
+		t.Errorf("opencode Dir = %q, want /home/user/oc-project", oc.Dir)
 	}
 	if !hasArg(oc.Args, "{port}") {
 		t.Errorf("opencode Args %v missing the {port} placeholder", oc.Args)
@@ -70,7 +73,7 @@ func TestEmbedSpecsDisabled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			specs, mounts := embedSpecs(
 				tc.args[0].(string), tc.args[1].(int), "",
-				tc.args[2].(string), tc.args[3].(int),
+				tc.args[2].(string), tc.args[3].(int), "",
 				tc.args[4].(string), tc.args[5].(int),
 			)
 			if len(specs) != tc.want {

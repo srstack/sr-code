@@ -140,6 +140,8 @@ func serve(args []string) error {
 		"working directory for the embedded dsh child; dsh scopes its session list to the cwd workspace, so set this to the project you usually run dsh in (empty inherits usher's cwd)")
 	openCodeWebPort := fs.Int("opencode-web-port", 7782,
 		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
+	openCodeDir := fs.String("opencode-dir", "",
+		"working directory for the embedded opencode child; opencode's web UI shows sessions of the cwd project, so set this to your main project (empty inherits usher's cwd)")
 	kimiCmd := fs.String("kimi", "",
 		"path to the Moonshot kimi-cli binary (embedded Kimi Code web UI); empty disables. "+
 			"Off by default: the \"kimi\" on PATH here is the unrelated kimi-code npm wrapper with no web UI")
@@ -384,7 +386,7 @@ func serve(args []string) error {
 	// Their lifetimes are bound to ctx (CommandContext kills them on
 	// shutdown); a missing binary or failed start just skips that embed.
 	var embedMounts []web.EmbedMount
-	specs, mounts := embedSpecs(*dshCmd, *dshPort, *dshDir, *openCodeCmd, *openCodeWebPort, *kimiCmd, *kimiPort)
+	specs, mounts := embedSpecs(*dshCmd, *dshPort, *dshDir, *openCodeCmd, *openCodeWebPort, *openCodeDir, *kimiCmd, *kimiPort)
 	for i, spec := range specs {
 		proc, err := embed.Start(ctx, spec, logger)
 		if err != nil {
@@ -518,7 +520,7 @@ var _ pluginapi.RouterAPI = (*router.Router)(nil)
 // usher-side listen ports. A UI is included only when its binary name is
 // non-empty AND its port is non-zero. Mounts are returned aligned with
 // specs; Process is filled in by serve() once each child starts.
-func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort int, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
+func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort int, ocDir string, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
 	var specs []embed.Spec
 	var mounts []web.EmbedMount
 	add := func(cmd string, port int, spec embed.Spec) {
@@ -543,6 +545,7 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		Name: "opencode", Title: "OpenCode",
 		Args:       []string{"web", "--port", "{port}", "--hostname", "127.0.0.1"},
 		HealthPath: "/",
+		Dir:        ocDir,
 	})
 	// Flags per Moonshot kimi-cli docs (`kimi web --port N --no-open`,
 	// loopback by default, prints an access URL carrying the auth token).
