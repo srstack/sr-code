@@ -46,9 +46,9 @@ needed, vendor a popular, self-contained, minimal one.
   exception is one tmux shell per conversation, opened in its cwd and limited
   to keystroke-level input (typed text, pasted text, and an allow-listed set
   of tmux control keys) — whole-line submit is a convenience on top. It is
-  not a filesystem API or security boundary. Directory listings are
-  read-only and fenced to the session's cwd (one endpoint, entry-capped,
-  no file contents, no navigation beyond the fence) — they exist to
+  not a filesystem API or security boundary. Directory listings and a
+  read-only file preview are fenced to the session's cwd (entry/size-capped,
+  no editing, no navigation beyond the fence) — they exist to
   render references in the transcript's own workspace, not to browse the
   machine. Still decided and out of scope: diff views, syntax
   highlighting, path linkification in prose, a native VSCode extension.

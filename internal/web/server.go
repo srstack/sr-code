@@ -12,6 +12,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -285,6 +286,7 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/sessions/{id}/terminal/screen", s.handleTerminalScreen)
 	webMux.HandleFunc("GET /api/sessions/{id}/image", s.handleSessionImage)
 	webMux.HandleFunc("GET /api/sessions/{id}/files", s.handleSessionFiles)
+	webMux.HandleFunc("GET /api/sessions/{id}/file", s.handleSessionFile)
 	webMux.HandleFunc("POST /api/sessions/{id}/upload", s.handleUpload)
 	webMux.HandleFunc("POST /api/sessions/{id}/terminal/control", s.handleTerminalControl)
 	webMux.HandleFunc("POST /api/sessions/{id}/auto-approve", s.handleAutoApprove)
@@ -1139,6 +1141,106 @@ func (s *Server) handleSessionFiles(w http.ResponseWriter, r *http.Request) {
 		"entries":   entries,
 		"truncated": truncated,
 	})
+}
+
+const (
+	maxFilePreviewBytes = 2 << 20 // 2 MiB read cap
+	maxFilePreviewLines = 5000
+	filePreviewSniffLen = 8192 // binary sniff window (NUL byte check)
+)
+
+// handleSessionFile returns a capped, read-only preview of one regular file
+// inside the session's working directory. Fenced by
+// pathutil.ResolveWithinDir like the listing endpoint. Binary files (NUL in
+// the sniff window) are rejected — images have their own endpoint. Content
+// is capped at maxFilePreviewBytes and maxFilePreviewLines; either cap sets
+// truncated. size always reports the full file size.
+func (s *Server) handleSessionFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.router.GetSession(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	rel := r.URL.Query().Get("path")
+	full, ok := pathutil.ResolveWithinDir(sess.Cwd, rel)
+	if !ok {
+		// ResolveWithinDir fails on escape AND on a missing target
+		// (EvalSymlinks). Report 404 only when the path is lexically
+		// inside the cwd and no entry exists there (Lstat, so a symlink
+		// escaping the fence still 400s).
+		p := rel
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(sess.Cwd, p)
+		}
+		rp, rerr := filepath.Rel(sess.Cwd, p)
+		if rerr == nil && rp != ".." && !strings.HasPrefix(rp, ".."+string(filepath.Separator)) {
+			if _, serr := os.Lstat(p); errors.Is(serr, os.ErrNotExist) {
+				writeErr(w, http.StatusNotFound, "file not found")
+				return
+			}
+		}
+		writeErr(w, http.StatusBadRequest, "outside workspace")
+		return
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "file not found")
+		return
+	}
+	if !info.Mode().IsRegular() {
+		writeErr(w, http.StatusBadRequest, "not a regular file")
+		return
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "file not found")
+		return
+	}
+	defer f.Close()
+	buf, err := io.ReadAll(io.LimitReader(f, maxFilePreviewBytes+1))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read failed")
+		return
+	}
+	truncated := false
+	if len(buf) > maxFilePreviewBytes {
+		buf = buf[:maxFilePreviewBytes]
+		truncated = true
+	}
+	sniff := buf
+	if len(sniff) > filePreviewSniffLen {
+		sniff = sniff[:filePreviewSniffLen]
+	}
+	if bytes.IndexByte(sniff, 0) >= 0 {
+		writeErr(w, http.StatusUnsupportedMediaType, "binary file")
+		return
+	}
+	content := strings.ToValidUTF8(string(buf), "�")
+	if i := afterLine(content, maxFilePreviewLines); i >= 0 && i < len(content) {
+		content = content[:i]
+		truncated = true
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":      rel,
+		"size":      info.Size(),
+		"truncated": truncated,
+		"content":   content,
+	})
+}
+
+// afterLine returns the byte offset just past the nth newline in s, or -1
+// if s holds fewer than n complete lines.
+func afterLine(s string, n int) int {
+	off := -1
+	for range n {
+		i := strings.IndexByte(s[off+1:], '\n')
+		if i < 0 {
+			return -1
+		}
+		off += i + 1
+	}
+	return off + 1
 }
 
 const (

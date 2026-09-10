@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexustar/usher/internal/backend"
@@ -214,5 +215,113 @@ func TestSessionFilesTruncation(t *testing.T) {
 	}
 	if len(body.Entries) != maxFileEntries {
 		t.Errorf("entries = %d, want cap %d", len(body.Entries), maxFileEntries)
+	}
+}
+
+type filePreview struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Truncated bool   `json:"truncated"`
+	Content   string `json:"content"`
+}
+
+func getFile(t *testing.T, s *Server, id, path string) (*httptest.ResponseRecorder, filePreview) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+id+"/file?path="+url.QueryEscape(path), nil)
+	req.SetPathValue("id", id)
+	s.handleSessionFile(rec, req)
+	var body filePreview
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("invalid JSON body %q: %v", rec.Body.String(), err)
+		}
+	}
+	return rec, body
+}
+
+func TestSessionFilePreview(t *testing.T) {
+	s, id, _ := newFilesTestServer(t)
+	rec, body := getFile(t, s, id, "go.mod")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if body.Path != "go.mod" {
+		t.Errorf("path = %q, want %q", body.Path, "go.mod")
+	}
+	if body.Content != "module example.com/proj\n" {
+		t.Errorf("content = %q", body.Content)
+	}
+	if body.Size != int64(len("module example.com/proj\n")) {
+		t.Errorf("size = %d, want %d", body.Size, len("module example.com/proj\n"))
+	}
+	if body.Truncated {
+		t.Error("small file should not be truncated")
+	}
+
+	rec, body = getFile(t, s, id, "cmd/main.go")
+	if rec.Code != http.StatusOK || body.Content != "package main\n" {
+		t.Errorf("nested: status = %d, content = %q", rec.Code, body.Content)
+	}
+}
+
+func TestSessionFileLineCap(t *testing.T) {
+	s, id, cwd := newFilesTestServer(t)
+	var sb strings.Builder
+	for i := 0; i < maxFilePreviewLines+100; i++ {
+		fmt.Fprintf(&sb, "line %d\n", i)
+	}
+	full := sb.String()
+	if err := os.WriteFile(filepath.Join(cwd, "big.txt"), []byte(full), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec, body := getFile(t, s, id, "big.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !body.Truncated {
+		t.Error("over-cap file should set truncated")
+	}
+	if n := strings.Count(body.Content, "\n"); n != maxFilePreviewLines {
+		t.Errorf("content lines = %d, want cap %d", n, maxFilePreviewLines)
+	}
+	if body.Size != int64(len(full)) {
+		t.Errorf("size = %d, want full file size %d", body.Size, len(full))
+	}
+}
+
+func TestSessionFileBinary(t *testing.T) {
+	s, id, cwd := newFilesTestServer(t)
+	if err := os.WriteFile(filepath.Join(cwd, "bin.dat"), []byte{'a', 'b', 0, 'c'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := getFile(t, s, id, "bin.dat")
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415 (body %q)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSessionFileFencing(t *testing.T) {
+	s, id, _ := newFilesTestServer(t)
+	// Outside the workspace (lexical or via escaping symlink).
+	for _, p := range []string{"..", "../../etc/passwd", "/etc/passwd", "escape"} {
+		rec, _ := getFile(t, s, id, p)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("path=%q: status = %d, want 400 (body %q)", p, rec.Code, rec.Body.String())
+		}
+	}
+	// A directory is not previewable.
+	rec, _ := getFile(t, s, id, "cmd")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("dir: status = %d, want 400 (body %q)", rec.Code, rec.Body.String())
+	}
+	// Missing file and unknown session.
+	rec, _ = getFile(t, s, id, "nope.txt")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("missing file: status = %d, want 404", rec.Code)
+	}
+	rec, _ = getFile(t, s, "no-such-session", "go.mod")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown session: status = %d, want 404", rec.Code)
 	}
 }
