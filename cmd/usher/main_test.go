@@ -5,7 +5,7 @@ import (
 )
 
 func TestEmbedSpecsAllEnabled(t *testing.T) {
-	specs, mounts := embedSpecs("dsh", 7781, "opencode", 7782, "kimi", 7783)
+	specs, mounts := embedSpecs("dsh", 7781, "/home/user/project", "opencode", 7782, "kimi", 7783)
 	if len(specs) != 3 || len(mounts) != 3 {
 		t.Fatalf("got %d specs, %d mounts; want 3 each", len(specs), len(mounts))
 	}
@@ -13,6 +13,9 @@ func TestEmbedSpecsAllEnabled(t *testing.T) {
 	dsh := specs[0]
 	if dsh.Name != "dsh" || dsh.Title != "DeepSeek Harness" || dsh.Cmd != "dsh" {
 		t.Errorf("dsh spec identity wrong: %+v", dsh)
+	}
+	if dsh.Dir != "/home/user/project" {
+		t.Errorf("dsh Dir = %q, want /home/user/project", dsh.Dir)
 	}
 	if dsh.HealthPath != "/" {
 		t.Errorf("dsh HealthPath = %q, want /", dsh.HealthPath)
@@ -66,7 +69,7 @@ func TestEmbedSpecsDisabled(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			specs, mounts := embedSpecs(
-				tc.args[0].(string), tc.args[1].(int),
+				tc.args[0].(string), tc.args[1].(int), "",
 				tc.args[2].(string), tc.args[3].(int),
 				tc.args[4].(string), tc.args[5].(int),
 			)

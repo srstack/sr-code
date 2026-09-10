@@ -36,6 +36,7 @@ type Spec struct {
 	Env        []string // extra KEY=VAL appended to os.Environ
 	HealthPath string   // HTTP path polled for readiness, e.g. "/"
 	URLPattern string   // regexp with one capture group; first stdout/stderr line matching yields the start URL (may carry ?token=). Empty = no capture.
+	Dir        string   // child working directory; empty inherits usher's. Agents scope their UI to the cwd workspace (dsh lists sessions per cwd).
 }
 
 // Process is a running embedded child.
@@ -80,6 +81,9 @@ func Start(ctx context.Context, spec Spec, logger *slog.Logger) (*Process, error
 	}
 	cmd := exec.CommandContext(ctx, spec.Cmd, args...)
 	cmd.Env = append(os.Environ(), spec.Env...)
+	if spec.Dir != "" {
+		cmd.Dir = spec.Dir
+	}
 
 	p := &Process{
 		spec:     spec,

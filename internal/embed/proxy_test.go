@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,37 @@ func TestProxyStripsFramingHeaders(t *testing.T) {
 	}
 	if got := resp.Header.Get("Content-Security-Policy"); got != "" {
 		t.Errorf("Content-Security-Policy = %q, want stripped (only directive was frame-ancestors)", got)
+	}
+}
+
+func TestProxyRewritesHostAndOrigin(t *testing.T) {
+	var gotHost, gotOrigin string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		gotOrigin = r.Header.Get("Origin")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.Handler())
+	defer proxy.Close()
+
+	req, _ := http.NewRequest("GET", proxy.URL+"/api/settings/describe", nil)
+	req.Host = "192.168.3.2:7781"
+	req.Header.Set("Origin", "http://192.168.3.2:7781")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	if gotHost != upstreamURL.Host {
+		t.Errorf("upstream saw Host = %q, want %q", gotHost, upstreamURL.Host)
+	}
+	if want := "http://" + upstreamURL.Host; gotOrigin != want {
+		t.Errorf("upstream saw Origin = %q, want %q", gotOrigin, want)
 	}
 }
 

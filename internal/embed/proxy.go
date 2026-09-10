@@ -17,6 +17,18 @@ import (
 func (p *Process) Handler() http.Handler {
 	target, _ := url.Parse(p.ChildURL())
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Children fence browser requests by Host/Origin (dsh's trustedHosts
+	// deputy defense). usher's auth middleware is the perimeter, and the
+	// child only ever sees loopback traffic — so present the upstream
+	// authority, exactly as a same-origin deployment would.
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		req.Host = target.Host
+		if req.Header.Get("Origin") != "" {
+			req.Header.Set("Origin", target.Scheme+"://"+target.Host)
+		}
+	}
 	proxy.ModifyResponse = func(r *http.Response) error {
 		r.Header.Del("X-Frame-Options")
 		if csp := r.Header.Get("Content-Security-Policy"); csp != "" {

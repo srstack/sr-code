@@ -136,6 +136,8 @@ func serve(args []string) error {
 		"usher-owned OpenCode 2 shadow transcript directory; empty uses <data-dir>/opencode2-sessions")
 	dshCmd := fs.String("dsh", "dsh", "path to the dsh binary (embedded DeepSeek Harness UI); empty disables")
 	dshPort := fs.Int("dsh-port", 7781, "usher-side port for the embedded dsh UI; 0 disables")
+	dshDir := fs.String("dsh-dir", "",
+		"working directory for the embedded dsh child; dsh scopes its session list to the cwd workspace, so set this to the project you usually run dsh in (empty inherits usher's cwd)")
 	openCodeWebPort := fs.Int("opencode-web-port", 7782,
 		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
 	kimiCmd := fs.String("kimi", "",
@@ -382,7 +384,7 @@ func serve(args []string) error {
 	// Their lifetimes are bound to ctx (CommandContext kills them on
 	// shutdown); a missing binary or failed start just skips that embed.
 	var embedMounts []web.EmbedMount
-	specs, mounts := embedSpecs(*dshCmd, *dshPort, *openCodeCmd, *openCodeWebPort, *kimiCmd, *kimiPort)
+	specs, mounts := embedSpecs(*dshCmd, *dshPort, *dshDir, *openCodeCmd, *openCodeWebPort, *kimiCmd, *kimiPort)
 	for i, spec := range specs {
 		proc, err := embed.Start(ctx, spec, logger)
 		if err != nil {
@@ -516,7 +518,7 @@ var _ pluginapi.RouterAPI = (*router.Router)(nil)
 // usher-side listen ports. A UI is included only when its binary name is
 // non-empty AND its port is non-zero. Mounts are returned aligned with
 // specs; Process is filled in by serve() once each child starts.
-func embedSpecs(dshCmd string, dshPort int, ocCmd string, ocPort int, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
+func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort int, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
 	var specs []embed.Spec
 	var mounts []web.EmbedMount
 	add := func(cmd string, port int, spec embed.Spec) {
@@ -535,6 +537,7 @@ func embedSpecs(dshCmd string, dshPort int, ocCmd string, ocPort int, kimiCmd st
 		Name: "dsh", Title: "DeepSeek Harness",
 		Args:       []string{"--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "{port}"},
 		HealthPath: "/", URLPattern: `(http://\S+)`,
+		Dir:        dshDir,
 	})
 	add(ocCmd, ocPort, embed.Spec{
 		Name: "opencode", Title: "OpenCode",
