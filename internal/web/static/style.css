@@ -2702,3 +2702,63 @@ body.embed-route .main-wrap > header { display: none; }
   cursor: pointer;
 }
 .traj-spacer { flex-shrink: 0; }
+
+/* --- Trajectory minimap + search --- */
+
+.traj-mode {
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--space-2);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.traj-mode:hover { background: var(--bg-hover); color: var(--text); }
+
+.traj-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 16px; /* ≥16px: iOS Safari must not zoom on focus */
+  padding: 1px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text);
+}
+.traj-search:focus { outline: none; border-color: var(--accent); }
+
+.traj-minimap {
+  position: relative;
+  height: 30px;
+  flex-shrink: 0;
+  margin: 0 var(--space-3);
+  border-bottom: 1px solid var(--border-hr);
+  cursor: pointer;
+}
+.traj-ticks { position: absolute; inset: 0; pointer-events: none; }
+.traj-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+.traj-lane { position: absolute; left: 0; right: 0; height: 6px; }
+.traj-lane-input { top: 3px; }
+.traj-lane-model { top: 12px; }
+.traj-lane-tools { top: 21px; }
+.traj-span {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  min-width: 1px;
+  border-radius: 1px;
+  background: var(--text-disabled);
+  opacity: 0.55;
+}
+.traj-span-hit { background: var(--accent); opacity: 1; }
+.traj-span-err { background: var(--danger-text); opacity: 1; }
+
+.traj-dimrow { opacity: 0.35; }
