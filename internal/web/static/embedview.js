@@ -79,11 +79,27 @@ export function leaveEmbed() {
   if (startRetry) { clearTimeout(startRetry); startRetry = null; }
 }
 
+// isDirectHost reports whether a dedicated embed port is likely reachable:
+// loopback or a bare IP/hostname with no domain suffix. A named domain
+// (reverse-proxied) only exposes usher's own port.
+function isDirectHost(hostname) {
+  if (!hostname || hostname === 'localhost' || hostname.includes(':')) return true;
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
+}
+
 function renderEmbedView(name) {
   const e = embeds.find(x => x.name === name);
   let html;
   if (e && e.ready) {
-    const src = '/embed/' + encodeURIComponent(e.name) + '/' + (e.query || '');
+    // A dedicated origin per embed is the robust design: the child's workers
+    // make root-absolute requests that a path proxy cannot rebase (dsh's RPC
+    // stream). Direct/LAN access uses the port; a named domain cannot reach
+    // it, so fall back to the same-origin /embed/<name>/ proxy (works for
+    // UIs without root-absolute worker traffic).
+    const direct = isDirectHost(location.hostname);
+    const src = direct
+      ? location.protocol + '//' + location.hostname + ':' + e.port + '/' + (e.query || '')
+      : '/embed/' + encodeURIComponent(e.name) + '/' + (e.query || '');
     html = `<div class="embed-view"><iframe src="${esc(src)}" title="${esc(e.title)}"></iframe></div>`;
   } else if (e) {
     html = `<div class="embed-view"><div class="embed-note">Starting ${esc(e.title)}…</div></div>`;
