@@ -55,10 +55,16 @@ func BootstrapPath(prefix string) string {
 func BootstrapJS(prefix string) []byte {
 	lit, _ := json.Marshal(strings.TrimSuffix(prefix, "/"))
 	return []byte(`(function(){var P=` + string(lit) + `;
-function f(u){try{if(typeof u!=="string")return u;var q=new URL(u,location.href);
+window.__usherEmbedPatched=true;
+function f(u){try{
+if(u&&typeof u==="object"){
+if(u instanceof Request){var r=f(u.url);return r===u.url?u:new Request(r,u)}
+u=String(u)}
+if(typeof u!=="string")return u;
+var q=new URL(u,location.href);
 if(q.origin!==location.origin)return u;if(q.pathname===P||q.pathname.indexOf(P+"/")===0)return u;
 return P+q.pathname+q.search+q.hash}catch(e){return u}}
-var of=window.fetch;if(of)window.fetch=function(i,o){return of.call(this,typeof i==="string"?f(i):i,o)};
+var of=window.fetch;if(of)window.fetch=function(i,o){return of.call(this,f(i),o)};
 var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=f(u);return xo.apply(this,arguments)};
 var W=window.WebSocket;if(W){var NW=function(u,p){return p===undefined?new W(f(u)):new W(f(u),p)};NW.prototype=W.prototype;window.WebSocket=NW}
 var E=window.EventSource;if(E){var NE=function(u,c){return c===undefined?new E(f(u)):new E(f(u),c)};NE.prototype=E.prototype;window.EventSource=NE}
