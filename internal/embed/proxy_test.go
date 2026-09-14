@@ -250,7 +250,7 @@ func wsAccept(key string) string {
 func TestProxyPathHandlerRebasesJSAssets(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
-		fmt.Fprint(w, `const x = import("/plugins/??a/client.js,b/client.js");const y="/assets/app.js";const z=fetch("/api/session/list");`)
+		fmt.Fprint(w, `const x = import("/plugins/??a/client.js,b/client.js");const y="/assets/app.js";const z=fetch("/api/session/list");const base="/plugins";`)
 	}))
 	defer upstream.Close()
 	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
@@ -271,5 +271,29 @@ func TestProxyPathHandlerRebasesJSAssets(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `fetch("/api/session/list")`) {
 		t.Errorf("/api must be left to the runtime bootstrap: %s", body)
+	}
+	if !strings.Contains(string(body), `const base="/embed/test/plugins";`) {
+		t.Errorf("trailing-slash-less base not rebased: %s", body)
+	}
+}
+
+func TestProxyPathHandlerRebasesInlineScript(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><head></head><body><script>var b="/plugins";</script></body></html>`)
+	}))
+	defer upstream.Close()
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/embed/test/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `var b="/embed/test/plugins";`) {
+		t.Errorf("inline loader base not rebased: %s", body)
 	}
 }

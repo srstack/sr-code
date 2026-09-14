@@ -184,9 +184,14 @@ func rebaseHTML(body []byte, prefix string) []byte {
 		merged = append(merged, out[:loc[1]]...)
 		merged = append(merged, inject...)
 		merged = append(merged, out[loc[1]:]...)
-		return merged
+		out = merged
+	} else {
+		out = append(inject, out...)
 	}
-	return append(inject, out...)
+	// Inline loader scripts carry asset bases as plain strings too; rebase
+	// those after attribute rewriting (already-prefixed URLs cannot match,
+	// since the namespace is no longer adjacent to the opening quote).
+	return rebaseJS(out, prefix)
 }
 
 func rebaseCSS(body []byte, prefix string) []byte {
@@ -196,14 +201,16 @@ func rebaseCSS(body []byte, prefix string) []byte {
 	})
 }
 
-// jsAssetRe rewrites root-absolute ASSET namespaces inside JavaScript. The
-// runtime bootstrap covers API calls (fetch/XHR/WebSocket/EventSource) and the
-// history API, but ES module dynamic imports (dsh loads its plugin bundles via
-// import("/plugins/…")) cannot be patched at runtime, so their literals are
-// rebased here. The allowlist keeps us away from arbitrary path strings and
-// from /api, which the bootstrap handles.
-var jsAssetRe = regexp.MustCompile("([\"'`])/(plugins|assets|static|_next|chunks)/")
+// jsAssetRe rewrites root-absolute ASSET namespaces inside JavaScript (and
+// inline <script> in HTML). The runtime bootstrap covers API calls
+// (fetch/XHR/WebSocket/EventSource) and the history API, but ES module dynamic
+// imports (dsh loads its plugin bundles via import("/plugins/…")) cannot be
+// patched at runtime, so their literals are rebased here. The allowlist keeps
+// us away from arbitrary path strings and from /api, which the bootstrap
+// handles. The namespace may appear with or without a trailing slash
+// ("/plugins" is a base the loader concatenates onto).
+var jsAssetRe = regexp.MustCompile("([\"'`])/(plugins|assets|static|_next|chunks)\\b")
 
 func rebaseJS(body []byte, prefix string) []byte {
-	return jsAssetRe.ReplaceAll(body, []byte("${1}"+prefix+"/${2}/"))
+	return jsAssetRe.ReplaceAll(body, []byte("${1}"+prefix+"/${2}"))
 }
