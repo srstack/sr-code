@@ -747,6 +747,27 @@ func TestReadOnlyBackend(t *testing.T) {
 	}
 }
 
+// TestDeleteSessionRejectsReadOnly proves a destructive delete never touches a
+// transcript-only backend's files: the read-only guard fires before the disk
+// removal, so the transcript and its discovery entry survive.
+func TestDeleteSessionRejectsReadOnly(t *testing.T) {
+	r, dshID, _ := newReadOnlyTestRouter(t)
+	path, ok := r.discovery.Path(dshID)
+	if !ok {
+		t.Fatalf("discovery.Path(%s) = not found", dshID)
+	}
+	err := r.DeleteSession(dshID)
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("DeleteSession = %v, want read-only error", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("transcript removed by rejected delete: %v", statErr)
+	}
+	if _, ok := r.discovery.Get(dshID); !ok {
+		t.Error("rejected delete dropped the session from discovery")
+	}
+}
+
 // TestRunSendTranscriptOnlyPublishesError proves the turn executor itself bails
 // on a nil Runtime (defense in depth behind enqueueSend's guard).
 func TestRunSendTranscriptOnlyPublishesError(t *testing.T) {

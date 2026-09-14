@@ -452,12 +452,16 @@ func (r *Router) Unarchive(sessionID string) {
 // kills usher's live window for it (if any), deletes the session jsonl from
 // disk, and forgets all per-session state (archive decision and auto-approve).
 // Irreversible — the conversation is gone with
-// the file. Errors if the session is unknown or the file delete fails; the
+// the file. Errors if the session is unknown, its backend is transcript-only
+// (read-only), or the file delete fails; the
 // live-process teardown is best-effort. Unlike Archive (a reversible sidebar
 // hide), this is destructive.
 func (r *Router) DeleteSession(id string) error {
 	if sess, ok := r.discovery.Get(id); ok && sess.IsSubagent {
 		return errors.New("subagent transcripts are read-only")
+	}
+	if r.ReadOnly(id) {
+		return readOnlyError(r.backendOf(id))
 	}
 	path, ok := r.discovery.Path(id)
 	if !ok {
@@ -531,7 +535,7 @@ func (r *Router) deleteSubagentTranscripts(parentID, rootPath string) {
 		}
 		r.discovery.Remove(sub.ID)
 	}
-	_ = os.RemoveAll(strings.TrimSuffix(rootPath, ".jsonl"))
+	_ = os.RemoveAll(strings.TrimSuffix(strings.TrimSuffix(rootPath, ".jsonl.zstd"), ".jsonl"))
 }
 
 // PauseSession stops usher's live backend worker without touching its

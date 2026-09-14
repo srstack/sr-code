@@ -132,6 +132,13 @@ export function renderSidebarSessions(allSessions) {
     const subs = children.get(s.id) || [];
     const archAction = s.archived ? 'unarchive' : 'archive';
     const archTitle = s.archived ? 'unarchive' : 'archive';
+    // Transcript-only backends (e.g. dsh) can't be deleted, so hide the
+    // destructive quick-action rather than offer a request the server rejects.
+    const quickDelete = s.read_only
+      ? ''
+      : `<button class="row-action-btn row-action-danger" type="button" data-quick="delete" data-id="${esc(s.id)}" title="delete" aria-label="delete">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h12M6 4V2.5A.5.5 0 0 1 6.5 2h3a.5.5 0 0 1 .5.5V4M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/></svg>
+        </button>`;
     return `<li class="${liClass}">
       <a href="${esc(href)}" data-route="s:${esc(s.id)}" title="${esc(title)}">${mark}${dot}${auto}${esc(title)}</a>
       <span class="row-actions">
@@ -140,15 +147,14 @@ export function renderSidebarSessions(allSessions) {
             ? '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3V5z"/><path d="M2 5l6 3 6-3M8 8v6" transform="rotate(180 8 8)"/></svg>'
             : '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3V5z"/><path d="M2 5l6 3 6-3M8 8v6"/></svg>'}
         </button>
-        <button class="row-action-btn row-action-danger" type="button" data-quick="delete" data-id="${esc(s.id)}" title="delete" aria-label="delete">
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h12M6 4V2.5A.5.5 0 0 1 6.5 2h3a.5.5 0 0 1 .5.5V4M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/></svg>
-        </button>
+        ${quickDelete}
       </span>
       <button class="kebab-btn" type="button"
         data-id="${esc(s.id)}" data-archived="${s.archived ? '1' : '0'}"
         data-pinned="${s.pinned ? '1' : '0'}"
         data-status="${esc(s.status || '')}"
         data-subagents="${subs.length}"
+        data-readonly="${s.read_only ? '1' : '0'}"
         aria-label="session actions" title="more">⋮</button>
     </li>`;
   };
@@ -329,6 +335,10 @@ function openKebabPopover(btn) {
   const pinned = btn.dataset.pinned === '1';
   const pinAction = pinned ? 'unpin' : 'pin';
   const pinLabel = pinned ? 'Unpin' : 'Pin';
+  // A transcript-only session (dsh) can be listed and read but not deleted —
+  // the server rejects it, so don't offer the action. The detail header's
+  // subtitle-menu doesn't carry the flag; its Delete is refused server-side.
+  const readOnly = btn.dataset.readonly === '1';
   // Pause only applies to a session with a live window; an idle one has
   // nothing to tear down, so we hide it rather than offer a no-op.
   const status = btn.dataset.status;
@@ -366,7 +376,7 @@ function openKebabPopover(btn) {
     `<button type="button" class="kebab-item" data-action="${pinAction}" data-id="${esc(id)}">${pinLabel}</button>` +
     `<button type="button" class="kebab-item" data-action="${action}" data-id="${esc(id)}">${label}</button>` +
     pauseItem +
-    `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`;
+    (readOnly ? '' : `<button type="button" class="kebab-item kebab-danger" data-action="delete" data-id="${esc(id)}">Delete</button>`);
   kebabPopover.hidden = false;
   // Position below the button — right-aligned for the edge-hugging kebabs,
   // left-aligned for the title menu (its anchor sits at the header's left).
