@@ -286,6 +286,13 @@ func (s *Server) Run(ctx context.Context) error {
 		webMux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, r.URL.Path+"/", http.StatusTemporaryRedirect)
 		})
+		if m.Process.Spec().RootAPI {
+			// A UI whose Workers call /api/... on the page origin (dsh's RPC
+			// stream) escapes the path proxy; serve unknown /api paths from
+			// that child. usher's own /api routes are more specific patterns
+			// and keep winning.
+			webMux.Handle("/api/", m.Process.Handler())
+		}
 	}
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)

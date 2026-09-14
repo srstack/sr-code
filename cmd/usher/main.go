@@ -552,7 +552,8 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		Name: "dsh", Title: "DeepSeek Harness",
 		Args:       []string{"--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "{port}"},
 		HealthPath: "/", URLPattern: `(http://\S+)`,
-		Dir: dshDir,
+		Dir:     dshDir,
+		RootAPI: true,
 	})
 	add(ocCmd, ocPort, embed.Spec{
 		Name: "opencode", Title: "OpenCode",

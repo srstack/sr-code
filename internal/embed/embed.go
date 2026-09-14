@@ -37,6 +37,11 @@ type Spec struct {
 	HealthPath string   // HTTP path polled for readiness, e.g. "/"
 	URLPattern string   // regexp with one capture group; first stdout/stderr line matching yields the start URL (may carry ?token=). Empty = no capture.
 	Dir        string   // child working directory; empty inherits usher's. Agents scope their UI to the cwd workspace (dsh lists sessions per cwd).
+	// RootAPI marks the child as the fallback for unknown root-absolute /api
+	// requests. UIs whose Workers bypass the URL-rebasing path proxy and call
+	// /api/... on the page origin (dsh's RPC stream and WebSocket) need it;
+	// at most one embed may set it.
+	RootAPI bool
 }
 
 // Process is a running embedded child.
