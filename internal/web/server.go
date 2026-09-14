@@ -339,7 +339,7 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	webMux.Handle("GET /", http.FileServer(http.FS(staticRoot)))
+	webMux.Handle("/", http.FileServer(http.FS(staticRoot)))
 
 	hookMux := http.NewServeMux()
 	hookMux.HandleFunc("POST /hook/{event}", s.handleHook)
