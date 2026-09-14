@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"sess-unknown","createdAt":1789064460000,"cwd":"/tmp/proj"}
+{"type":"turn/start","seq":0,"time":1789064460005,"data":{"turn":1}}
+{"type":"step/start","seq":1,"time":1789064460010,"data":{"turn":1,"step":0}}
+{"type":"tool/ptc-dispatch","seq":2,"time":1789064460015,"data":{"tool":"run_code"},"ignorable":true}
+{"type":"user/message","seq":3,"time":1789064461000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"hi"}],"source":{"kind":"user"}}}
+{"type":"future/event","seq":4,"time":1789064461500,"data":{"who":"knows"},"ignorable":false}
+{"type":"assistant/message","seq":5,"time":1789064462000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}
+{"type":"turn/end","seq":6,"time":1789064462100,"data":{"turn":1}}

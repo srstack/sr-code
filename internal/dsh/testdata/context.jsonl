@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"sess-context","createdAt":1789064460000,"cwd":"/tmp/proj"}
+{"type":"user/message","seq":1,"time":1789064461000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"hi"}],"source":{"kind":"user"}}}
+{"type":"user/message","seq":2,"time":1789064462000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"runtime ctx"}],"source":{"kind":"plugin","plugin":"@deepseek-ai/dsh-system-prompt"}}}
+{"type":"user/message","seq":3,"time":1789064463000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"skill list"}],"source":{"kind":"skill-catalog"}}}
+{"type":"assistant/message","seq":4,"time":1789064464000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}

@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"sess-compaction","createdAt":1789064460000,"cwd":"/tmp/proj"}
+{"type":"user/message","seq":1,"time":1789064461000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"hi"}],"source":{"kind":"user"}}}
+{"type":"assistant/message","seq":2,"time":1789064462000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}
+{"type":"compaction/summary","seq":3,"time":1789064462500,"data":{"content":[{"type":"text","text":"older turns condensed"}]}}
+{"type":"assistant/message","seq":4,"time":1789064462600,"surfaceOp":{"op":"replace","startSeq":2,"endSeq":2},"sourceEventSeqs":[2],"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"MODEL ONLY"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}
+{"type":"user/message","seq":5,"time":1789064462700,"surfaceOp":{"op":"replace","startSeq":1,"endSeq":4},"sourceEventSeqs":[1,2,4],"data":{"content":[{"type":"text","text":"condensed history"}],"source":{"kind":"plugin","plugin":"compact"}}}
+{"type":"user/message","seq":6,"time":1789064462750,"surfaceOp":{"op":"replace","startSeq":5,"endSeq":5},"sourceEventSeqs":[5],"data":{"content":[{"type":"text","text":"other rewrite"}],"source":{"kind":"plugin","plugin":"other"}}}
+{"type":"user/message","seq":7,"time":1789064463000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"next"}],"source":{"kind":"user"}}}

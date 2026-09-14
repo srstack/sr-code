@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"sess-errorresult","createdAt":1789064460000,"cwd":"/tmp/proj"}
+{"type":"user/message","seq":1,"time":1789064461000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"read it"}],"source":{"kind":"user"}}}
+{"type":"assistant/message","seq":2,"time":1789064462000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"tool-call","id":"e1","name":"read","arguments":"{\"file_path\":\"/nope\"}"},{"type":"tool-call","id":"e2","name":"read","arguments":"{\"file_path\":\"/maybe\"}"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}
+{"type":"tool/call","seq":3,"time":1789064462100,"data":{"turn":1,"step":0,"callId":"e1","name":"read","arguments":"{\"file_path\":\"/nope\"}"}}
+{"type":"tool/result","seq":4,"time":1789064462600,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"user","source":{"kind":"tool","callId":"e1"},"content":[{"type":"tool-result","toolCallId":"e1","content":[{"type":"text","text":"no such file"}],"isError":true}]}}}
+{"type":"tool/call","seq":5,"time":1789064462700,"data":{"turn":1,"step":0,"callId":"e2","name":"read","arguments":"{\"file_path\":\"/maybe\"}"}}
+{"type":"tool/result","seq":6,"time":1789064463200,"surfaceOp":"append","data":{"turn":1,"step":0,"error":{"code":"E_IO","message":"boom"},"message":{"role":"user","source":{"kind":"tool","callId":"e2"},"content":[{"type":"tool-result","toolCallId":"e2","content":[{"type":"text","text":"partial"}],"isError":false}]}}}
