@@ -150,15 +150,18 @@ func (s DshSource) ReadMeta(path string) (core.SessionMeta, error) {
 }
 
 // quarantineCorrupt moves a session dir whose log has no valid header frame
-// aside, under <dsh-home>/quarantine. It refuses files younger than a small
-// grace period so a log dsh is still writing is never touched. Returns the
-// destination and whether the move happened.
+// aside, under <dsh-home>/quarantine. A headerless first line is definitive
+// corruption — dsh always writes the header as frame 0 — and dsh itself fails
+// to boot while one exists (its workspace init aborts), so this is done
+// immediately rather than after a grace period. A file still being written
+// either has no complete line yet (a different, non-quarantining error path)
+// or already carries its header. Returns the destination and whether the move
+// happened.
 func (s DshSource) quarantineCorrupt(path string) (string, bool) {
 	if s.quarantineDir == "" {
 		return "", false
 	}
-	info, err := os.Stat(path)
-	if err != nil || time.Since(info.ModTime()) < dshQuarantineGrace {
+	if _, err := os.Stat(path); err != nil {
 		return "", false
 	}
 	src := filepath.Dir(path)
@@ -174,10 +177,6 @@ func (s DshSource) quarantineCorrupt(path string) (string, bool) {
 	}
 	return dest, true
 }
-
-// dshQuarantineGrace keeps quarantine away from logs dsh may still be appending
-// to; a real corruption never self-heals, so waiting costs nothing.
-const dshQuarantineGrace = 2 * time.Minute
 
 // cachedTitle reads dsh's advisory projection cache for the session's latest
 // title. Missing or malformed caches yield "" (the caller falls back).

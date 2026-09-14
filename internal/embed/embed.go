@@ -25,6 +25,14 @@ import (
 const (
 	healthPollInterval = 250 * time.Millisecond
 	readyTimeout       = 60 * time.Second
+
+	// A crashed child is restarted on a fresh port a bounded number of times,
+	// so a transient boot failure (e.g. dsh aborting on a corrupt session log)
+	// self-heals instead of leaving the embed stuck on "starting…". A child
+	// that stayed up for restartHealthyAfter resets the budget.
+	maxRestarts         = 5
+	restartDelay        = 3 * time.Second
+	restartHealthyAfter = 60 * time.Second
 )
 
 // Spec describes one embedded agent UI.
@@ -46,14 +54,16 @@ type Spec struct {
 
 // Process is a running embedded child.
 type Process struct {
-	spec       Spec
-	childURL   string
-	logger     *slog.Logger
-	startQuery atomic.Value // string, query captured from the child's output
-	ready      atomic.Bool
+	spec     Spec
+	logger   *slog.Logger
+	childURL atomic.Value // string, "http://127.0.0.1:<port>" of the live child
+	query    atomic.Value // string, start query captured from the child's output
+	ready    atomic.Bool
 }
 
-// Start spawns the child on a free loopback port and returns immediately.
+// Start spawns the child on a free loopback port and returns immediately. The
+// child is supervised: if it exits before usher shuts down, it is restarted on
+// a fresh port (bounded, see maxRestarts).
 func Start(ctx context.Context, spec Spec, logger *slog.Logger) (*Process, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -69,32 +79,64 @@ func Start(ctx context.Context, spec Spec, logger *slog.Logger) (*Process, error
 		}
 		urlRe = re
 	}
+	p := &Process{spec: spec, logger: logger}
+	p.query.Store("")
+	go p.supervise(ctx, urlRe)
+	return p, nil
+}
 
+// supervise runs the child, restarting it after an early exit until the
+// restart budget is exhausted or ctx is cancelled.
+func (p *Process) supervise(ctx context.Context, urlRe *regexp.Regexp) {
+	restarts := 0
+	for {
+		started := time.Now()
+		err := p.spawn(ctx, urlRe)
+		p.ready.Store(false)
+		if ctx.Err() != nil {
+			return
+		}
+		p.logger.Info("embed child exited", "name", p.spec.Name, "err", err, "ran", time.Since(started).Round(time.Second))
+		if time.Since(started) >= restartHealthyAfter {
+			restarts = 0
+		}
+		if restarts >= maxRestarts {
+			p.logger.Error("embed child gave up after repeated exits", "name", p.spec.Name, "restarts", restarts)
+			return
+		}
+		restarts++
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(restartDelay):
+		}
+	}
+}
+
+// spawn runs one child to completion, returning its exit error. It publishes
+// the new child's URL and query before waiting.
+func (p *Process) spawn(ctx context.Context, urlRe *regexp.Regexp) error {
 	// Reserve a free port and release it before spawning. The child binds
 	// immediately after, so the listen/close race is accepted; a port stolen
 	// in between surfaces as the child never becoming ready.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, fmt.Errorf("embed %s: find free port: %w", spec.Name, err)
+		return fmt.Errorf("find free port: %w", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	args := make([]string, len(spec.Args))
-	for i, a := range spec.Args {
+	args := make([]string, len(p.spec.Args))
+	for i, a := range p.spec.Args {
 		args[i] = strings.ReplaceAll(a, "{port}", strconv.Itoa(port))
 	}
-	cmd := exec.CommandContext(ctx, spec.Cmd, args...)
-	cmd.Env = append(os.Environ(), spec.Env...)
-	if spec.Dir != "" {
-		cmd.Dir = spec.Dir
+	cmd := exec.CommandContext(ctx, p.spec.Cmd, args...)
+	cmd.Env = append(os.Environ(), p.spec.Env...)
+	if p.spec.Dir != "" {
+		cmd.Dir = p.spec.Dir
 	}
-
-	p := &Process{
-		spec:     spec,
-		childURL: "http://127.0.0.1:" + strconv.Itoa(port),
-		logger:   logger,
-	}
+	p.childURL.Store("http://127.0.0.1:" + strconv.Itoa(port))
+	p.query.Store("")
 
 	// Feed each stream through an io.Pipe: cmd.Wait waits for the
 	// stdlib-internal copies into these writers to finish, and a writer only
@@ -105,28 +147,38 @@ func Start(ctx context.Context, spec Spec, logger *slog.Logger) (*Process, error
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("embed %s: start: %w", spec.Name, err)
+		stdoutW.Close()
+		stderrW.Close()
+		return fmt.Errorf("start: %w", err)
 	}
 
 	var captureOnce sync.Once
-	p.scanStream(spec.Name, urlRe, &captureOnce, stdoutR)
-	p.scanStream(spec.Name, urlRe, &captureOnce, stderrR)
-	go p.pollReady(ctx)
-	go func() {
-		err := cmd.Wait()
-		p.ready.Store(false)
-		logger.Info("embed child exited", "name", spec.Name, "err", err)
-	}()
-	return p, nil
+	p.scanStream(p.spec.Name, urlRe, &captureOnce, stdoutR)
+	p.scanStream(p.spec.Name, urlRe, &captureOnce, stderrR)
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	go p.pollReady(runCtx)
+	err = cmd.Wait()
+	// The child is gone; close our pipe writers so the line scanners see EOF
+	// and exit instead of blocking on Read forever (one pair per restart).
+	stdoutW.Close()
+	stderrW.Close()
+	return err
 }
 
-// ChildURL returns "http://127.0.0.1:<port>" once the process is running.
-func (p *Process) ChildURL() string { return p.childURL }
+// ChildURL returns "http://127.0.0.1:<port>" of the live child.
+func (p *Process) ChildURL() string {
+	if u, ok := p.childURL.Load().(string); ok {
+		return u
+	}
+	return ""
+}
 
 // StartQuery returns the query string captured from stdout (e.g.
 // "?token=abc"), or "".
 func (p *Process) StartQuery() string {
-	if q, ok := p.startQuery.Load().(string); ok {
+	if q, ok := p.query.Load().(string); ok {
 		return q
 	}
 	return ""
@@ -159,7 +211,7 @@ func (p *Process) scanStream(name string, urlRe *regexp.Regexp, captureOnce *syn
 			}
 			captureOnce.Do(func() {
 				if u.RawQuery != "" {
-					p.startQuery.Store("?" + u.RawQuery)
+					p.query.Store("?" + u.RawQuery)
 				}
 			})
 		}
@@ -169,24 +221,27 @@ func (p *Process) scanStream(name string, urlRe *regexp.Regexp, captureOnce *syn
 // pollReady polls the health endpoint until any HTTP response (even
 // 4xx/5xx) arrives, then marks the process ready. It gives up after
 // readyTimeout and logs an error; the process stays up and the UI keeps
-// showing "starting…".
-func (p *Process) pollReady(ctx context.Context) {
+// showing "starting…". runCtx is cancelled when the child exits, so a stale
+// poller never marks a restart's process ready.
+func (p *Process) pollReady(runCtx context.Context) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.After(readyTimeout)
 	tick := time.NewTicker(healthPollInterval)
 	defer tick.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return
 		case <-deadline:
 			p.logger.Error("embed child never became ready", "name", p.spec.Name)
 			return
 		case <-tick.C:
-			resp, err := client.Get(p.childURL + p.spec.HealthPath)
+			resp, err := client.Get(p.ChildURL() + p.spec.HealthPath)
 			if err == nil {
 				resp.Body.Close()
-				p.ready.Store(true)
+				if runCtx.Err() == nil {
+					p.ready.Store(true)
+				}
 				return
 			}
 		}

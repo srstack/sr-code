@@ -23,7 +23,7 @@ func TestProxyStripsFramingHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.Handler())
 	defer proxy.Close()
 
@@ -56,7 +56,7 @@ func TestProxyRewritesHostAndOrigin(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.Handler())
 	defer proxy.Close()
 
@@ -93,7 +93,7 @@ func TestProxyPathHandlerRebasesAndStrips(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
 	defer proxy.Close()
 
@@ -133,7 +133,7 @@ func TestProxyPathHandlerRedirectsBarePrefix(t *testing.T) {
 		fmt.Fprint(w, "ok")
 	}))
 	defer upstream.Close()
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
 	defer proxy.Close()
 
@@ -156,7 +156,7 @@ func TestProxyKeepsCSPBeyondFrameAncestors(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.Handler())
 	defer proxy.Close()
 
@@ -180,7 +180,7 @@ func TestProxyNotReady(t *testing.T) {
 	dead := "http://" + ln.Addr().String()
 	ln.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: dead}
+	p := newTestProcess(dead)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	p.Handler().ServeHTTP(rr, req)
@@ -220,7 +220,7 @@ func TestProxyWebSocketUpgrade(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.Handler())
 	defer proxy.Close()
 
@@ -254,7 +254,7 @@ func TestProxyPathHandlerRebasesJSAssets(t *testing.T) {
 		fmt.Fprint(w, `const x = import("/plugins/??a/client.js,b/client.js");const y="/assets/app.js";const z=fetch("/api/session/list");const base="/plugins";`)
 	}))
 	defer upstream.Close()
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
 	defer proxy.Close()
 
@@ -284,7 +284,7 @@ func TestProxyPathHandlerRebasesInlineScript(t *testing.T) {
 		fmt.Fprint(w, `<html><head></head><body><script>var b="/plugins";</script></body></html>`)
 	}))
 	defer upstream.Close()
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
 	defer proxy.Close()
 
@@ -312,7 +312,7 @@ func TestProxyPathHandlerPassesThroughLargeBodies(t *testing.T) {
 	maxRebaseBytes = 128
 	defer func() { maxRebaseBytes = old }()
 
-	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	p := newTestProcess(upstream.URL)
 	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
 	defer proxy.Close()
 
@@ -325,4 +325,12 @@ func TestProxyPathHandlerPassesThroughLargeBodies(t *testing.T) {
 	if string(body) != payload {
 		t.Errorf("large body corrupted: got %d bytes, want %d", len(body), len(payload))
 	}
+}
+
+// newTestProcess builds a Process pointing at a test upstream.
+func newTestProcess(target string) *Process {
+	p := &Process{spec: Spec{Name: "test"}}
+	p.childURL.Store(target)
+	p.query.Store("")
+	return p
 }

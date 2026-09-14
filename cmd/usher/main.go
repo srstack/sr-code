@@ -395,6 +395,13 @@ func serve(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Start discovery (and its initial scan) before the embedded children so
+	// dsh sessions with a corrupt header are quarantined before dsh itself
+	// boots — dsh aborts startup when one exists.
+	if err := d.Start(ctx); err != nil {
+		return err
+	}
+
 	// Embedded agent UIs (dsh/opencode/kimi): optional children spawned on
 	// free loopback ports, each surfaced on its own auth-guarded listener.
 	// Their lifetimes are bound to ctx (CommandContext kills them on
@@ -419,10 +426,6 @@ func serve(args []string) error {
 	if oc2Sync != nil {
 		oc2Sync.LoadTombstones()
 		go opencode.SyncLoop(ctx, oc2Sync, logger)
-	}
-
-	if err := d.Start(ctx); err != nil {
-		return err
 	}
 
 	if pushMgr != nil {

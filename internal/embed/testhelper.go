@@ -10,10 +10,11 @@ import (
 // without spawning a child process.
 func NewForTest(upstream *httptest.Server) *Process {
 	p := &Process{
-		spec:     Spec{Name: "test", Title: "Test"},
-		childURL: upstream.URL,
-		logger:   slog.Default(),
+		spec:   Spec{Name: "test", Title: "Test"},
+		logger: slog.Default(),
 	}
+	p.childURL.Store(upstream.URL)
+	p.query.Store("")
 	p.ready.Store(true)
 	return p
 }

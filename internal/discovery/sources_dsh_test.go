@@ -239,9 +239,10 @@ func TestDshSource_QuarantinesCorruptLog(t *testing.T) {
 	}
 }
 
-// TestDshSource_KeepsFreshCorruptLog: a headerless log younger than the grace
-// period might still be mid-write; quarantine must not touch it.
-func TestDshSource_KeepsFreshCorruptLog(t *testing.T) {
+// TestDshSource_QuarantinesFreshCorruptLog: a headerless log blocks dsh's own
+// startup, so quarantine is immediate — no age grace applies once the first
+// complete line is an event rather than the header.
+func TestDshSource_QuarantinesFreshCorruptLog(t *testing.T) {
 	home := t.TempDir()
 	sessionsDir := filepath.Join(home, "sessions")
 	sessDir := filepath.Join(sessionsDir, "--tmp-proj--", dshUUID2)
@@ -252,7 +253,7 @@ func TestDshSource_KeepsFreshCorruptLog(t *testing.T) {
 	if _, err := src.ReadMeta(path); err == nil {
 		t.Fatal("ReadMeta succeeded on a headerless log; want an error")
 	}
-	if _, err := os.Stat(sessDir); err != nil {
-		t.Errorf("fresh session dir moved by quarantine: %v", err)
+	if _, err := os.Stat(sessDir); !os.IsNotExist(err) {
+		t.Errorf("fresh corrupt session dir not quarantined (stat err = %v)", err)
 	}
 }
