@@ -26,8 +26,9 @@ approve or deny tool-permission prompts — without being at the keyboard.
 - Open a lightweight tmux shell in a session's working directory.
 - Use the dsh, OpenCode, or Kimi Code native web UIs inside usher — usher
   spawns them as loopback-only children behind the same auth and iframes them.
-  dsh's on-disk sessions also appear in the sidebar; clicking one opens the
-  embedded dsh UI.
+  dsh's on-disk sessions also appear in the sidebar and open a read-only
+  transcript rendered from disk; the embedded dsh UI stays available for
+  interaction.
 
 ## Install
 

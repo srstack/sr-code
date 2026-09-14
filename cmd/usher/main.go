@@ -20,6 +20,7 @@ import (
 	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/broker"
 	"github.com/nexustar/usher/internal/discovery"
+	"github.com/nexustar/usher/internal/dsh"
 	"github.com/nexustar/usher/internal/embed"
 	"github.com/nexustar/usher/internal/hook"
 	"github.com/nexustar/usher/internal/mainchat"
@@ -316,14 +317,14 @@ func serve(args []string) error {
 			*projectsDir, *codexSessionsDir, *piSessionsDir, *openCodeCmd)
 	}
 
-	// dsh sessions are listed read-only in the sidebar (a click opens the
-	// embedded dsh UI, never usher's detail view). There is deliberately no
-	// backends["dsh"] entry: the dsh UI owns sending, and keeping dsh out of
-	// the backend map keeps it out of the new-session picker. The router's
-	// fallback-to-default sender never matches a dsh UUID, so listing and
-	// GetSession treat these as plain idle sessions.
+	// dsh sessions are rendered read-only from disk. The backend is
+	// transcript-only (nil Runtime): it can be listed and read but never sent
+	// to, and Backends() keeps it out of the new-session picker. Interaction
+	// still happens in the embedded DeepSeek Harness UI, which remains
+	// available under #/ui/dsh.
 	if dir := *dshSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewDshSource(dir))
+		backends["dsh"] = backend.Backend{Transcript: dsh.Transcript{}}
 		logger.Info("dsh sessions enabled", "sessions_dir", dir)
 	}
 

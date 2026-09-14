@@ -2876,3 +2876,17 @@ body.embed-route .main-wrap > header { display: none; }
   color: var(--text-faint);
   flex-shrink: 0;
 }
+
+/* Read-only session note (transcript-only backends such as dsh). It replaces
+   the composer, since usher never sends to these sessions — interaction stays
+   in the agent's own embedded UI. */
+.read-only-note {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-subtle);
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.5;
+}

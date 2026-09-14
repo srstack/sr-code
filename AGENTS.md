@@ -66,5 +66,9 @@ needed, vendor a popular, self-contained, minimal one.
   embedded UI is the agent's own product surface — usher does not
   re-implement its features (permissions, interrupts, model pickers) and
   does not treat anything inside the iframe as usher's UI to style.
+- **dsh sessions are rendered read-only from disk.** usher lists dsh's
+  on-disk sessions and projects their transcript from the log files; it
+  never sends to or drives dsh. The embedded DeepSeek Harness UI remains
+  embeddable and is where interaction happens.
 - Sessions are a derived view of the jsonl files on disk — no SQLite, no
   session registry.

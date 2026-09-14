@@ -201,10 +201,7 @@ export async function loadList() {
           // Kebab clicks are taken by its own (document-level) popover handler;
           // the row listener runs first while bubbling, so skip them here.
           if (e.target.closest('.kebab-btn')) return;
-          // dsh sessions open in dsh's own embedded UI, not the detail view.
-          location.hash = tr.dataset.backend === 'dsh'
-            ? '#/ui/dsh'
-            : '#/s/' + encodeURIComponent(tr.dataset.id);
+          location.hash = '#/s/' + encodeURIComponent(tr.dataset.id);
         });
       });
       rowsEl.querySelectorAll('.row-check').forEach(cb => {

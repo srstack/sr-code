@@ -360,6 +360,52 @@ export async function showNewSession(prefillCwd) {
   });
 }
 
+// composerMarkup renders the message composer, or — for a transcript-only
+// session (`read_only`, e.g. dsh) — a subtle note in its place. Such a session
+// is rendered from disk, so sending and interrupting belong to the agent's own
+// embedded UI and the composer is never rendered.
+function composerMarkup(sess, readOnly) {
+  if (readOnly) {
+    return `<div class="read-only-note">Read-only: dsh sessions are rendered from disk; use the embedded DeepSeek Harness interface to interact.</div>`;
+  }
+  return `
+        <div class="composer">
+          <div id="attach-chips" class="attach-chips" hidden></div>
+          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button id="upload-btn" class="upload-btn" type="button" title="upload file" aria-label="upload file">+</button>
+              <input id="upload-input" type="file" hidden>
+              <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
+                aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
+                title="ask: confirm each tool call · auto: run them automatically">
+                <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
+              </button>
+              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${sess.terminal_open ? 'mixed' : 'false'}"
+                ${sess.terminal_available ? '' : 'disabled'}
+                title="${sess.terminal_available ? 'show or hide this session’s shell — hiding keeps it running; type exit in the shell to end it' : 'terminal unavailable: tmux is not installed'}">
+                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">${sess.terminal_open ? 'bg' : 'off'}</span>
+              </button>
+            </div>
+            <div class="composer-send">
+              <div class="model-select-wrap">
+                <button id="model-summary" class="model-summary" type="button" title="model &amp; effort settings" aria-expanded="false"></button>
+                <div id="settings-pop" class="settings-pop" hidden>
+                  <div class="settings-row" id="settings-row-model"><span class="settings-label">model</span><span id="model-mount" class="model-mount"></span></div>
+                  <div class="settings-row" id="settings-row-effort" hidden><span class="settings-label">effort</span><span id="effort-mount" class="model-mount"></span></div>
+                </div>
+              </div>
+              <div class="session-usage-wrap">
+                <button id="session-usage" class="session-usage" type="button" hidden
+                  aria-expanded="false" aria-controls="session-usage-detail"></button>
+                <div id="session-usage-detail" class="session-usage-detail" hidden></div>
+              </div>
+              <button id="send" class="send-circle" type="button" title="send"></button>
+            </div>
+          </div>
+        </div>`;
+}
+
 // ---------- Detail view ----------
 
 export async function showDetail(id) {
@@ -403,6 +449,9 @@ export async function showDetail(id) {
   // band, no fragile second-tier sticky element.
   renderSessionSubtitle(sess);
 
+  // Transcript-only backends (dsh): rendered from disk, never sent to.
+  const readOnly = !!sess.read_only;
+
   if (sess.is_subagent) {
     root.innerHTML = `
       <div class="detail-row">
@@ -432,41 +481,7 @@ export async function showDetail(id) {
             <div id="session-bar-usage-detail" class="session-bar-usage-detail" hidden></div>
           </div>
         </div>
-        <div class="composer">
-          <div id="attach-chips" class="attach-chips" hidden></div>
-          <textarea id="prompt" rows="1" placeholder="message…"></textarea>
-          <div class="composer-bar">
-            <div class="composer-tools">
-              <button id="upload-btn" class="upload-btn" type="button" title="upload file" aria-label="upload file">+</button>
-              <input id="upload-input" type="file" hidden>
-              <button id="auto-approve-toggle" class="auto-approve-toggle" type="button"
-                aria-pressed="${sess.auto_approve ? 'true' : 'false'}"
-                title="ask: confirm each tool call · auto: run them automatically">
-                <span class="t-icon">ϟ</span><span class="t-full">approve:</span><span class="toggle-val">${sess.auto_approve ? 'auto' : 'ask'}</span>
-              </button>
-              <button id="term-toggle" class="term-toggle" type="button" aria-pressed="${sess.terminal_open ? 'mixed' : 'false'}"
-                ${sess.terminal_available ? '' : 'disabled'}
-                title="${sess.terminal_available ? 'show or hide this session’s shell — hiding keeps it running; type exit in the shell to end it' : 'terminal unavailable: tmux is not installed'}">
-                <span class="t-icon">&gt;_</span><span class="t-full">terminal:</span><span class="toggle-val">${sess.terminal_open ? 'bg' : 'off'}</span>
-              </button>
-            </div>
-            <div class="composer-send">
-              <div class="model-select-wrap">
-                <button id="model-summary" class="model-summary" type="button" title="model &amp; effort settings" aria-expanded="false"></button>
-                <div id="settings-pop" class="settings-pop" hidden>
-                  <div class="settings-row" id="settings-row-model"><span class="settings-label">model</span><span id="model-mount" class="model-mount"></span></div>
-                  <div class="settings-row" id="settings-row-effort" hidden><span class="settings-label">effort</span><span id="effort-mount" class="model-mount"></span></div>
-                </div>
-              </div>
-              <div class="session-usage-wrap">
-                <button id="session-usage" class="session-usage" type="button" hidden
-                  aria-expanded="false" aria-controls="session-usage-detail"></button>
-                <div id="session-usage-detail" class="session-usage-detail" hidden></div>
-              </div>
-              <button id="send" class="send-circle" type="button" title="send"></button>
-            </div>
-          </div>
-        </div>
+        ${composerMarkup(sess, readOnly)}
         <div id="term-panel" class="term-panel" hidden>
           <div class="term-head">
             <span class="term-head-title">terminal</span>
@@ -698,7 +713,7 @@ export async function showDetail(id) {
     });
   }
   renderSessionRuntime(sess.runtime);
-  restoreDraft(promptEl);
+  if (promptEl) restoreDraft(promptEl); // absent for a read-only session
 
   const autoBtn = document.getElementById('auto-approve-toggle');
   if (autoBtn) {
@@ -1054,6 +1069,7 @@ export async function showDetail(id) {
   let sendAccepted = false;
   let sendLifecycleObserved = false;
   const renderAction = () => {
+    if (!promptEl || !sendBtn) return; // read-only: no composer to paint
     const hasText = promptEl.value.trim() !== '';
     const stop = (detailStreaming || actionPending) && !hasText;
     sendBtn.classList.toggle('stop', stop);
@@ -1139,37 +1155,41 @@ export async function showDetail(id) {
     }
   };
 
-  sendBtn.addEventListener('click', () => {
-    // Stop only when the input is empty; with text, mid-turn steering wins.
-    if (detailStreaming && !promptEl.value.trim()) cancel();
-    else submit();
-  });
-  promptEl.addEventListener('input', renderAction);
-  renderAction();
-  promptEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-      e.preventDefault();
-      submit();
-      return;
-    }
-    if (e.key === 'ArrowUp' && !e.isComposing) {
-      if (promptEl.selectionStart === 0 || promptEl.value.length === 0) {
+  // Composer wiring is skipped for a read-only session: its transcript is
+  // rendered from disk and interaction happens in the agent's embedded UI.
+  if (promptEl && sendBtn) {
+    sendBtn.addEventListener('click', () => {
+      // Stop only when the input is empty; with text, mid-turn steering wins.
+      if (detailStreaming && !promptEl.value.trim()) cancel();
+      else submit();
+    });
+    promptEl.addEventListener('input', renderAction);
+    renderAction();
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        historyNavigate('s:' + id, promptEl, -1);
+        submit();
+        return;
       }
-      return;
-    }
-    if (e.key === 'ArrowDown' && !e.isComposing) {
-      if (promptEl.selectionStart === promptEl.value.length) {
-        e.preventDefault();
-        historyNavigate('s:' + id, promptEl, 1);
+      if (e.key === 'ArrowUp' && !e.isComposing) {
+        if (promptEl.selectionStart === 0 || promptEl.value.length === 0) {
+          e.preventDefault();
+          historyNavigate('s:' + id, promptEl, -1);
+        }
+        return;
       }
-      return;
-    }
-  });
-  setupPasteImage(promptEl, id);
+      if (e.key === 'ArrowDown' && !e.isComposing) {
+        if (promptEl.selectionStart === promptEl.value.length) {
+          e.preventDefault();
+          historyNavigate('s:' + id, promptEl, 1);
+        }
+        return;
+      }
+    });
+    setupPasteImage(promptEl, id);
 
-  promptEl.focus();
+    promptEl.focus();
+  }
 }
 
 // Subagents are read-only and intentionally do not stream partial output.

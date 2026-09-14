@@ -754,6 +754,7 @@ type sessionDTO struct {
 	AutoApprove       bool `json:"auto_approve"`
 	Archived          bool `json:"archived"`
 	Pinned            bool `json:"pinned"`
+	ReadOnly          bool `json:"read_only"`
 	TerminalOpen      bool `json:"terminal_open,omitempty"`
 	TerminalAvailable bool `json:"terminal_available,omitempty"`
 }
@@ -770,7 +771,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	out := make([]sessionDTO, 0, len(sessions))
 	for _, sess := range sessions {
 		if sess.IsSubagent {
-			out = append(out, sessionDTO{Session: sess})
+			out = append(out, sessionDTO{Session: sess, ReadOnly: s.router.ReadOnly(sess.ID)})
 			continue
 		}
 		archived := s.router.IsArchived(sess.ID)
@@ -782,6 +783,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			AutoApprove: s.router.IsAutoApprove(sess.ID),
 			Archived:    archived,
 			Pinned:      s.router.IsPinned(sess.ID),
+			ReadOnly:    s.router.ReadOnly(sess.ID),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -833,6 +835,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		AutoApprove:       s.router.IsAutoApprove(id),
 		Archived:          s.router.IsArchived(id),
 		Pinned:            s.router.IsPinned(id),
+		ReadOnly:          s.router.ReadOnly(id),
 		TerminalOpen:      s.router.HasTerminal(id),
 		TerminalAvailable: s.router.TerminalAvailable(),
 	})
