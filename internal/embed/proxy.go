@@ -121,7 +121,13 @@ func (p *Process) proxy(rebase string) *httputil.ReverseProxy {
 
 // maxRebaseBytes caps body rewriting; larger payloads (bundles) pass through
 // unchanged — the runtime bootstrap covers their API calls.
-const maxRebaseBytes = 8 << 20
+var maxRebaseBytes int64 = 8 << 20
+
+// readCloser pairs a reconstructed reader with the original body's Closer.
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
 
 // rebaseResponse rewrites root-absolute URLs in HTML/CSS responses so the
 // child's assets resolve under the proxy prefix, injects the base tag and
@@ -142,11 +148,14 @@ func rebaseResponse(r *http.Response, prefix string) error {
 	if err != nil {
 		return err
 	}
-	_ = r.Body.Close()
-	if len(body) > maxRebaseBytes {
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+	if int64(len(body)) > maxRebaseBytes {
+		// Too big to rewrite: hand the bytes we peeked plus the unread rest
+		// back to the proxy unchanged. (Closing here would truncate it.)
+		rest := r.Body
+		r.Body = readCloser{io.MultiReader(bytes.NewReader(body), rest), rest}
 		return nil
 	}
+	_ = r.Body.Close()
 	switch {
 	case isHTML:
 		body = rebaseHTML(body, prefix)

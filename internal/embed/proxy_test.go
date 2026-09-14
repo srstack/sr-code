@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -295,5 +296,33 @@ func TestProxyPathHandlerRebasesInlineScript(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(body), `var b="/embed/test/plugins";`) {
 		t.Errorf("inline loader base not rebased: %s", body)
+	}
+}
+
+func TestProxyPathHandlerPassesThroughLargeBodies(t *testing.T) {
+	payload := strings.Repeat("A", 500)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		fmt.Fprint(w, payload)
+	}))
+	defer upstream.Close()
+
+	old := maxRebaseBytes
+	maxRebaseBytes = 128
+	defer func() { maxRebaseBytes = old }()
+
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/embed/test/big.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != payload {
+		t.Errorf("large body corrupted: got %d bytes, want %d", len(body), len(payload))
 	}
 }
