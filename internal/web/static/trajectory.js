@@ -50,7 +50,7 @@ export function project(turns) {
       push({ kind: 'user', text: oneLine(t.content), right: clock(t.ts), turnIndex });
       continue;
     }
-    if (role === 'summary' || (role === 'system' && t.content === 'Context compacted')) {
+    if (role === 'summary' || (role === 'system' && typeof t.content === 'string' && t.content.startsWith('Context compacted'))) {
       push({
         kind: 'compaction',
         text: role === 'summary' ? 'earlier conversation compressed' : oneLine(t.content),

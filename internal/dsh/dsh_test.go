@@ -172,9 +172,10 @@ func TestReadTurnsInterrupted(t *testing.T) {
 	if len(turns[1].Parts) != 1 || turns[1].Parts[0].Content != "— stopped —" {
 		t.Errorf("empty interrupted parts = %+v, want stopped marker", turns[1].Parts)
 	}
-	// Interrupted with content: keep the content, do not add the marker.
-	if len(turns[2].Parts) != 1 || turns[2].Parts[0].Content != "partial" {
-		t.Errorf("partial interrupted parts = %+v, want only 'partial'", turns[2].Parts)
+	// Interrupted with content: keep the content and append the stopped marker.
+	got := partTexts(turns[2].Parts)
+	if !reflect.DeepEqual(got, []string{"text:partial", "text:— stopped —"}) {
+		t.Errorf("partial interrupted parts = %v, want [text:partial text:— stopped —]", got)
 	}
 }
 

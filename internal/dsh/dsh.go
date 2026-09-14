@@ -341,7 +341,6 @@ func (b *builder) assistant(ev wireEvent) {
 	// message's end time. Absent a stream record (older logs), the whole
 	// message's timestamp is the fallback.
 	blockTimes := streamBlockTimes(d.Stream)
-	produced := 0
 	for i, blk := range d.Message.Content {
 		bt := ts
 		if v, ok := blockTimes[i]; ok {
@@ -353,13 +352,11 @@ func (b *builder) assistant(ev wireEvent) {
 				continue
 			}
 			b.addPart(t, ev.Seq, core.TurnPart{Type: "thinking", Content: blk.Text, Time: bt})
-			produced++
 		case "text":
 			if blk.Text == "" {
 				continue
 			}
 			b.addPart(t, ev.Seq, core.TurnPart{Type: "text", Content: blk.Text, Time: bt})
-			produced++
 		case "tool-call":
 			target := toolTarget(blk.Name, blk.Arguments)
 			idx := b.addPart(t, ev.Seq, core.TurnPart{
@@ -375,12 +372,11 @@ func (b *builder) assistant(ev wireEvent) {
 					b.callMeta[blk.ID] = toolMeta{name: blk.Name, target: target}
 				}
 			}
-			produced++
 		}
 	}
-	// An interrupted message that emitted nothing still happened: keep dsh's
-	// "stopped" hint without inventing content it never produced.
-	if d.Interrupted && produced == 0 {
+	// An interrupted message keeps whatever it produced and appends dsh's
+	// "stopped" hint after it (the marker alone when it produced nothing).
+	if d.Interrupted {
 		b.addPart(t, ev.Seq, core.TurnPart{Type: "text", Content: "— stopped —", Time: ts})
 	}
 }

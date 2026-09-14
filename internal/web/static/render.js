@@ -371,7 +371,7 @@ export function appendChatMessage(m) {
       : 'session';
   }
 
-  if (role === 'system' && m.content === 'Context compacted') {
+  if (role === 'system' && typeof m.content === 'string' && m.content.startsWith('Context compacted')) {
     div.classList.add('compaction');
     div.innerHTML = `<span>${esc(m.content)}${ts}</span>`;
   } else if (role === 'assistant' && m.parts) {
