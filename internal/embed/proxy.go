@@ -62,8 +62,12 @@ if(u instanceof Request){var r=f(u.url);return r===u.url?u:new Request(r,u)}
 u=String(u)}
 if(typeof u!=="string")return u;
 var q=new URL(u,location.href);
-if(q.origin!==location.origin)return u;if(q.pathname===P||q.pathname.indexOf(P+"/")===0)return u;
-return P+q.pathname+q.search+q.hash}catch(e){return u}}
+var ws=q.protocol==="ws:"||q.protocol==="wss:";
+var org=ws?((q.protocol==="wss:"?"https:":"http:")+"//"+q.host):q.origin;
+if(org!==location.origin)return u;
+if(q.pathname===P||q.pathname.indexOf(P+"/")===0)return u;
+var path=P+q.pathname+q.search+q.hash;
+return ws?(q.protocol+"//"+q.host+path):path}catch(e){return u}}
 var of=window.fetch;if(of)window.fetch=function(i,o){return of.call(this,f(i),o)};
 var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=f(u);return xo.apply(this,arguments)};
 var W=window.WebSocket;if(W){var NW=function(u,p){return p===undefined?new W(f(u)):new W(f(u),p)};NW.prototype=W.prototype;window.WebSocket=NW}
