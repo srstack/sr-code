@@ -77,6 +77,76 @@ func TestProxyRewritesHostAndOrigin(t *testing.T) {
 	}
 }
 
+func TestProxyPathHandlerRebasesAndStrips(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".css"):
+			w.Header().Set("Content-Type", "text/css")
+			fmt.Fprint(w, `body{background:url(/assets/bg.png)}`)
+		default:
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<html><head><title>t</title><link href="/favicon.ico" rel="icon"></head><body><script src="/assets/app.js"></script></body></html>`)
+		}
+	}))
+	defer upstream.Close()
+
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/embed/test/deep/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if gotPath != "/deep/page" {
+		t.Errorf("upstream path = %q, want /deep/page (prefix stripped)", gotPath)
+	}
+	for _, want := range []string{
+		`<base href="/embed/test/">`,
+		`src="/embed/test/assets/app.js"`,
+		`href="/embed/test/favicon.ico"`,
+		`src="/embed/test/__usher_bootstrap.js"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("HTML body missing %q\n---\n%s", want, body)
+		}
+	}
+
+	css, err := http.Get(proxy.URL + "/embed/test/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cbody, _ := io.ReadAll(css.Body)
+	css.Body.Close()
+	if !strings.Contains(string(cbody), "url(/embed/test/assets/bg.png)") {
+		t.Errorf("CSS not rebased: %s", cbody)
+	}
+}
+
+func TestProxyPathHandlerRedirectsBarePrefix(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
+	defer proxy.Close()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Get(proxy.URL + "/embed/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect || resp.Header.Get("Location") != "/embed/test/" {
+		t.Errorf("bare prefix: %d %q, want 307 /embed/test/", resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
 func TestProxyKeepsCSPBeyondFrameAncestors(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy",

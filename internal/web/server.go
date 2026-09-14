@@ -271,6 +271,22 @@ func (s *Server) Run(ctx context.Context) error {
 	webMux.HandleFunc("GET /api/models", s.handleModels)
 	webMux.HandleFunc("GET /api/backends", s.handleBackends)
 	webMux.HandleFunc("GET /api/embeds", s.handleEmbeds)
+
+	// Embedded agent UIs are also served same-origin under /embed/<name>/ so
+	// they work behind a TLS reverse proxy (the dedicated-port listeners only
+	// work when those ports are directly reachable). The bootstrap script is
+	// usher-generated, not proxied, so a strict child CSP still allows it.
+	for _, m := range s.Embeds {
+		prefix := "/embed/" + m.Process.Spec().Name
+		webMux.Handle("GET "+prefix+"/", m.Process.PathHandler(prefix))
+		webMux.HandleFunc("GET "+embedpkg.BootstrapPath(prefix), func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			_, _ = w.Write(embedpkg.BootstrapJS(prefix))
+		})
+		webMux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, r.URL.Path+"/", http.StatusTemporaryRedirect)
+		})
+	}
 	webMux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	webMux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	webMux.HandleFunc("GET /api/sessions/{id}/transcript", s.handleTranscript)

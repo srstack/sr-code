@@ -1,7 +1,8 @@
 // usher SPA: embedded agent UIs — the sidebar "Interfaces" section and the
 // #/ui/{name} full-view iframe route. Data comes from GET /api/embeds
-// ([{name,title,port,ready,query?}]); each ready embed serves its own UI on
-// 127.0.0.1:<port>/ behind the same auth cookie as the main UI.
+// ([{name,title,port,ready,query?}]); each ready embed is served same-origin
+// under /embed/<name>/ (also reachable directly on its dedicated port for
+// LAN clients that can reach it) behind the same auth cookie as the main UI.
 
 import {
   esc, root, subtitle, closeES, clearListInterval,
@@ -82,7 +83,7 @@ function renderEmbedView(name) {
   const e = embeds.find(x => x.name === name);
   let html;
   if (e && e.ready) {
-    const src = location.protocol + '//' + location.hostname + ':' + e.port + '/' + (e.query || '');
+    const src = '/embed/' + encodeURIComponent(e.name) + '/' + (e.query || '');
     html = `<div class="embed-view"><iframe src="${esc(src)}" title="${esc(e.title)}"></iframe></div>`;
   } else if (e) {
     html = `<div class="embed-view"><div class="embed-note">Starting ${esc(e.title)}…</div></div>`;
