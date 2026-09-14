@@ -136,8 +136,8 @@ func TestReadTurnsCompaction(t *testing.T) {
 	if turns[1].Role != "assistant" || len(turns[1].Parts) != 1 || turns[1].Parts[0].Content != "ok" {
 		t.Errorf("assistant turn = %+v, want only the append-origin 'ok'", turns[1])
 	}
-	if turns[2].Role != "system" || turns[2].Content != "Context compacted" {
-		t.Errorf("turn2 = %+v, want compaction marker", turns[2])
+	if turns[2].Role != "system" || turns[2].Content != "Context compacted\n\nolder turns condensed" {
+		t.Errorf("turn2 = %+v, want compaction marker carrying the summary excerpt", turns[2])
 	}
 	if turns[3].Role != "user" || turns[3].Content != "next" {
 		t.Errorf("turn3 = %+v, want user 'next'", turns[3])
@@ -187,8 +187,124 @@ func TestReadTurnsErrorResults(t *testing.T) {
 	if got := a.Parts[0].Content; got != "error: no such file" {
 		t.Errorf("isError content = %q, want error-prefixed", got)
 	}
-	if got := a.Parts[1].Content; got != "error: partial" {
-		t.Errorf("data.error content = %q, want error-prefixed", got)
+	if got := a.Parts[1].Content; got != "error: E_IO: partial" {
+		t.Errorf("data.error content = %q, want code-prefixed", got)
+	}
+}
+
+// TestReadTurnsReasoningStream proves the thinking part takes its start time
+// from the message's stream `reasoning-chunks.time0`, so reasoning emitted in
+// the same message as a tool call still yields a positive span.
+func TestReadTurnsReasoningStream(t *testing.T) {
+	turns, _ := readFixture(t, "reasoningstream.jsonl")
+	a := turns[1]
+	if len(a.Parts) != 2 || a.Parts[0].Type != "thinking" || a.Parts[1].Type != "tool" {
+		t.Fatalf("parts = %+v, want thinking then tool", a.Parts)
+	}
+	think := a.Parts[0]
+	if !think.Time.Equal(ms(1789064462000)) {
+		t.Errorf("thinking time = %v, want the stream time0 %v", think.Time, ms(1789064462000))
+	}
+	if think.DurationMs != 600 {
+		t.Errorf("thinking duration = %d, want 600 (tool-call-chunks.time0 - reasoning-chunks.time0)", think.DurationMs)
+	}
+	// The tool part also takes its block start from the stream.
+	if !a.Parts[1].Time.Equal(ms(1789064462600)) {
+		t.Errorf("tool time = %v, want the stream time0 %v", a.Parts[1].Time, ms(1789064462600))
+	}
+	if a.Parts[1].DurationMs != 300 {
+		t.Errorf("tool duration = %d, want 300 (result - tool/call)", a.Parts[1].DurationMs)
+	}
+}
+
+// TestReadTurnsPartOrdering proves a turn's parts are ordered by event seq, not
+// arrival order.
+func TestReadTurnsPartOrdering(t *testing.T) {
+	turns, _ := readFixture(t, "outoforder.jsonl")
+	a := turns[1]
+	if len(a.Parts) != 2 {
+		t.Fatalf("parts = %+v, want 2", a.Parts)
+	}
+	if got := partTexts(a.Parts); !reflect.DeepEqual(got, []string{"text:two", "text:five"}) {
+		t.Errorf("parts = %v, want seq order [text:two text:five]", got)
+	}
+}
+
+// TestReadTurnsPartContentCap proves every part's content is bounded to 32 KiB.
+func TestReadTurnsPartContentCap(t *testing.T) {
+	const capBytes = 32 * 1024
+	big := strings.Repeat("x", capBytes+1000)
+	lines := []string{
+		`{"type":"session","version":3,"id":"sess-cap","createdAt":1,"cwd":"/tmp"}`,
+		`{"type":"user/message","seq":1,"time":1000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"hi"}],"source":{"kind":"user"}}}`,
+		`{"type":"assistant/message","seq":2,"time":2000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"reasoning","text":"` + big + `"},{"type":"tool-call","id":"c1","name":"read","arguments":"{}"}],"source":{"kind":"model","provider":"p","model":"m"}}}}`,
+		`{"type":"tool/call","seq":3,"time":2100,"data":{"turn":1,"step":0,"callId":"c1","name":"read","arguments":"{}"}}`,
+		`{"type":"tool/result","seq":4,"time":2500,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"user","source":{"kind":"tool","callId":"c1"},"content":[{"type":"tool-result","toolCallId":"c1","content":[{"type":"text","text":"` + big + `"}],"isError":false}]}}}`,
+	}
+	p := filepath.Join(t.TempDir(), "cap.jsonl")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, _, err := Transcript{}.ReadTurns(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 2 || len(turns[1].Parts) != 2 {
+		t.Fatalf("turns = %+v, want user + assistant with 2 parts", turns)
+	}
+	for i, part := range turns[1].Parts {
+		if len(part.Content) != capBytes+len("\n… (truncated)") {
+			t.Errorf("part %d content is %d bytes, want capped at %d", i, len(part.Content), capBytes)
+		}
+		if !strings.HasSuffix(part.Content, "(truncated)") {
+			t.Errorf("part %d does not end with the truncation marker", i)
+		}
+	}
+}
+
+// TestReadTurnsCompactionSummaryExcerpt proves the marker carries a rune-capped
+// excerpt of the paired compaction/summary.
+func TestReadTurnsCompactionSummaryExcerpt(t *testing.T) {
+	long := strings.Repeat("一", 250)
+	lines := []string{
+		`{"type":"session","version":3,"id":"sess-summary","createdAt":1,"cwd":"/tmp"}`,
+		`{"type":"compaction/summary","seq":1,"time":1000,"data":{"content":[{"type":"text","text":"` + long + `"}]}}`,
+		`{"type":"user/message","seq":2,"time":2000,"surfaceOp":{"op":"replace","startSeq":1,"endSeq":1},"data":{"content":[{"type":"text","text":"condensed"}],"source":{"kind":"plugin","plugin":"compact"}}}`,
+	}
+	p := filepath.Join(t.TempDir(), "summary.jsonl")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, total, err := Transcript{}.ReadTurns(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+	want := "Context compacted\n\n" + strings.Repeat("一", 200) + "…"
+	if turns[0].Content != want {
+		t.Errorf("marker content = %q, want %q", turns[0].Content, want)
+	}
+}
+
+// TestStreamBlockTimes proves only the per-block chunk records contribute a
+// start time, keyed by their content index.
+func TestStreamBlockTimes(t *testing.T) {
+	entries := []streamEntry{
+		{Type: "chunk", Time0: 999, Index: 7}, // non-chunk record: ignored
+		{Type: "reasoning-chunks", Time0: 100, Index: 0},
+		{Type: "text-chunks", Time0: 0, Index: 1}, // no start time: ignored
+		{Type: "tool-call-chunks", Time0: 300, Index: 2},
+		{Type: "finish"},
+	}
+	got := streamBlockTimes(entries)
+	want := map[int]int64{0: 100, 2: 300}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("streamBlockTimes = %v, want %v", got, want)
+	}
+	if got := streamBlockTimes(nil); got != nil {
+		t.Errorf("streamBlockTimes(nil) = %v, want nil", got)
 	}
 }
 

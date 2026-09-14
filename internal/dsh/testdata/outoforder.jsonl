@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"sess-outoforder","createdAt":1789064460000,"cwd":"/tmp/proj"}
+{"type":"user/message","seq":1,"time":1789064461000,"surfaceOp":"append","data":{"content":[{"type":"text","text":"hi"}],"source":{"kind":"user"}}}
+{"type":"assistant/message","seq":5,"time":1789064465000,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"five"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}
+{"type":"assistant/message","seq":2,"time":1789064462000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"role":"assistant","content":[{"type":"text","text":"two"}],"source":{"kind":"model","provider":"deepseek-official","model":"m"}}}}

@@ -79,9 +79,31 @@ type assistantData struct {
 			Model    string `json:"model"`
 		} `json:"source"`
 	} `json:"message"`
-	Usage       *usage `json:"usage"`
-	Interrupted bool   `json:"interrupted"`
+	Usage       *usage        `json:"usage"`
+	Stream      []streamEntry `json:"stream"`
+	Interrupted bool          `json:"interrupted"`
 }
+
+// streamEntry is one record of an assistant message's stream log. Only the
+// per-block chunk records carry time0/index — the epoch-ms a block started
+// streaming and its index in the message's content array; the surrounding
+// chunk/usage/finish records are ignored.
+type streamEntry struct {
+	Type  string `json:"type"`
+	Time0 int64  `json:"time0"`
+	Index int    `json:"index"`
+}
+
+// summaryData is a compaction/summary payload: the condensation text dsh keeps
+// for a compaction checkpoint.
+type summaryData struct {
+	Content []contentBlock `json:"content"`
+	Text    string         `json:"text"`
+}
+
+// maxPartBytes caps a single TurnPart.Content, mirroring internal/jsonl's
+// clampBody: one huge file or model dump must not bloat the transcript payload.
+const maxPartBytes = 32 * 1024
 
 // usage is dsh's per-message token accounting. inputTokens is already uncached
 // (usher's core.TokenUsage convention), so it maps straight across.
@@ -201,6 +223,12 @@ type builder struct {
 	callParts map[string]partRef
 	callTimes map[string]time.Time
 	callMeta  map[string]toolMeta
+	// partSeq records the event seq that produced each turn's parts, so finish
+	// can order them by seq rather than by arrival.
+	partSeq map[*core.Turn][]int64
+	// compactSummary is the most recent compaction/summary text, consumed by the
+	// checkpoint marker that follows it.
+	compactSummary string
 }
 
 type entry struct {
@@ -214,6 +242,7 @@ func newBuilder() *builder {
 		callParts: map[string]partRef{},
 		callTimes: map[string]time.Time{},
 		callMeta:  map[string]toolMeta{},
+		partSeq:   map[*core.Turn][]int64{},
 	}
 }
 
@@ -238,6 +267,8 @@ func (b *builder) event(ev wireEvent) {
 			return // replacement copies are model-only
 		}
 		b.user(ev, d)
+	case "compaction/summary":
+		b.summary(ev)
 	case "assistant/message":
 		if !isAppendOp(ev.SurfaceOp) {
 			return
@@ -304,30 +335,39 @@ func (b *builder) assistant(ev wireEvent) {
 		t.Usage.CacheWrite += d.Usage.CacheWriteTokens
 	}
 
+	// Each block takes its start time from the message's stream record when dsh
+	// logged one, so a reasoning block emitted in the same message as a tool
+	// call still spans a positive "thought for Ns" rather than sharing the
+	// message's end time. Absent a stream record (older logs), the whole
+	// message's timestamp is the fallback.
+	blockTimes := streamBlockTimes(d.Stream)
 	produced := 0
-	for _, blk := range d.Message.Content {
+	for i, blk := range d.Message.Content {
+		bt := ts
+		if v, ok := blockTimes[i]; ok {
+			bt = msTime(v)
+		}
 		switch blk.Type {
 		case "reasoning":
 			if blk.Text == "" {
 				continue
 			}
-			t.Parts = append(t.Parts, core.TurnPart{Type: "thinking", Content: blk.Text, Time: ts})
+			b.addPart(t, ev.Seq, core.TurnPart{Type: "thinking", Content: blk.Text, Time: bt})
 			produced++
 		case "text":
 			if blk.Text == "" {
 				continue
 			}
-			t.Parts = append(t.Parts, core.TurnPart{Type: "text", Content: blk.Text, Time: ts})
+			b.addPart(t, ev.Seq, core.TurnPart{Type: "text", Content: blk.Text, Time: bt})
 			produced++
 		case "tool-call":
 			target := toolTarget(blk.Name, blk.Arguments)
-			idx := len(t.Parts)
-			t.Parts = append(t.Parts, core.TurnPart{
+			idx := b.addPart(t, ev.Seq, core.TurnPart{
 				Type:       "tool",
 				ToolName:   blk.Name,
 				ToolTarget: target,
 				ToolUseID:  blk.ID,
-				Time:       ts,
+				Time:       bt,
 			})
 			if blk.ID != "" {
 				b.callParts[blk.ID] = partRef{turn: t, idx: idx}
@@ -341,8 +381,51 @@ func (b *builder) assistant(ev wireEvent) {
 	// An interrupted message that emitted nothing still happened: keep dsh's
 	// "stopped" hint without inventing content it never produced.
 	if d.Interrupted && produced == 0 {
-		t.Parts = append(t.Parts, core.TurnPart{Type: "text", Content: "— stopped —", Time: ts})
+		b.addPart(t, ev.Seq, core.TurnPart{Type: "text", Content: "— stopped —", Time: ts})
 	}
+}
+
+// streamBlockTimes maps a message content-block index to the epoch-ms at which
+// dsh began streaming it. Only the reasoning/text/tool-call chunk records carry
+// a start time; every other stream record is ignored.
+func streamBlockTimes(entries []streamEntry) map[int]int64 {
+	var out map[int]int64
+	for _, e := range entries {
+		if e.Time0 == 0 {
+			continue
+		}
+		switch e.Type {
+		case "reasoning-chunks", "text-chunks", "tool-call-chunks":
+			if out == nil {
+				out = map[int]int64{}
+			}
+			out[e.Index] = e.Time0
+		}
+	}
+	return out
+}
+
+// summary records a compaction/summary's condensation text for the checkpoint
+// marker that follows it.
+func (b *builder) summary(ev wireEvent) {
+	var d summaryData
+	if json.Unmarshal(ev.Data, &d) != nil {
+		return
+	}
+	if text := joinText(d.Content); text != "" {
+		b.compactSummary = text
+	} else if strings.TrimSpace(d.Text) != "" {
+		b.compactSummary = d.Text
+	}
+}
+
+// addPart appends a part to t and records the seq that produced it, returning
+// the part's index.
+func (b *builder) addPart(t *core.Turn, seq int64, p core.TurnPart) int {
+	idx := len(t.Parts)
+	t.Parts = append(t.Parts, p)
+	b.partSeq[t] = append(b.partSeq[t], seq)
+	return idx
 }
 
 // toolCall records the log-only half of a call: its timestamp and name/target,
@@ -367,14 +450,10 @@ func (b *builder) toolResult(ev wireEvent) {
 	if json.Unmarshal(ev.Data, &d) != nil {
 		return
 	}
-	callID, text, isErr := d.result()
+	callID, text, isErr, errCode := d.result()
 	content := text
 	if isErr {
-		if content == "" {
-			content = "error"
-		} else {
-			content = "error: " + content
-		}
+		content = errorContent(errCode, text)
 	}
 	ts := msTime(ev.Time)
 
@@ -410,19 +489,27 @@ func (b *builder) toolResult(ev wireEvent) {
 			part.DurationMs = dur.Milliseconds()
 		}
 	}
-	t.Parts = append(t.Parts, part)
+	b.addPart(t, ev.Seq, part)
 }
 
-// marker appends the compaction checkpoint turn in seq position.
+// marker appends the compaction checkpoint turn in seq position, carrying a
+// short excerpt of the paired compaction/summary so the condensation is not
+// lost. Without a summary the content stays the exact marker string.
 func (b *builder) marker(ev wireEvent) {
-	b.add(ev.Seq, &core.Turn{Role: "system", Content: "Context compacted", Time: msTime(ev.Time)})
+	content := "Context compacted"
+	if s := strings.TrimSpace(b.compactSummary); s != "" {
+		content += "\n\n" + excerpt(s, 200)
+	}
+	b.compactSummary = ""
+	b.add(ev.Seq, &core.Turn{Role: "system", Content: content, Time: msTime(ev.Time)})
 }
 
 func (b *builder) add(seq int64, t *core.Turn) {
 	b.entries = append(b.entries, entry{seq: seq, turn: t})
 }
 
-// finish orders turns by their first event seq, drops empty rows, stamps
+// finish orders turns by their first event seq, drops empty rows, orders each
+// turn's parts by the seq that produced them, caps part payloads, stamps
 // reasoning durations, and applies the tail limit.
 func (b *builder) finish(limit int) ([]core.Turn, int, error) {
 	sort.SliceStable(b.entries, func(i, j int) bool { return b.entries[i].seq < b.entries[j].seq })
@@ -432,6 +519,10 @@ func (b *builder) finish(limit int) ([]core.Turn, int, error) {
 		if t.Role == "assistant" {
 			if len(t.Parts) == 0 {
 				continue
+			}
+			b.orderParts(t)
+			for i := range t.Parts {
+				t.Parts[i].Content = clampPart(t.Parts[i].Content)
 			}
 			t.StampPartDurations()
 		} else if strings.TrimSpace(t.Content) == "" {
@@ -446,10 +537,10 @@ func (b *builder) finish(limit int) ([]core.Turn, int, error) {
 	return turns, total, nil
 }
 
-// result extracts a tool result's callId, joined display text, and error flag
-// from its message, falling back to the tool-result block's own callId when the
-// message source carries none.
-func (d toolResultData) result() (callID, text string, isErr bool) {
+// result extracts a tool result's callId, joined display text, error flag, and
+// (when dsh recorded a top-level error) its code, falling back to the
+// tool-result block's own callId when the message source carries none.
+func (d toolResultData) result() (callID, text string, isErr bool, errCode string) {
 	callID = d.Message.Source.CallID
 	var texts []string
 	for _, blk := range d.Message.Content {
@@ -470,8 +561,65 @@ func (d toolResultData) result() (callID, text string, isErr bool) {
 	}
 	if len(d.Error) > 0 && string(d.Error) != "null" {
 		isErr = true
+		var e struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(d.Error, &e) == nil {
+			errCode = e.Code
+		}
 	}
-	return callID, strings.Join(texts, "\n"), isErr
+	return callID, strings.Join(texts, "\n"), isErr, errCode
+}
+
+// errorContent renders a failed tool result for display, prefixing dsh's error
+// code when it recorded one: "error: <code>: <text>", dropping empty pieces.
+func errorContent(code, text string) string {
+	parts := []string{"error"}
+	if code != "" {
+		parts = append(parts, code)
+	}
+	if text != "" {
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, ": ")
+}
+
+// orderParts stably reorders a turn's parts by the event seq that produced them,
+// preserving document order for parts that share a seq (the blocks of one
+// assistant message). It is a no-op when the bookkeeping is absent or aligned.
+func (b *builder) orderParts(t *core.Turn) {
+	seqs := b.partSeq[t]
+	if len(seqs) != len(t.Parts) || len(seqs) < 2 {
+		return
+	}
+	order := make([]int, len(seqs))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool { return seqs[order[i]] < seqs[order[j]] })
+	parts := make([]core.TurnPart, len(t.Parts))
+	for dst, src := range order {
+		parts[dst] = t.Parts[src]
+	}
+	t.Parts = parts
+}
+
+// clampPart bounds a part's content so one huge file or model dump cannot bloat
+// the transcript payload, mirroring internal/jsonl's clampBody.
+func clampPart(s string) string {
+	if len(s) <= maxPartBytes {
+		return s
+	}
+	return s[:maxPartBytes] + "\n… (truncated)"
+}
+
+// excerpt returns the first n runes of s, with an ellipsis when clamped.
+func excerpt(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // flattenResultContent pulls text out of a tool-result block's nested content,
