@@ -278,7 +278,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// usher-generated, not proxied, so a strict child CSP still allows it.
 	for _, m := range s.Embeds {
 		prefix := "/embed/" + m.Process.Spec().Name
-		webMux.Handle("GET "+prefix+"/", m.Process.PathHandler(prefix))
+		webMux.Handle(prefix+"/", m.Process.PathHandler(prefix))
 		webMux.HandleFunc("GET "+embedpkg.BootstrapPath(prefix), func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 			_, _ = w.Write(embedpkg.BootstrapJS(prefix))
