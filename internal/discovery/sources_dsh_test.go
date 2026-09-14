@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -205,5 +206,53 @@ func TestDshSource_ScanIgnoresNonSessions(t *testing.T) {
 	sub, ok := d.Get(dshUUID3)
 	if !ok || !sub.IsSubagent || sub.ParentID != dshUUID1 {
 		t.Errorf("subagent = %+v ok=%v, want IsSubagent with parent %s", sub, ok, dshUUID1)
+	}
+}
+
+// TestDshSource_QuarantinesCorruptLog: a session whose log starts with an
+// event instead of the header poisons dsh's own session/list. ReadMeta must
+// move the session dir aside (lossless) once it is old enough that dsh cannot
+// still be writing it.
+func TestDshSource_QuarantinesCorruptLog(t *testing.T) {
+	home := t.TempDir()
+	sessionsDir := filepath.Join(home, "sessions")
+	sessDir := filepath.Join(sessionsDir, "--tmp-proj--", dshUUID2)
+	path := writeDshLog(t, sessDir, "session.v3.jsonl.zstd", true,
+		`{"type":"agent/inbox/spliced","seq":3,"time":1789064460604,"data":{}}`)
+
+	// Old enough to quarantine.
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	src := NewDshSource(sessionsDir)
+	if _, err := src.ReadMeta(path); err == nil {
+		t.Fatal("ReadMeta succeeded on a headerless log; want an error")
+	}
+	if _, err := os.Stat(sessDir); !os.IsNotExist(err) {
+		t.Errorf("session dir still present after quarantine (stat err = %v)", err)
+	}
+	qdir := filepath.Join(home, "quarantine", dshUUID2)
+	if _, err := os.Stat(qdir); err != nil {
+		t.Errorf("quarantined dir %s: %v", qdir, err)
+	}
+}
+
+// TestDshSource_KeepsFreshCorruptLog: a headerless log younger than the grace
+// period might still be mid-write; quarantine must not touch it.
+func TestDshSource_KeepsFreshCorruptLog(t *testing.T) {
+	home := t.TempDir()
+	sessionsDir := filepath.Join(home, "sessions")
+	sessDir := filepath.Join(sessionsDir, "--tmp-proj--", dshUUID2)
+	path := writeDshLog(t, sessDir, "session.v3.jsonl.zstd", true,
+		`{"type":"agent/inbox/spliced","seq":3,"time":1789064460604,"data":{}}`)
+
+	src := NewDshSource(sessionsDir)
+	if _, err := src.ReadMeta(path); err == nil {
+		t.Fatal("ReadMeta succeeded on a headerless log; want an error")
+	}
+	if _, err := os.Stat(sessDir); err != nil {
+		t.Errorf("fresh session dir moved by quarantine: %v", err)
 	}
 }

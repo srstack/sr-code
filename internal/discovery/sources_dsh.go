@@ -24,16 +24,18 @@ import (
 // header line), so reads go through codexrollout.Open, which decodes
 // transparently and drops a torn trailing frame like a torn trailing line.
 type DshSource struct {
-	root     string // <dsh-home>/sessions
-	cacheDir string // <dsh-home>/storages/session_projcache/sessions
+	root          string // <dsh-home>/sessions
+	cacheDir      string // <dsh-home>/storages/session_projcache/sessions
+	quarantineDir string // <dsh-home>/quarantine
 }
 
 // NewDshSource builds a source over dsh's sessions dir; the projection cache
 // (fast title path) sits at the sibling storages/ tree of the same DSH_HOME.
 func NewDshSource(sessionsDir string) DshSource {
 	return DshSource{
-		root:     sessionsDir,
-		cacheDir: filepath.Join(filepath.Dir(sessionsDir), "storages", "session_projcache", "sessions"),
+		root:          sessionsDir,
+		cacheDir:      filepath.Join(filepath.Dir(sessionsDir), "storages", "session_projcache", "sessions"),
+		quarantineDir: filepath.Join(filepath.Dir(sessionsDir), "quarantine"),
 	}
 }
 
@@ -117,6 +119,17 @@ func (s DshSource) ReadMeta(path string) (core.SessionMeta, error) {
 		return meta, fmt.Errorf("dsh session header: %w", err)
 	}
 	if hdr.Type != "session" {
+		// dsh occasionally writes a session log whose first frame is an event
+		// instead of the header (observed twice). dsh's own session/list then
+		// fails wholesale — "first frame is not exactly one header line" — so
+		// every workspace looks empty until the bad log is moved aside. Quarantine
+		// it (lossless: the dir is renamed, never deleted) so both dsh and usher
+		// recover. The age guard avoids racing a log dsh is still writing.
+		if dest, ok := s.quarantineCorrupt(path); ok {
+			return meta, fmt.Errorf(
+				"dsh session %s: corrupt header frame (first line is %q); quarantined to %s",
+				path, string(bytes.TrimSpace(sc.Bytes()[:min(len(sc.Bytes()), 80)])), dest)
+		}
 		return meta, fmt.Errorf("dsh session %s: unexpected header type %q", path, hdr.Type)
 	}
 	meta.Cwd = hdr.Cwd
@@ -135,6 +148,36 @@ func (s DshSource) ReadMeta(path string) (core.SessionMeta, error) {
 	}
 	return meta, nil
 }
+
+// quarantineCorrupt moves a session dir whose log has no valid header frame
+// aside, under <dsh-home>/quarantine. It refuses files younger than a small
+// grace period so a log dsh is still writing is never touched. Returns the
+// destination and whether the move happened.
+func (s DshSource) quarantineCorrupt(path string) (string, bool) {
+	if s.quarantineDir == "" {
+		return "", false
+	}
+	info, err := os.Stat(path)
+	if err != nil || time.Since(info.ModTime()) < dshQuarantineGrace {
+		return "", false
+	}
+	src := filepath.Dir(path)
+	dest := filepath.Join(s.quarantineDir, filepath.Base(src))
+	if _, err := os.Stat(dest); err == nil {
+		dest = fmt.Sprintf("%s-%d", dest, time.Now().UnixNano())
+	}
+	if err := os.MkdirAll(s.quarantineDir, 0o700); err != nil {
+		return "", false
+	}
+	if err := os.Rename(src, dest); err != nil {
+		return "", false
+	}
+	return dest, true
+}
+
+// dshQuarantineGrace keeps quarantine away from logs dsh may still be appending
+// to; a real corruption never self-heals, so waiting costs nothing.
+const dshQuarantineGrace = 2 * time.Minute
 
 // cachedTitle reads dsh's advisory projection cache for the session's latest
 // title. Missing or malformed caches yield "" (the caller falls back).
