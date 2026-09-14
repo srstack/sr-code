@@ -134,7 +134,8 @@ func rebaseResponse(r *http.Response, prefix string) error {
 	ct := r.Header.Get("Content-Type")
 	isHTML := strings.Contains(ct, "text/html")
 	isCSS := strings.Contains(ct, "text/css")
-	if !isHTML && !isCSS {
+	isJS := strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript")
+	if !isHTML && !isCSS && !isJS {
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRebaseBytes+1))
@@ -146,10 +147,13 @@ func rebaseResponse(r *http.Response, prefix string) error {
 		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 		return nil
 	}
-	if isHTML {
+	switch {
+	case isHTML:
 		body = rebaseHTML(body, prefix)
-	} else {
+	case isCSS:
 		body = rebaseCSS(body, prefix)
+	default:
+		body = rebaseJS(body, prefix)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -190,4 +194,16 @@ func rebaseCSS(body []byte, prefix string) []byte {
 		sub := cssURLRe.FindSubmatch(m)
 		return []byte("url(" + rebaseRef(prefix, string(sub[1])) + ")")
 	})
+}
+
+// jsAssetRe rewrites root-absolute ASSET namespaces inside JavaScript. The
+// runtime bootstrap covers API calls (fetch/XHR/WebSocket/EventSource) and the
+// history API, but ES module dynamic imports (dsh loads its plugin bundles via
+// import("/plugins/…")) cannot be patched at runtime, so their literals are
+// rebased here. The allowlist keeps us away from arbitrary path strings and
+// from /api, which the bootstrap handles.
+var jsAssetRe = regexp.MustCompile("([\"'`])/(plugins|assets|static|_next|chunks)/")
+
+func rebaseJS(body []byte, prefix string) []byte {
+	return jsAssetRe.ReplaceAll(body, []byte("${1}"+prefix+"/${2}/"))
 }

@@ -246,3 +246,30 @@ func wsAccept(key string) string {
 	io.WriteString(h, key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
+
+func TestProxyPathHandlerRebasesJSAssets(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		fmt.Fprint(w, `const x = import("/plugins/??a/client.js,b/client.js");const y="/assets/app.js";const z=fetch("/api/session/list");`)
+	}))
+	defer upstream.Close()
+	p := &Process{spec: Spec{Name: "test"}, childURL: upstream.URL}
+	proxy := httptest.NewServer(p.PathHandler("/embed/test"))
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/embed/test/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `import("/embed/test/plugins/??a/client.js,b/client.js")`) {
+		t.Errorf("dynamic import not rebased: %s", body)
+	}
+	if !strings.Contains(string(body), `"/embed/test/assets/app.js"`) {
+		t.Errorf("asset literal not rebased: %s", body)
+	}
+	if !strings.Contains(string(body), `fetch("/api/session/list")`) {
+		t.Errorf("/api must be left to the runtime bootstrap: %s", body)
+	}
+}
