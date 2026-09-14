@@ -115,13 +115,31 @@ func New(d *discovery.Discovery, backends map[string]backendpkg.Backend, default
 
 // Backends returns the enabled backend names, sorted ("claude" before "codex").
 // The web layer uses it to show only available backends in the model picker.
+// Transcript-only backends (nil Runtime) are omitted: they can be rendered but
+// not started, so they must never be offered as a new-session choice.
 func (r *Router) Backends() []string {
 	out := make([]string, 0, len(r.backends))
-	for b := range r.backends {
+	for b, be := range r.backends {
+		if be.Runtime == nil {
+			continue
+		}
 		out = append(out, b)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ReadOnly reports whether a session's backend is transcript-only — registered
+// with a nil Runtime, so it can be listed and read but never sent to.
+func (r *Router) ReadOnly(id string) bool {
+	b, ok := r.backends[r.backendOf(id)]
+	return ok && b.Runtime == nil
+}
+
+// readOnlyError is the failure for any operation that needs a live Runtime on
+// a transcript-only backend.
+func readOnlyError(backendName string) error {
+	return fmt.Errorf("backend %q is read-only", backendName)
 }
 
 // Backend returns the composed capabilities registered for backendName.
@@ -197,8 +215,10 @@ func (r *Router) senderFor(id string) backendpkg.Runtime {
 // used for hook ownership, where the session's backend may not be resolved yet.
 func (r *Router) anyHas(id string) bool {
 	for _, b := range r.backends {
-		s := b.Runtime
-		if s.Has(id) {
+		if b.Runtime == nil {
+			continue
+		}
+		if b.Runtime.Has(id) {
 			return true
 		}
 	}
@@ -209,8 +229,10 @@ func (r *Router) anyHas(id string) bool {
 func (r *Router) liveSet() map[string]bool {
 	set := map[string]bool{}
 	for _, b := range r.backends {
-		s := b.Runtime
-		for _, id := range s.LiveSessions() {
+		if b.Runtime == nil {
+			continue
+		}
+		for _, id := range b.Runtime.LiveSessions() {
 			set[id] = true
 		}
 	}
@@ -348,7 +370,7 @@ func (r *Router) GetSession(id string) (core.Session, bool) {
 	r.sendMu.Unlock()
 	if running {
 		sess.Status = core.StatusRunning
-	} else if r.senderForBackend(sess.Backend).Has(id) {
+	} else if s := r.senderForBackend(sess.Backend); s != nil && s.Has(id) {
 		sess.Status = core.StatusLive
 	}
 	r.applyCustomTitle(&sess)
@@ -536,8 +558,10 @@ func (r *Router) stopLive(id string) {
 	if tok != nil {
 		tok.cancel()
 	}
-	if err := r.senderFor(id).Kill(id); err != nil {
-		slog.Warn("kill session window", "session", id, "err", err)
+	if s := r.senderFor(id); s != nil {
+		if err := s.Kill(id); err != nil {
+			slog.Warn("kill session window", "session", id, "err", err)
+		}
 	}
 }
 
@@ -571,6 +595,9 @@ func (r *Router) enqueueSend(id, text, model string, pre func(), abort func(erro
 	}
 	if sess.IsSubagent {
 		return errors.New("subagent transcripts are read-only")
+	}
+	if r.ReadOnly(id) {
+		return readOnlyError(r.backendOf(id))
 	}
 	// Reorder the sidebar the instant the user sends, without waiting for the
 	// prompt to land in the jsonl (see discovery.MarkInput).
@@ -615,6 +642,14 @@ func (r *Router) runSend(ctx context.Context, sessionID, prompt, cwd, model stri
 	}
 	started := time.Now()
 	rt := r.senderFor(sessionID)
+	if rt == nil {
+		// Transcript-only backend: nothing can run a turn. Report it the way a
+		// failed send would, so a relay collector on the other end still ends.
+		r.markSendIdle(sessionID, tok)
+		errMsg, _ := json.Marshal(backendpkg.ErrorPayload{Message: readOnlyError(r.backendOf(sessionID)).Error()})
+		r.broker.Publish(broker.Event{SessionID: sessionID, Type: backendpkg.EventError, Raw: errMsg})
+		return
+	}
 	var ch <-chan sender.StreamEvent
 	if model != "" {
 		if ms, ok := rt.(interface {
@@ -910,8 +945,10 @@ func (r *Router) CancelSend(sessionID string) error {
 	// Cancel means stop: drop queued follow-ups too, before cancelling the
 	// turn, so releaseSend finds nothing to promote.
 	r.flushSendQueue(sessionID, errors.New("cancelled"))
-	if err := r.senderFor(sessionID).Interrupt(sessionID); err != nil {
-		slog.Warn("interrupt session turn", "session", sessionID, "err", err)
+	if s := r.senderFor(sessionID); s != nil {
+		if err := s.Interrupt(sessionID); err != nil {
+			slog.Warn("interrupt session turn", "session", sessionID, "err", err)
+		}
 	}
 	tok.cancel()
 	return nil
@@ -1491,7 +1528,11 @@ func (r *Router) beginNewSession(ctx context.Context, cancel context.CancelFunc,
 	if _, err := r.transcriptForBackend(backendName); err != nil {
 		return "", nil, nil, err
 	}
-	id, ch, err := r.senderForBackend(backendName).Start(ctx, backendpkg.StartRequest{
+	rt := r.senderForBackend(backendName)
+	if rt == nil {
+		return "", nil, nil, readOnlyError(backendName)
+	}
+	id, ch, err := rt.Start(ctx, backendpkg.StartRequest{
 		Cwd: cwd, Prompt: prompt, Model: model,
 	})
 	if err != nil {

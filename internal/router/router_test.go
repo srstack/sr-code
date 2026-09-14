@@ -16,6 +16,7 @@ import (
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/discovery"
 	"github.com/nexustar/usher/internal/sender"
+	"github.com/nexustar/usher/internal/sessionmeta"
 	"github.com/nexustar/usher/internal/transcript"
 )
 
@@ -448,7 +449,7 @@ func newQueueTestRouter(t *testing.T) *Router {
 	}
 	r := &Router{
 		discovery:      d,
-		backends:       map[string]backend.Backend{"claude": {Transcript: transcript.Claude{}}},
+		backends:       map[string]backend.Backend{"claude": {Runtime: routerStubRuntime{}, Transcript: transcript.Claude{}}},
 		defaultBackend: "claude",
 		broker:         broker.New(),
 		activeSend:     map[string]*sendToken{},
@@ -602,5 +603,165 @@ func TestValidateCreateInputsResolvesSymlinks(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("cwd = %q, want %q", got, want)
+	}
+}
+
+// --- transcript-only (read-only) backends ---------------------------------
+
+// routerStubRuntime satisfies backend.Runtime so a normal backend can be probed
+// for liveness without spawning a real agent process.
+type routerStubRuntime struct{}
+
+func (routerStubRuntime) Start(context.Context, backend.StartRequest) (string, <-chan backend.Event, error) {
+	return "", nil, nil
+}
+func (routerStubRuntime) Send(context.Context, string, string, string) (<-chan backend.Event, error) {
+	return nil, nil
+}
+func (routerStubRuntime) Has(string) bool        { return false }
+func (routerStubRuntime) LiveSessions() []string { return nil }
+func (routerStubRuntime) Interrupt(string) error { return nil }
+func (routerStubRuntime) Kill(string) error      { return nil }
+func (routerStubRuntime) Shutdown()              {}
+
+// newReadOnlyTestRouter builds a router over two discovered sessions: a dsh
+// session whose backend is registered transcript-only (nil Runtime) and a
+// normal claude session with a stub Runtime. Returns the router and both ids.
+func newReadOnlyTestRouter(t *testing.T) (r *Router, dshID, claudeID string) {
+	t.Helper()
+	home := t.TempDir()
+	sessionsDir := filepath.Join(home, "dsh", "sessions")
+
+	dshID = "11111111-2222-3333-4444-555555555555"
+	dshDir := filepath.Join(sessionsDir, "--tmp-proj--", dshID)
+	if err := os.MkdirAll(dshDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dshLog := `{"type":"session","version":3,"id":"` + dshID + `","createdAt":1789064460603,"cwd":"/tmp/proj","isSeeded":false}` + "\n" +
+		`{"type":"user/message","seq":1,"time":1789064460604,"data":{"content":[{"type":"text","text":"hello dsh"}],"source":{"kind":"user"}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dshDir, "session.v3.jsonl"), []byte(dshLog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	claudeRoot := filepath.Join(home, "claude")
+	claudeID = "abc12345"
+	claudePath := filepath.Join(claudeRoot, "-tmp-x", claudeID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudeLine := `{"type":"user","sessionId":"` + claudeID + `","cwd":"/tmp/x","timestamp":"2026-07-01T10:00:00.000Z","message":{"role":"user","content":"seed"},"uuid":"u1"}` + "\n"
+	if err := os.WriteFile(claudePath, []byte(claudeLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := discovery.NewMulti(nil,
+		discovery.NewClaudeSource(claudeRoot),
+		discovery.NewDshSource(sessionsDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r = &Router{
+		discovery: d,
+		backends: map[string]backend.Backend{
+			"dsh":    {Transcript: transcript.Claude{}}, // transcript-only: nil Runtime
+			"claude": {Runtime: routerStubRuntime{}, Transcript: transcript.Claude{}},
+		},
+		defaultBackend: "claude",
+		broker:         broker.New(),
+		meta:           sessionmeta.New(filepath.Join(home, "meta.json"), 0),
+		activeSend:     map[string]*sendToken{},
+		sendQueue:      map[string][]pendingSend{},
+		creating:       map[string]core.Session{},
+	}
+	return r, dshID, claudeID
+}
+
+// TestReadOnlyBackend proves a transcript-only backend is safe for reads and
+// fails cleanly (never panics) on writes.
+func TestReadOnlyBackend(t *testing.T) {
+	r, dshID, claudeID := newReadOnlyTestRouter(t)
+
+	// The new-session picker must never offer a Runtime-less backend.
+	if got := r.Backends(); len(got) != 1 || got[0] != "claude" {
+		t.Fatalf("Backends() = %v, want [claude] (transcript-only omitted)", got)
+	}
+
+	// List and GetSession must render the read-only session.
+	var listed bool
+	for _, s := range r.ListSessions() {
+		if s.ID == dshID {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("ListSessions() omitted transcript-only session %s", dshID)
+	}
+	sess, ok := r.GetSession(dshID)
+	if !ok {
+		t.Fatalf("GetSession(%s) = not found", dshID)
+	}
+	if sess.Status == core.StatusRunning || sess.Status == core.StatusLive {
+		t.Errorf("transcript-only session status = %q, want idle", sess.Status)
+	}
+	if _, _, err := r.ReadTurns(dshID, 0); err != nil {
+		t.Errorf("ReadTurns on transcript-only session: %v", err)
+	}
+
+	// ReadOnly tells the web DTO which sessions can't be sent to.
+	if !r.ReadOnly(dshID) {
+		t.Errorf("ReadOnly(%s) = false, want true", dshID)
+	}
+	if r.ReadOnly(claudeID) {
+		t.Errorf("ReadOnly(%s) = true, want false for a runtime-backed backend", claudeID)
+	}
+	if r.anyHas(dshID) {
+		t.Error("anyHas on a transcript-only backend = true, want false")
+	}
+
+	// Writes must error, not panic.
+	if err := r.SendToSession(dshID, "hi"); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("SendToSession = %v, want read-only error", err)
+	}
+	if err := r.SendToSessionWithModel(dshID, "hi", ""); err == nil {
+		t.Error("SendToSessionWithModel on read-only backend: want error")
+	}
+	if _, err := r.StartSessionWithBackend("dsh", t.TempDir(), "hi", ""); err == nil {
+		t.Error("StartSessionWithBackend on read-only backend: want error")
+	}
+	if err := r.PauseSession(dshID); err != nil {
+		t.Errorf("PauseSession on read-only backend: %v", err)
+	}
+
+	// Cancel with an in-flight token must reach the nil-Runtime guard instead
+	// of panicking on Interrupt.
+	r.sendMu.Lock()
+	r.activeSend[dshID] = &sendToken{cancel: func() {}}
+	r.sendMu.Unlock()
+	if err := r.CancelSend(dshID); err != nil {
+		t.Errorf("CancelSend on read-only backend with active token: %v", err)
+	}
+}
+
+// TestRunSendTranscriptOnlyPublishesError proves the turn executor itself bails
+// on a nil Runtime (defense in depth behind enqueueSend's guard).
+func TestRunSendTranscriptOnlyPublishesError(t *testing.T) {
+	r, dshID, _ := newReadOnlyTestRouter(t)
+	sub, unsub := r.broker.Subscribe(dshID)
+	defer unsub()
+
+	r.runSend(context.Background(), dshID, "hi", "/tmp/proj", "", &sendToken{cancel: func() {}})
+
+	select {
+	case ev := <-sub:
+		if ev.Type != backend.EventError || !strings.Contains(string(ev.Raw), "read-only") {
+			t.Fatalf("runSend published %s %s, want an error event mentioning read-only", ev.Type, ev.Raw)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runSend published no error event")
 	}
 }
