@@ -210,8 +210,18 @@ func (p *Process) scanStream(name string, urlRe *regexp.Regexp, captureOnce *syn
 				continue
 			}
 			captureOnce.Do(func() {
+				// The child may carry its boot token as a query (?token=…) or a
+				// fragment (#token=…, kimi 2.0). Preserve whichever is present
+				// so the iframe URL inherits it.
+				suffix := ""
 				if u.RawQuery != "" {
-					p.query.Store("?" + u.RawQuery)
+					suffix = "?" + u.RawQuery
+				}
+				if u.Fragment != "" {
+					suffix += "#" + u.Fragment
+				}
+				if suffix != "" {
+					p.query.Store(suffix)
 				}
 			})
 		}

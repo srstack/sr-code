@@ -30,7 +30,11 @@ func TestMain(m *testing.M) {
 				port = os.Args[i+1]
 			}
 		}
-		fmt.Println("listening on http://127.0.0.1:" + port + "/?token=sekret") // stdout capture target
+		if os.Getenv("EMBED_TEST_URL_STYLE") == "fragment" {
+			fmt.Println("Local:    http://127.0.0.1:" + port + "/#token=sekret")
+		} else {
+			fmt.Println("listening on http://127.0.0.1:" + port + "/?token=sekret") // stdout capture target
+		}
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 		http.ListenAndServe("127.0.0.1:"+port, nil)
 		os.Exit(0)
@@ -98,4 +102,29 @@ func TestProcessRestartsAfterEarlyExit(t *testing.T) {
 		t.Fatalf("restarted child not serving: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// TestProcessCapturesFragmentToken: children that put the boot token in the
+// URL fragment (kimi 2.0 prints http://host:port/#token=…) must have it
+// captured, not just query strings.
+func TestProcessCapturesFragmentToken(t *testing.T) {
+	self, _ := os.Executable()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p, err := Start(ctx, Spec{
+		Name: "test", Title: "Test", Cmd: self,
+		Args:       []string{"--port", "{port}"},
+		Env:        []string{"EMBED_TEST_CHILD=1", "EMBED_TEST_URL_STYLE=fragment"},
+		HealthPath: "/", URLPattern: `(http://\S+)`,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for p.StartQuery() == "" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := p.StartQuery(); got != "#token=sekret" {
+		t.Fatalf("StartQuery = %q, want %q", got, "#token=sekret")
+	}
 }
