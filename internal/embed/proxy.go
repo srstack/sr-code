@@ -93,6 +93,9 @@ func (p *Process) proxy(rebase string) *httputil.ReverseProxy {
 		if req.Header.Get("Origin") != "" {
 			req.Header.Set("Origin", target.Scheme+"://"+target.Host)
 		}
+		if p.spec.BasicAuth != "" {
+			req.SetBasicAuth(splitBasicAuth(p.spec.BasicAuth))
+		}
 		if rebase != "" {
 			// Force an identity upstream response: rebasing has to read the
 			// body, and compressed bytes cannot be rewritten as text.
@@ -127,6 +130,16 @@ func (p *Process) proxy(rebase string) *httputil.ReverseProxy {
 		http.Error(w, fmt.Sprintf("embed %q is not ready", p.spec.Name), http.StatusBadGateway)
 	}
 	return proxy
+}
+
+// splitBasicAuth splits "user:pass" into its parts; a missing colon means the
+// whole value is the username.
+func splitBasicAuth(cred string) (string, string) {
+	user, pass, ok := strings.Cut(cred, ":")
+	if !ok {
+		return cred, ""
+	}
+	return user, pass
 }
 
 // maxRebaseBytes caps body rewriting; larger payloads (bundles) pass through

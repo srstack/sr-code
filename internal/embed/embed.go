@@ -50,6 +50,11 @@ type Spec struct {
 	// /api/... on the page origin (dsh's RPC stream and WebSocket) need it;
 	// at most one embed may set it.
 	RootAPI bool
+	// BasicAuth, when set as "user:pass", is injected as an Authorization
+	// header on every proxied request. opencode 2's `serve` protects its API
+	// with HTTP Basic auth; usher's auth is the perimeter, so the child never
+	// needs the browser to hold the credential.
+	BasicAuth string
 }
 
 // Process is a running embedded child.

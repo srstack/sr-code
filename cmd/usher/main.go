@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -143,6 +145,9 @@ func serve(args []string) error {
 		"dsh sessions directory ($DSH_HOME/sessions); dsh sessions are listed in the sidebar when it exists")
 	openCodeWebPort := fs.Int("opencode-web-port", 7782,
 		"usher-side port for the embedded OpenCode web UI (child reuses the -opencode binary); 0 disables")
+	openCodeWebCmd := fs.String("opencode-web", "",
+		"binary for the embedded OpenCode web UI; empty reuses -opencode. Point it at opencode2 to embed the v2 UI "+
+			"(opencode2 serve: v2 API + web, HTTP Basic auth, injected by usher)")
 	openCodeDir := fs.String("opencode-dir", "",
 		"working directory for the embedded opencode child; opencode's web UI shows sessions of the cwd project, so set this to your main project (empty inherits usher's cwd)")
 	kimiCmd := fs.String("kimi", "",
@@ -407,7 +412,7 @@ func serve(args []string) error {
 	// Their lifetimes are bound to ctx (CommandContext kills them on
 	// shutdown); a missing binary or failed start just skips that embed.
 	var embedMounts []web.EmbedMount
-	specs, mounts := embedSpecs(*dshCmd, *dshPort, *dshDir, *openCodeCmd, *openCodeWebPort, *openCodeDir, *kimiCmd, *kimiPort)
+	specs, mounts := embedSpecs(*dshCmd, *dshPort, *dshDir, *openCodeCmd, *openCodeWebPort, *openCodeDir, *openCodeWebCmd, *kimiCmd, *kimiPort)
 	for i, spec := range specs {
 		proc, err := embed.Start(ctx, spec, logger)
 		if err != nil {
@@ -537,7 +542,7 @@ var _ pluginapi.RouterAPI = (*router.Router)(nil)
 // usher-side listen ports. A UI is included only when its binary name is
 // non-empty AND its port is non-zero. Mounts are returned aligned with
 // specs; Process is filled in by serve() once each child starts.
-func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort int, ocDir string, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
+func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort int, ocDir string, ocWebCmd string, kimiCmd string, kimiPort int) ([]embed.Spec, []web.EmbedMount) {
 	var specs []embed.Spec
 	var mounts []web.EmbedMount
 	add := func(cmd string, port int, spec embed.Spec) {
@@ -559,12 +564,24 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		Dir:     dshDir,
 		RootAPI: true,
 	})
-	add(ocCmd, ocPort, embed.Spec{
-		Name: "opencode", Title: "OpenCode",
-		Args:       []string{"web", "--port", "{port}", "--hostname", "127.0.0.1"},
-		HealthPath: "/",
-		Dir:        ocDir,
-	})
+	// OpenCode web: v1 and v2 differ. v1 (`opencode web`) binds loopback and is
+	// unauthenticated; v2 (`opencode2 serve`) serves the new UI behind HTTP
+	// Basic auth, so usher generates a password (exported to the child, also
+	// injected into proxied requests) and pins --hostname/--port.
+	ocWebBin := ocWebCmd
+	if ocWebBin == "" {
+		ocWebBin = ocCmd
+	}
+	ocSpec := embed.Spec{Name: "opencode", Title: "OpenCode", HealthPath: "/", Dir: ocDir}
+	if strings.Contains(filepath.Base(ocWebBin), "opencode2") {
+		pw := randomHex(24)
+		ocSpec.Args = []string{"serve", "--hostname", "127.0.0.1", "--port", "{port}"}
+		ocSpec.Env = []string{"OPENCODE_SERVER_PASSWORD=" + pw}
+		ocSpec.BasicAuth = "opencode:" + pw
+	} else {
+		ocSpec.Args = []string{"web", "--port", "{port}", "--hostname", "127.0.0.1"}
+	}
+	add(ocWebBin, ocPort, ocSpec)
 	// Flags per Moonshot kimi-cli (`kimi web --no-open --port N`, loopback by
 	// default). kimi 2.x prints "Local: http://127.0.0.1:N/#token=…" — the
 	// token travels in the URL fragment, which embed.Start captures and the
@@ -575,6 +592,15 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		HealthPath: "/", URLPattern: `(http://\S+)`,
 	})
 	return specs, mounts
+}
+
+// randomHex returns n random bytes hex-encoded, for generated child secrets.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b)
 }
 
 // hookSockPath returns the Unix socket path for the hook listener.

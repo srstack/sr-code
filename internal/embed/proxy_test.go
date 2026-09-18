@@ -334,3 +334,41 @@ func newTestProcess(target string) *Process {
 	p.query.Store("")
 	return p
 }
+
+func TestProxyInjectsBasicAuth(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	p := newTestProcess(upstream.URL)
+	p.spec.BasicAuth = "opencode:s3cret"
+	proxy := httptest.NewServer(p.Handler())
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/api/session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	user, pass, ok := parseBasic(gotAuth)
+	if !ok || user != "opencode" || pass != "s3cret" {
+		t.Fatalf("upstream Authorization = %q, want basic opencode:s3cret", gotAuth)
+	}
+}
+
+// parseBasic decodes a "Basic <b64>" header value.
+func parseBasic(h string) (user, pass string, ok bool) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(h, prefix) {
+		return "", "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(h, prefix))
+	if err != nil {
+		return "", "", false
+	}
+	u, p, found := strings.Cut(string(raw), ":")
+	return u, p, found
+}

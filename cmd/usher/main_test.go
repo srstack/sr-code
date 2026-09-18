@@ -1,11 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
 func TestEmbedSpecsAllEnabled(t *testing.T) {
-	specs, mounts := embedSpecs("dsh", 7781, "/home/user/project", "opencode", 7782, "/home/user/oc-project", "kimi", 7783)
+	specs, mounts := embedSpecs("dsh", 7781, "/home/user/project", "opencode", 7782, "/home/user/oc-project", "", "kimi", 7783)
 	if len(specs) != 3 || len(mounts) != 3 {
 		t.Fatalf("got %d specs, %d mounts; want 3 each", len(specs), len(mounts))
 	}
@@ -73,7 +74,7 @@ func TestEmbedSpecsDisabled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			specs, mounts := embedSpecs(
 				tc.args[0].(string), tc.args[1].(int), "",
-				tc.args[2].(string), tc.args[3].(int), "",
+				tc.args[2].(string), tc.args[3].(int), "", "",
 				tc.args[4].(string), tc.args[5].(int),
 			)
 			if len(specs) != tc.want {
@@ -93,4 +94,31 @@ func hasArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestEmbedSpecsOpenCodeV2(t *testing.T) {
+	specs, _ := embedSpecs("", 0, "", "opencode", 7782, "/home/user/proj", "/usr/local/bin/opencode2", "", 0)
+	if len(specs) != 1 {
+		t.Fatalf("got %d specs, want 1", len(specs))
+	}
+	s := specs[0]
+	if s.Name != "opencode" || s.Cmd != "/usr/local/bin/opencode2" {
+		t.Fatalf("spec = %+v, want the opencode2 binary", s)
+	}
+	if len(s.Args) != 0 && s.Args[0] != "serve" {
+		t.Errorf("args = %v, want serve ...", s.Args)
+	}
+	var env, auth string
+	for _, e := range s.Env {
+		if strings.HasPrefix(e, "OPENCODE_SERVER_PASSWORD=") {
+			env = strings.TrimPrefix(e, "OPENCODE_SERVER_PASSWORD=")
+		}
+	}
+	auth = s.BasicAuth
+	if _, pass, ok := strings.Cut(auth, ":"); !ok || pass == "" || pass != env {
+		t.Errorf("BasicAuth %q must carry the generated password %q", auth, env)
+	}
+	if !hasArg(s.Args, "{port}") {
+		t.Errorf("args %v missing {port}", s.Args)
+	}
 }
