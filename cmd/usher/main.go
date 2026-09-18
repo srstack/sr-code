@@ -147,7 +147,7 @@ func serve(args []string) error {
 		"working directory for the embedded opencode child; opencode's web UI shows sessions of the cwd project, so set this to your main project (empty inherits usher's cwd)")
 	kimiCmd := fs.String("kimi", "",
 		"path to the Moonshot kimi-cli binary (embedded Kimi Code web UI); empty disables. "+
-			"Off by default: the \"kimi\" on PATH here is the unrelated kimi-code npm wrapper with no web UI")
+			"Set it in the service (e.g. --kimi ~/.local/bin/kimi); kimi 2.x binds loopback and prints its token URL")
 	kimiPort := fs.Int("kimi-port", 7783, "usher-side port for the embedded Kimi Code UI; 0 disables")
 	permissionMode := fs.String("permission-mode", "default",
 		"--permission-mode passed to claude (default|manual|acceptEdits|bypassPermissions|plan); "+
@@ -565,11 +565,10 @@ func embedSpecs(dshCmd string, dshPort int, dshDir string, ocCmd string, ocPort 
 		HealthPath: "/",
 		Dir:        ocDir,
 	})
-	// Flags per Moonshot kimi-cli docs (`kimi web --port N --no-open`,
-	// loopback by default, prints an access URL carrying the auth token).
-	// NOTE: not smoke-tested — this machine's `kimi` on PATH is the
-	// unrelated whitesmith/kimi-code npm wrapper (no web subcommand), so
-	// the --kimi flag defaults to empty (disabled).
+	// Flags per Moonshot kimi-cli (`kimi web --no-open --port N`, loopback by
+	// default). kimi 2.x prints "Local: http://127.0.0.1:N/#token=…" — the
+	// token travels in the URL fragment, which embed.Start captures and the
+	// iframe inherits. Verified against kimi 2.0.0.
 	add(kimiCmd, kimiPort, embed.Spec{
 		Name: "kimi", Title: "Kimi Code",
 		Args:       []string{"web", "--no-open", "--port", "{port}"},
