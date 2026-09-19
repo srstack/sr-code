@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "1.0.0",
+  "dataModelVersion": 1,
+  "id": "sess_94d89c0d-7d10-4e1f-b45a-6a32d599b7eb",
+  "title": "Create a file named kprobe.txt containing 'hi', using your file writing tool....",
+  "agentMode": "vibe",
+  "workspacePaths": [
+    "/tmp/opencode/qtest"
+  ],
+  "rootPaths": [
+    "/tmp/opencode/qtest"
+  ],
+  "createdAt": "2026-09-19T17:46:22.039Z",
+  "lastModifiedAt": "2026-09-19T17:46:26.704Z",
+  "modelId": "gpt-5.6-sol",
+  "semanticReviewEnabled": true,
+  "disableAutoCompaction": false,
+  "ftaEnabled": false,
+  "workflowsEnabled": false,
+  "specPlanEnabled": false,
+  "specWorkflow": "quick",
+  "specSkipClarificationEnabled": true,
+  "status": "idle"
+}

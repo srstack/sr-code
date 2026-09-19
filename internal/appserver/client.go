@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -323,7 +324,7 @@ func (c *Client) handleServerRequest(m rpcMessage) {
 	case "mcpServer/elicitation/request":
 		c.mcpElicitation(m)
 	case "item/tool/requestUserInput":
-		c.replyError(m.ID, -32000, "request_user_input is not supported by this usher client")
+		c.requestUserInput(m)
 	case "item/tool/call":
 		c.replyError(m.ID, -32000, "dynamic client tools are not supported by this usher client")
 	case "currentTime/read":
@@ -338,14 +339,24 @@ func (c *Client) handleServerRequest(m rpcMessage) {
 	}
 }
 
-// mcpElicitation handles confirmation forms; forms requiring input are declined.
+// mcpElicitation handles confirmation forms and input forms. Confirmations
+// surface as allow/deny; forms with fields surface as the question picker
+// (enum fields become options, everything else takes free text) and the
+// answers go back as the elicitation content.
 func (c *Client) mcpElicitation(m rpcMessage) {
 	var p struct {
 		ThreadID        string `json:"threadId"`
 		ServerName      string `json:"serverName"`
 		Mode            string `json:"mode"`
+		Message         string `json:"message"`
 		RequestedSchema struct {
-			Required []string `json:"required"`
+			Required   []string `json:"required"`
+			Properties map[string]struct {
+				Type        string   `json:"type"`
+				Title       string   `json:"title"`
+				Description string   `json:"description"`
+				Enum        []string `json:"enum"`
+			} `json:"properties"`
 		} `json:"requestedSchema"`
 	}
 	if err := json.Unmarshal(m.Params, &p); err != nil {
@@ -358,14 +369,67 @@ func (c *Client) mcpElicitation(m rpcMessage) {
 	cwd := c.threads[p.ThreadID]
 	c.mu.Unlock()
 
+	tool := "MCP"
+	if p.ServerName != "" {
+		tool += ": " + p.ServerName
+	}
+	isForm := p.Mode == "form" || p.Mode == "openai/form"
 	action := "decline"
 	var content any
-	confirmation := (p.Mode == "form" || p.Mode == "openai/form") && len(p.RequestedSchema.Required) == 0
-	if confirmation && h != nil {
-		tool := "MCP"
-		if p.ServerName != "" {
-			tool += ": " + p.ServerName
+
+	switch {
+	case isForm && len(p.RequestedSchema.Properties) > 0 && h != nil:
+		// Input form: one question per schema property.
+		keys := make([]string, 0, len(p.RequestedSchema.Properties))
+		for k := range p.RequestedSchema.Properties {
+			keys = append(keys, k)
 		}
+		sort.Strings(keys)
+		questions := make([]map[string]any, 0, len(keys))
+		for _, k := range keys {
+			prop := p.RequestedSchema.Properties[k]
+			text := prop.Title
+			if text == "" {
+				text = k
+			}
+			if prop.Description != "" {
+				text += " — " + prop.Description
+			}
+			var opts []map[string]any
+			for _, e := range prop.Enum {
+				opts = append(opts, map[string]any{"label": e})
+			}
+			questions = append(questions, map[string]any{
+				"question": text, "header": tool, "multiSelect": false, "options": opts,
+			})
+		}
+		input, _ := json.Marshal(map[string]any{"questions": questions})
+		r, err := h.Submit(context.Background(), hook.Event{
+			SessionID: p.ThreadID,
+			Event:     "PermissionRequest",
+			ToolName:  "AskUserQuestion",
+			ToolInput: input,
+			Cwd:       cwd,
+		})
+		if err == nil && r.Behavior == "allow" {
+			action = "accept"
+			content = map[string]any{}
+			for _, k := range keys {
+				prop := p.RequestedSchema.Properties[k]
+				text := prop.Title
+				if text == "" {
+					text = k
+				}
+				if prop.Description != "" {
+					text += " — " + prop.Description
+				}
+				if a := r.Answers[text]; a != "" {
+					content.(map[string]any)[k] = a
+				}
+			}
+		}
+	case isForm && h != nil:
+		// Confirmation-only form: plain allow/deny.
 		r, err := h.Submit(context.Background(), hook.Event{
 			SessionID: p.ThreadID,
 			Event:     "PermissionRequest",
@@ -379,6 +443,67 @@ func (c *Client) mcpElicitation(m rpcMessage) {
 		}
 	}
 	c.replyResult(m.ID, map[string]any{"action": action, "content": content})
+}
+
+// requestUserInput brokers codex's question tool through usher's interaction
+// UI. The AskUserQuestion-shaped pending renders the existing choice picker;
+// answers are returned keyed by question id in codex's response shape.
+func (c *Client) requestUserInput(m rpcMessage) {
+	var p struct {
+		ThreadID  string `json:"threadId"`
+		Questions []struct {
+			ID       string `json:"id"`
+			Header   string `json:"header"`
+			Question string `json:"question"`
+			Options  []struct {
+				Label       string `json:"label"`
+				Description string `json:"description"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal(m.Params, &p); err != nil || len(p.Questions) == 0 {
+		c.replyError(m.ID, -32602, "invalid requestUserInput parameters")
+		return
+	}
+
+	c.mu.Lock()
+	h := c.hooks
+	cwd := c.threads[p.ThreadID]
+	c.mu.Unlock()
+	if h == nil {
+		c.replyError(m.ID, -32000, "question handler unavailable")
+		return
+	}
+
+	questions := make([]map[string]any, 0, len(p.Questions))
+	for _, q := range p.Questions {
+		var opts []map[string]any
+		for _, o := range q.Options {
+			opts = append(opts, map[string]any{"label": o.Label, "description": o.Description})
+		}
+		questions = append(questions, map[string]any{
+			"question": q.Question, "header": q.Header, "multiSelect": false, "options": opts,
+		})
+	}
+	input, _ := json.Marshal(map[string]any{"questions": questions})
+	r, err := h.Submit(context.Background(), hook.Event{
+		SessionID: p.ThreadID,
+		Event:     "PermissionRequest",
+		ToolName:  "AskUserQuestion",
+		ToolInput: input,
+		Cwd:       cwd,
+	})
+	if err != nil || r.Behavior != "allow" {
+		c.replyError(m.ID, -32000, "the user declined to answer")
+		return
+	}
+	answers := map[string]any{}
+	for _, q := range p.Questions {
+		if a := r.Answers[q.Question]; a != "" {
+			answers[q.ID] = map[string]any{"answers": []string{a}}
+		}
+	}
+	c.replyResult(m.ID, map[string]any{"answers": answers})
 }
 
 func (c *Client) replyResult(id json.RawMessage, result any) {

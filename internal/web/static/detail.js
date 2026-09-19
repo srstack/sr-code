@@ -538,7 +538,7 @@ export async function showDetail(id) {
   let followSessionModel = null;
   let sessionEffort = null;
   let effectiveModelId = () => '';
-  if (sess.backend === 'claude' || sess.backend === 'opencode' || sess.backend === 'opencode2' || sess.backend === 'codex') {
+  if (sess.backend === 'claude' || sess.backend === 'opencode' || sess.backend === 'opencode2' || sess.backend === 'codex' || sess.backend === 'kiro') {
     const mount = document.getElementById('model-mount');
     if (mount) {
       sessionModel = makeDropdown({

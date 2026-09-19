@@ -242,18 +242,86 @@ func TestMcpConfirmationElicitationUsesPermissionDecision(t *testing.T) {
 	}
 }
 
-func TestMcpInputFormIsNotAcceptedWithoutAnswers(t *testing.T) {
+// answerFirstPending waits for the hook manager to surface a pending
+// interaction and responds to it, simulating the web UI. Safe to run in a
+// goroutine: failures are reported, not fatal (the caller's assertions on the
+// missing response catch them).
+func answerFirstPending(t *testing.T, hooks *hook.Manager, resp hook.Response) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if list := hooks.List(); len(list) > 0 {
+			if err := hooks.Respond(list[0].ID, resp); err != nil {
+				t.Errorf("respond: %v", err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("no pending interaction surfaced")
+}
+
+func TestMcpInputFormDeclined(t *testing.T) {
 	hooks := hook.New("")
-	hooks.SetAutoApprove("thread-1", true)
 	out := new(testWriteCloser)
 	c := New("unused", hooks, nil, nil, nil, nil)
 	c.in = out
+	go answerFirstPending(t, hooks, hook.Response{Behavior: "deny"})
 	c.mcpElicitation(rpcMessage{
 		ID:     json.RawMessage(`11`),
 		Method: "mcpServer/elicitation/request",
 		Params: json.RawMessage(`{"threadId":"thread-1","serverName":"other","mode":"form","message":"Enter a value","requestedSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}}}}`),
 	})
-	if !strings.Contains(out.String(), `"action":"decline"`) || !strings.Contains(out.String(), `"content":null`) {
+	if !strings.Contains(out.String(), `"action":"decline"`) {
+		t.Fatalf("response = %s", out.String())
+	}
+}
+
+func TestMcpInputFormAcceptedWithAnswers(t *testing.T) {
+	hooks := hook.New("")
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	go answerFirstPending(t, hooks, hook.Response{Behavior: "allow", Answers: map[string]string{"value": "hello"}})
+	c.mcpElicitation(rpcMessage{
+		ID:     json.RawMessage(`11`),
+		Method: "mcpServer/elicitation/request",
+		Params: json.RawMessage(`{"threadId":"thread-1","serverName":"other","mode":"form","message":"Enter a value","requestedSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}}}}`),
+	})
+	if !strings.Contains(out.String(), `"action":"accept"`) || !strings.Contains(out.String(), `"value":"hello"`) {
+		t.Fatalf("response = %s", out.String())
+	}
+}
+
+func TestRequestUserInputSurfacesQuestions(t *testing.T) {
+	hooks := hook.New("")
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	go answerFirstPending(t, hooks, hook.Response{Behavior: "allow", Answers: map[string]string{"Pick one": "Red"}})
+	c.requestUserInput(rpcMessage{
+		ID:     json.RawMessage(`12`),
+		Method: "item/tool/requestUserInput",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"q1","header":"Color","question":"Pick one","options":[{"label":"Red"},{"label":"Blue"}]}]}`),
+	})
+	s := out.String()
+	if !strings.Contains(s, `"answers"`) || !strings.Contains(s, `"q1"`) || !strings.Contains(s, `"Red"`) {
+		t.Fatalf("response = %s", s)
+	}
+}
+
+func TestRequestUserInputDenied(t *testing.T) {
+	hooks := hook.New("")
+	out := new(testWriteCloser)
+	c := New("unused", hooks, nil, nil, nil, nil)
+	c.in = out
+	go answerFirstPending(t, hooks, hook.Response{Behavior: "deny"})
+	c.requestUserInput(rpcMessage{
+		ID:     json.RawMessage(`13`),
+		Method: "item/tool/requestUserInput",
+		Params: json.RawMessage(`{"threadId":"thread-1","questions":[{"id":"q1","question":"Pick one"}]}`),
+	})
+	if !strings.Contains(out.String(), `"error"`) {
 		t.Fatalf("response = %s", out.String())
 	}
 }

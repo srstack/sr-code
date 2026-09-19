@@ -108,6 +108,8 @@ most common:
 | `--opencode-web-port` | `7782` | usher-side port for the embedded OpenCode web UI (reuses the `--opencode` binary); `0` disables. |
 | `--kimi` | empty | Moonshot kimi-cli binary for the embedded Kimi Code web UI; off by default. |
 | `--kimi-port` | `7783` | usher-side port for the embedded Kimi Code UI; `0` disables. |
+| `--kiro` | `kiro-cli` | kiro-cli executable (Kiro v3 backend); the backend auto-enables when its session dir exists. |
+| `--kiro-sessions-dir` | `~/.kiro/sessions` | Kiro v3 session dir (`<hash>/sess_*/messages.jsonl`); enables the kiro backend when present. |
 | `--permission-mode` | `default` | Claude only. `default` uses the hook UI; `bypassPermissions` skips prompting. |
 | `--tmux-socket` | `usher` | Socket prefix for optional session terminals (`<name>-terminal`). |
 | `--terminal-shell` | `$SHELL` or `bash` | Shell executable used by session terminals. |

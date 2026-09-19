@@ -8,6 +8,7 @@ import (
 	"github.com/nexustar/usher/internal/codexrollout"
 	"github.com/nexustar/usher/internal/core"
 	"github.com/nexustar/usher/internal/jsonl"
+	"github.com/nexustar/usher/internal/kiro"
 	piagent "github.com/nexustar/usher/internal/pi"
 )
 
@@ -170,6 +171,36 @@ func (s PiSource) IsSessionFile(path string) bool {
 func (s PiSource) SessionID(path string) string { return piagent.SessionIDFromPath(path) }
 func (s PiSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return piagent.ReadSessionMeta(path)
+}
+
+// KiroSource scans kiro-cli v3's native session tree:
+// <root>/<project-hash>/sess_<uuid>/messages.jsonl with a session.json sibling
+// carrying title/cwd/model. The legacy flat "cli" store is excluded.
+type KiroSource struct{ root string }
+
+func NewKiroSource(root string) KiroSource { return KiroSource{root: root} }
+
+func (s KiroSource) Backend() string { return "kiro" }
+func (s KiroSource) Root() string    { return s.root }
+
+func (s KiroSource) IsSessionFile(path string) bool {
+	rel, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	return len(parts) == 3 && strings.HasPrefix(parts[1], "sess_") && parts[2] == "messages.jsonl"
+}
+
+func (s KiroSource) SessionID(path string) string {
+	if !s.IsSessionFile(path) {
+		return ""
+	}
+	return filepath.Base(filepath.Dir(path))
+}
+
+func (s KiroSource) ReadMeta(path string) (core.SessionMeta, error) {
+	return kiro.ReadSessionMeta(path)
 }
 
 // OpenCodeSource scans usher's shadow transcripts for opencode sessions:

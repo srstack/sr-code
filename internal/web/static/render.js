@@ -460,6 +460,9 @@ export const BACKEND_MARKS = {
     + '<circle cx="12" cy="12" r="1.6" fill="currentColor"/>',
   dsh: '<path d="M6 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
     + '<line x1="13" y1="18" x2="19" y2="18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
+  // kiro: ghost — rounded body with a wavy hem and two eyes.
+  kiro: '<path d="M12 3.5c-4.1 0-7 3-7 7.2v9l2.4-1.7 2.3 1.7 2.3-1.7 2.3 1.7 2.3-1.7 2.4 1.7v-9c0-4.2-2.9-7.2-7-7.2Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>'
+    + '<circle cx="9.4" cy="10.6" r="1.3" fill="currentColor"/><circle cx="14.6" cy="10.6" r="1.3" fill="currentColor"/>',
 };
 
 // Unknown/empty backend falls back to claude, mirroring the router default.

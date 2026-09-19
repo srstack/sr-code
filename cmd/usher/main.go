@@ -25,6 +25,7 @@ import (
 	"github.com/nexustar/usher/internal/dsh"
 	"github.com/nexustar/usher/internal/embed"
 	"github.com/nexustar/usher/internal/hook"
+	"github.com/nexustar/usher/internal/kiro"
 	"github.com/nexustar/usher/internal/mainchat"
 	"github.com/nexustar/usher/internal/modelcatalog"
 	"github.com/nexustar/usher/internal/opencode"
@@ -150,6 +151,9 @@ func serve(args []string) error {
 			"(opencode2 serve: v2 API + web, HTTP Basic auth, injected by usher)")
 	openCodeDir := fs.String("opencode-dir", "",
 		"working directory for the embedded opencode child; opencode's web UI shows sessions of the cwd project, so set this to your main project (empty inherits usher's cwd)")
+	kiroCmd := fs.String("kiro", "kiro-cli", "path to the kiro-cli binary (Kiro v3 backend)")
+	kiroSessionsDir := fs.String("kiro-sessions-dir", defaultKiroSessionsDir(),
+		"Kiro v3 sessions directory (~/.kiro/sessions); the kiro backend auto-enables when it exists")
 	kimiCmd := fs.String("kimi", "",
 		"path to the Moonshot kimi-cli binary (embedded Kimi Code web UI); empty disables. "+
 			"Set it in the service (e.g. --kimi ~/.local/bin/kimi); kimi 2.x binds loopback and prints its token URL")
@@ -304,8 +308,13 @@ func serve(args []string) error {
 		}
 		sources = append(sources, discovery.NewOpenCode2Source(*openCode2SessionsDir))
 		oc2Runtime := opencode.NewRuntimeV2(*openCode2Cmd, *openCode2SessionsDir, logger)
+		// v2 sessions are driven through the background service's HTTP API
+		// rather than `opencode2 run`: the headless run CLI auto-dismisses
+		// question forms and permission requests, while the API keeps them
+		// pending for usher's interaction UI to answer. The run-based runtime
+		// stays for the background sync loop's store helpers.
 		backends["opencode2"] = backend.Backend{
-			Runtime:    oc2Runtime,
+			Runtime:    opencode.NewAPIRuntime(*openCode2Cmd, *openCode2SessionsDir, oc2Runtime, h, logger),
 			Transcript: transcript.Claude{},
 			Models:     &modelcatalog.OpenCode{Cmd: *openCode2Cmd, V2: true},
 		}
@@ -314,6 +323,20 @@ func serve(args []string) error {
 			defaultBackend = "opencode2"
 		}
 		logger.Info("opencode2 backend enabled", "sessions_dir", *openCode2SessionsDir)
+	}
+
+	if dir := *kiroSessionsDir; dir != "" && isDir(dir) && commandExists(*kiroCmd) {
+		sources = append(sources, discovery.NewKiroSource(dir))
+		kiroRuntime := kiro.NewRuntime(*kiroCmd, dir, logger)
+		backends["kiro"] = backend.Backend{
+			Runtime:    kiroRuntime,
+			Transcript: kiro.Transcript{},
+			Models:     kiroRuntime.Models(),
+		}
+		if defaultBackend == "" {
+			defaultBackend = "kiro"
+		}
+		logger.Info("kiro backend enabled", "sessions_dir", dir)
 	}
 
 	if len(backends) == 0 {
@@ -655,6 +678,16 @@ func defaultPiSessionsDir() string {
 		return filepath.Join(dir, "sessions")
 	}
 	return filepath.Join(home, ".pi", "agent", "sessions")
+}
+
+// defaultKiroSessionsDir resolves kiro-cli v3's on-disk session tree
+// (~/.kiro/sessions).
+func defaultKiroSessionsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".kiro", "sessions")
 }
 
 // defaultDshSessionsDir resolves dsh's on-disk session tree:
