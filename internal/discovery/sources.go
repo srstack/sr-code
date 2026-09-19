@@ -203,6 +203,38 @@ func (s KiroSource) ReadMeta(path string) (core.SessionMeta, error) {
 	return kiro.ReadSessionMeta(path)
 }
 
+// KiroLegacySource scans kiro-cli's legacy (v1/v2 engine) flat store:
+// <root>/cli/<uuid>.jsonl with a <uuid>.json sidecar. v3 cannot resume these
+// sessions, so they are registered under the transcript-only "kiro-legacy"
+// backend — listed and rendered, never sent to.
+type KiroLegacySource struct{ root string }
+
+func NewKiroLegacySource(sessionsRoot string) KiroLegacySource {
+	return KiroLegacySource{root: filepath.Join(sessionsRoot, "cli")}
+}
+
+func (s KiroLegacySource) Backend() string { return "kiro-legacy" }
+func (s KiroLegacySource) Root() string    { return s.root }
+
+func (s KiroLegacySource) IsSessionFile(path string) bool {
+	rel, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(rel, string(os.PathSeparator)) && strings.HasSuffix(rel, ".jsonl")
+}
+
+func (s KiroLegacySource) SessionID(path string) string {
+	if !s.IsSessionFile(path) {
+		return ""
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
+}
+
+func (s KiroLegacySource) ReadMeta(path string) (core.SessionMeta, error) {
+	return kiro.ReadLegacySessionMeta(path)
+}
+
 // OpenCodeSource scans usher's shadow transcripts for opencode sessions:
 // <root>/<sanitized-cwd>/<id>.jsonl. opencode stores its native state in
 // SQLite, so usher writes this small Claude-shaped jsonl for sessions it

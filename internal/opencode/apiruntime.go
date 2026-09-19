@@ -829,6 +829,14 @@ func (r *APIRuntime) Shutdown() {
 	}
 }
 
+// DeleteNative removes the session from opencode2's own store, invoked when
+// the user deletes the shadow session in usher — otherwise the next sync tick
+// would export it right back. Delegates to the legacy runtime, which owns the
+// tombstone set the sync loop checks.
+func (r *APIRuntime) DeleteNative(id string) error {
+	return r.legacy.DeleteNative(id)
+}
+
 // v2ModelPayload builds a Model.Ref from a "provider/model[#variant]" ref.
 func v2ModelPayload(ref string) map[string]any {
 	provider, rest, _ := strings.Cut(ref, "/")

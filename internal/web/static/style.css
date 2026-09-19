@@ -1730,6 +1730,7 @@ pre.raw-markdown {
 .backend-mark--opencode { color: var(--opencode); }
 .backend-mark--opencode2 { color: var(--opencode2); }
 .backend-mark--kiro { color: var(--kiro); }
+.backend-mark--kiro-legacy { color: var(--kiro); }
 .archived-row .backend-mark { opacity: 0.4; }
 
 /* ===== Send controls ===== */
