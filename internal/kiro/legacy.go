@@ -252,11 +252,12 @@ func legacyResultBody(blocks []struct {
 
 // legacySidecar is the <uuid>.json metadata file next to a legacy transcript.
 type legacySidecar struct {
-	SessionID string    `json:"session_id"`
-	Cwd       string    `json:"cwd"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	SessionID     string    `json:"session_id"`
+	Cwd           string    `json:"cwd"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	CreatedReason string    `json:"session_created_reason"` // "subagent" for agent-spawned sessions
 }
 
 // ReadLegacySessionMeta builds the discovery descriptor for a legacy session
@@ -276,6 +277,12 @@ func ReadLegacySessionMeta(path string) (core.SessionMeta, error) {
 	meta.Cwd = sc.Cwd
 	meta.StartedAt = sc.CreatedAt
 	meta.LastInputAt = sc.UpdatedAt
+	// Subagent spawns carry no parent linkage in the sidecar; marking them
+	// keeps them out of the sidebar's root list (they're internal artifacts
+	// of the parent's pipeline, and kiro can't resume them anyway).
+	if sc.CreatedReason == "subagent" {
+		meta.IsSubagent = true
+	}
 	if st, err := os.Stat(path); err == nil {
 		meta.LastEventAt = st.ModTime()
 	}

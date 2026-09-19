@@ -366,7 +366,11 @@ export async function showNewSession(prefillCwd) {
 // embedded UI and the composer is never rendered.
 function composerMarkup(sess, readOnly) {
   if (readOnly) {
-    return `<div class="read-only-note">Read-only: dsh sessions are rendered from disk; use the embedded DeepSeek Harness interface to interact.</div>`;
+    const notes = {
+      dsh: 'Read-only: dsh sessions are rendered from disk; use the embedded DeepSeek Harness interface to interact.',
+      'kiro-legacy': 'Read-only: a legacy kiro (v1/v2 engine) session rendered from disk; the v3 engine cannot resume it.',
+    };
+    return `<div class="read-only-note">${esc(notes[sess.backend] || `Read-only: ${sess.backend} sessions are rendered from disk.`)}</div>`;
   }
   return `
         <div class="composer">
