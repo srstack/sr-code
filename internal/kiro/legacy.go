@@ -252,12 +252,21 @@ func legacyResultBody(blocks []struct {
 
 // legacySidecar is the <uuid>.json metadata file next to a legacy transcript.
 type legacySidecar struct {
-	SessionID     string    `json:"session_id"`
-	Cwd           string    `json:"cwd"`
-	Title         string    `json:"title"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	CreatedReason string    `json:"session_created_reason"` // informational only; see ReadLegacySessionMeta
+	SessionID       string    `json:"session_id"`
+	ParentSessionID string    `json:"parent_session_id"` // set on subagent spawns only
+	Cwd             string    `json:"cwd"`
+	Title           string    `json:"title"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	SessionState    struct {
+		RtsModelState struct {
+			ContextUsagePct float64 `json:"context_usage_percentage"`
+			ModelInfo       struct {
+				ModelID             string `json:"model_id"`
+				ContextWindowTokens int64  `json:"context_window_tokens"`
+			} `json:"model_info"`
+		} `json:"rts_model_state"`
+	} `json:"session_state"`
 }
 
 // ReadLegacySessionMeta builds the discovery descriptor for a legacy session
@@ -277,9 +286,21 @@ func ReadLegacySessionMeta(path string) (core.SessionMeta, error) {
 	meta.Cwd = sc.Cwd
 	meta.StartedAt = sc.CreatedAt
 	meta.LastInputAt = sc.UpdatedAt
-	// Note: session_created_reason is NOT a reliable subagent marker (root
-	// sessions resumed standalone carry it too), so it is deliberately not
-	// used to hide sessions.
+	// parent_session_id is the reliable subagent marker (unlike
+	// session_created_reason, which root sessions resumed standalone also
+	// carry): subagents nest under their parent in the sidebar.
+	if sc.ParentSessionID != "" {
+		meta.IsSubagent = true
+		meta.ParentID = sc.ParentSessionID
+		meta.AgentName = "kiro"
+	}
+	if mi := sc.SessionState.RtsModelState.ModelInfo; mi.ModelID != "" {
+		meta.Runtime.Model = mi.ModelID
+		if mi.ContextWindowTokens > 0 && sc.SessionState.RtsModelState.ContextUsagePct > 0 {
+			meta.Runtime.ContextTokens = int64(sc.SessionState.RtsModelState.ContextUsagePct / 100 * float64(mi.ContextWindowTokens))
+			meta.Runtime.ContextWindow = mi.ContextWindowTokens
+		}
+	}
 	if st, err := os.Stat(path); err == nil {
 		meta.LastEventAt = st.ModTime()
 	}
