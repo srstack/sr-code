@@ -327,7 +327,7 @@ func serve(args []string) error {
 
 	if dir := *kiroSessionsDir; dir != "" && isDir(dir) && commandExists(*kiroCmd) {
 		sources = append(sources, discovery.NewKiroSource(dir))
-		kiroRuntime := kiro.NewRuntime(*kiroCmd, dir, logger)
+		kiroRuntime := kiro.NewRuntime(*kiroCmd, dir, *maxLiveSessions, h, logger)
 		backends["kiro"] = backend.Backend{
 			Runtime:    kiroRuntime,
 			Transcript: kiro.Transcript{},
@@ -359,15 +359,19 @@ func serve(args []string) error {
 			*projectsDir, *codexSessionsDir, *piSessionsDir, *openCodeCmd)
 	}
 
-	// dsh sessions are rendered read-only from disk. The backend is
-	// transcript-only (nil Runtime): it can be listed and read but never sent
-	// to, and Backends() keeps it out of the new-session picker. Interaction
-	// still happens in the embedded DeepSeek Harness UI, which remains
-	// available under #/ui/dsh.
+	// dsh sessions are driven over ACP (dsh --profile acp) when the dsh binary
+	// is configured; without it the backend stays transcript-only (read-only,
+	// interaction via the embedded DeepSeek Harness UI at #/ui/dsh). Note dsh
+	// sessions are single-writer: one open in the embedded UI can't be driven
+	// here until closed there.
 	if dir := *dshSessionsDir; dir != "" && isDir(dir) {
 		sources = append(sources, discovery.NewDshSource(dir))
-		backends["dsh"] = backend.Backend{Transcript: dsh.Transcript{}}
-		logger.Info("dsh sessions enabled", "sessions_dir", dir)
+		b := backend.Backend{Transcript: dsh.Transcript{}}
+		if *dshCmd != "" && commandExists(*dshCmd) {
+			b.Runtime = dsh.NewRuntime(*dshCmd, h, logger)
+		}
+		backends["dsh"] = b
+		logger.Info("dsh sessions enabled", "sessions_dir", dir, "interactive", b.Runtime != nil)
 	}
 
 	// Pre-warm every backend's model catalog in the background so the first

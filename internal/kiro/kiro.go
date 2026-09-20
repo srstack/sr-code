@@ -1,72 +1,166 @@
-// Package kiro adapts the Kiro CLI (v3 agent engine) to usher's backend
-// contract.
+// Package kiro adapts the Kiro CLI to usher's backend contract.
 //
-// Sessions are driven through per-turn headless chat processes:
+// Sessions are driven over Agent Client Protocol stdio: one long-lived
+// `kiro-cli acp` child per active session (v3 engine for sess_* ids, the
+// default v2 engine for legacy flat-store uuids — which must not get an
+// explicit engine flag, or resume fails with "ACP load_session failed").
+// ACP gives live streaming updates and a permission callback channel, unlike
+// the earlier headless `chat --no-interactive` mode, which auto-approved
+// everything and could never surface questions.
 //
-//	kiro-cli --v3 chat --no-interactive --trust-all-tools [--model M] <prompt>
-//	kiro-cli --v3 chat --no-interactive --trust-all-tools --resume-id <id> <prompt>
-//
-// kiro writes its own native transcript (messages.jsonl) under
-// ~/.kiro/sessions/<project-hash>/sess_<uuid>/, which is both the discovery
-// source (KiroSource) and the live event source: the runtime tails the file
-// while the child runs and emits each new record.
-//
-// Headless chat auto-approves tools (--trust-all-tools); kiro's interactive
-// question flows are not reachable in this mode, so nothing is surfaced to
-// usher's permission UI from this backend.
+// The transcript of record stays kiro's native messages.jsonl (v3) /
+// cli/<id>.jsonl (legacy), parsed by Transcript / LegacyTranscript; ACP
+// updates only feed the live view.
 package kiro
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/nexustar/usher/internal/acp"
 	"github.com/nexustar/usher/internal/backend"
 	"github.com/nexustar/usher/internal/core"
+	"github.com/nexustar/usher/internal/hook"
 )
 
-// Runtime drives kiro through `kiro-cli --v3 chat --no-interactive` — one
-// child process per turn, resumed across turns with --resume-id.
+// Runtime drives kiro over ACP, one worker process per active session.
 type Runtime struct {
-	cmd    string
-	root   string // sessions root (~/.kiro/sessions), used to locate transcripts
-	logger *slog.Logger
-	models *ModelCatalog
+	cmd     string
+	root    string // sessions root (~/.kiro/sessions), used to locate transcripts
+	logger  *slog.Logger
+	models  *ModelCatalog
+	hooks   *hook.Manager
+	maxLive int
 
 	mu      sync.Mutex
-	running map[string]context.CancelFunc
-	paths   map[string]string // session id -> messages.jsonl path (learned at Start)
+	workers map[string]*worker
 }
 
-func NewRuntime(cmd, root string, logger *slog.Logger) *Runtime {
+func NewRuntime(cmd, root string, maxLive int, hooks *hook.Manager, logger *slog.Logger) *Runtime {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if maxLive <= 0 {
+		maxLive = 8
 	}
 	return &Runtime{
 		cmd:     cmd,
 		root:    root,
 		logger:  logger,
 		models:  &ModelCatalog{Cmd: cmd},
-		running: map[string]context.CancelFunc{},
-		paths:   map[string]string{},
+		hooks:   hooks,
+		maxLive: maxLive,
+		workers: map[string]*worker{},
 	}
 }
 
 // Models exposes the model catalog so main can register it on the backend.
 func (r *Runtime) Models() *ModelCatalog { return r.models }
 
-// Start begins a brand-new session. kiro assigns the id itself (sess_<uuid>),
-// so Start spawns the first turn, then polls `chat --list-sessions` for the
-// cwd until a previously-unseen session appears.
+// worker is one ACP child bound to one session.
+type worker struct {
+	conn     *acp.Conn
+	id       string
+	cwd      string
+	busy     bool
+	lastUsed time.Time
+}
+
+// isV3 reports whether the session id belongs to the v3 engine store.
+func isV3(id string) bool { return id == "" || strings.HasPrefix(id, "sess_") }
+
+func (r *Runtime) acpArgs(id string) []string {
+	if isV3(id) {
+		return []string{"acp", "--agent-engine", "v3", "--auth-method", "cli"}
+	}
+	// Legacy (v2 engine): --auth-method is a v3-only flag; the v2 ACP process
+	// misbehaves with it (loads fine, then prompts return instantly without
+	// touching the transcript).
+	return []string{"acp"}
+}
+
+// spawnWorker starts a kiro ACP child for cwd.
+func (r *Runtime) spawnWorker(ctx context.Context, id, cwd string) (*worker, error) {
+	w := &worker{id: id, cwd: cwd, lastUsed: time.Now()}
+	conn, err := acp.Start(ctx, r.cmd, r.acpArgs(id), cwd, nil, func(reqID int64, m acp.ServerRequest) {
+		r.handleServerRequest(w, reqID, m)
+	})
+	if err != nil {
+		return nil, err
+	}
+	w.conn = conn
+	if err := conn.Initialize(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("kiro acp initialize: %w", err)
+	}
+	return w, nil
+}
+
+// workerFor returns the live worker for id, spawning and attaching
+// (session/load) a cold one when needed.
+func (r *Runtime) workerFor(ctx context.Context, id, cwd string) (*worker, error) {
+	r.mu.Lock()
+	w := r.workers[id]
+	r.mu.Unlock()
+	if w != nil {
+		select {
+		case <-w.conn.Done():
+			r.mu.Lock()
+			delete(r.workers, id)
+			r.mu.Unlock()
+		default:
+			return w, nil
+		}
+	}
+	if cwd == "" {
+		cwd = r.cwdFor(id)
+	}
+	w, err := r.spawnWorker(ctx, id, cwd)
+	if err != nil {
+		return nil, err
+	}
+	if err := w.conn.SessionLoad(ctx, id, cwd); err != nil {
+		w.conn.Close()
+		return nil, fmt.Errorf("kiro resume %s: %w", id, err)
+	}
+	r.mu.Lock()
+	r.workers[id] = w
+	r.evictIdleLocked()
+	r.mu.Unlock()
+	return w, nil
+}
+
+// evictIdleLocked closes the least-recently-used idle workers beyond maxLive.
+// Caller holds r.mu.
+func (r *Runtime) evictIdleLocked() {
+	for len(r.workers) > r.maxLive {
+		var oldestID string
+		var oldest time.Time
+		for id, w := range r.workers {
+			if w.busy {
+				continue
+			}
+			if oldestID == "" || w.lastUsed.Before(oldest) {
+				oldestID, oldest = id, w.lastUsed
+			}
+		}
+		if oldestID == "" {
+			return // all busy
+		}
+		r.workers[oldestID].conn.Close()
+		delete(r.workers, oldestID)
+	}
+}
+
+// Start creates a new v3 session and runs the first turn.
 func (r *Runtime) Start(ctx context.Context, req backend.StartRequest) (string, <-chan backend.Event, error) {
 	if strings.TrimSpace(req.Cwd) == "" {
 		var err error
@@ -75,61 +169,284 @@ func (r *Runtime) Start(ctx context.Context, req backend.StartRequest) (string, 
 			return "", nil, err
 		}
 	}
-	before := r.sessionIDs(ctx, req.Cwd)
-	t, err := r.spawn(ctx, "", req.Prompt, req.Cwd, req.Model)
+	w, err := r.spawnWorker(ctx, "", req.Cwd)
 	if err != nil {
 		return "", nil, err
 	}
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		id, path := r.findNewSession(ctx, req.Cwd, before)
-		if id != "" {
-			t.attach(id, path)
-			return id, t.events(), nil
+	id, err := w.conn.SessionNew(ctx, req.Cwd)
+	if err != nil || id == "" {
+		w.conn.Close()
+		if err == nil {
+			err = errors.New("kiro did not return a session id")
 		}
-		select {
-		case err := <-t.failed:
-			return "", nil, err
-		case <-time.After(500 * time.Millisecond):
-			if time.Now().After(deadline) {
-				t.cancel()
-				return "", nil, errors.New("kiro did not register a session within 60s")
-			}
-		case <-ctx.Done():
-			t.cancel()
-			return "", nil, ctx.Err()
-		}
+		return "", nil, err
 	}
+	w.id = id
+	r.mu.Lock()
+	r.workers[id] = w
+	r.evictIdleLocked()
+	r.mu.Unlock()
+	return id, r.runTurn(ctx, w, req.Prompt, req.Model, true), nil
 }
 
-// Send resumes an existing session via --resume-id.
 func (r *Runtime) Send(ctx context.Context, id, prompt, cwd string) (<-chan backend.Event, error) {
 	return r.SendWithModel(ctx, id, prompt, cwd, "")
 }
 
 func (r *Runtime) SendWithModel(ctx context.Context, id, prompt, cwd, model string) (<-chan backend.Event, error) {
-	if strings.TrimSpace(cwd) == "" {
-		cwd = r.cwdFor(id)
-	}
-	t, err := r.spawn(ctx, id, prompt, cwd, model)
+	w, err := r.workerFor(ctx, id, cwd)
 	if err != nil {
 		return nil, err
 	}
-	t.attach(id, r.locate(id))
-	return t.events(), nil
+	return r.runTurn(ctx, w, prompt, model, false), nil
 }
 
-// cwdFor returns the cwd recorded for a live session ("" when unknown; the
-// child then inherits usher's cwd, which kiro scopes its session store to).
-func (r *Runtime) cwdFor(id string) string {
+// runTurn executes one prompt and streams display events until it ends.
+func (r *Runtime) runTurn(ctx context.Context, w *worker, prompt, model string, fresh bool) <-chan backend.Event {
+	out := make(chan backend.Event, 64)
 	r.mu.Lock()
-	p := r.paths[id]
+	w.busy = true
 	r.mu.Unlock()
+
+	// Per-turn update stream bound to this turn's channel.
+	updates := make(chan acp.Update, 256)
+	w.conn.SetUpdateHandler(func(u acp.Update) {
+		if u.SessionID == w.id {
+			select {
+			case updates <- u:
+			default:
+			}
+		}
+	})
+
+	go func() {
+		defer close(out)
+		defer func() {
+			r.mu.Lock()
+			w.busy = false
+			w.lastUsed = time.Now()
+			r.mu.Unlock()
+		}()
+		defer w.conn.SetUpdateHandler(nil)
+
+		emit := func(ev backend.Event) bool {
+			select {
+			case out <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		emitErr := func(msg string) {
+			r.logger.Warn("kiro turn error", "session", w.id, "err", msg)
+			raw, _ := json.Marshal(backend.ErrorPayload{Message: msg})
+			select {
+			case out <- backend.Event{Type: backend.EventError, Raw: raw}:
+			default:
+			}
+		}
+
+		started, _ := json.Marshal(backend.ProcessStartedPayload{Cwd: w.cwd, Fresh: fresh})
+		if !emit(backend.Event{Type: backend.EventProcessStarted, Raw: started}) {
+			return
+		}
+		// Echo the user prompt as a transcript-shaped line so the assembler
+		// produces the user turn (the native file gets its own copy from kiro).
+		userLine := kiroUserLine(w.id, prompt)
+		if !isV3(w.id) {
+			userLine = legacyUserLine(prompt)
+		}
+		if !emit(backend.Event{Type: "kiro", Raw: userLine}) {
+			return
+		}
+
+		var usagePct float64
+		promptDone := make(chan error, 1)
+		go func() {
+			_, err := w.conn.Prompt(ctx, w.id, prompt)
+			promptDone <- err
+		}()
+		for {
+			select {
+			case u := <-updates:
+				if pct := u.ContextUsagePct(); pct > 0 {
+					usagePct = pct
+				}
+				if ev := translateUpdate(w.id, u); ev != nil {
+					if !emit(*ev) {
+						return
+					}
+				}
+			case err := <-promptDone:
+				if err != nil && ctx.Err() == nil {
+					if tail := strings.TrimSpace(w.conn.StderrTail()); tail != "" {
+						r.logger.Warn("kiro acp stderr", "session", w.id, "tail", tail)
+					}
+					emitErr("kiro turn failed: " + err.Error())
+				}
+				r.emitRuntime(out, ctx, w.id, usagePct)
+				exited, _ := json.Marshal(map[string]any{"code": 0})
+				emit(backend.Event{Type: backend.EventProcessExit, Raw: exited})
+				return
+			case <-ctx.Done():
+				return
+			case <-w.conn.Done():
+				emitErr("kiro acp process exited")
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// emitRuntime reports context occupancy for the turn.
+func (r *Runtime) emitRuntime(out chan<- backend.Event, ctx context.Context, id string, usagePct float64) {
+	if usagePct <= 0 {
+		return
+	}
+	model := r.modelOf(id)
+	rt := core.SessionRuntime{Model: model, ContextWindow: r.models.ContextWindow(ctx, model)}
+	rt.ContextTokens = int64(usagePct / 100 * float64(rt.ContextWindow))
+	raw, _ := json.Marshal(rt)
+	select {
+	case out <- backend.Event{Type: backend.EventRuntime, Raw: raw}:
+	case <-ctx.Done():
+	}
+}
+
+// translateUpdate maps one ACP session/update to a display event (nil =
+// nothing to show). Text streams as deltas; tool calls are synthesized as
+// transcript lines in the session's own format (v3 or legacy) so the matching
+// assembler renders the cards.
+func translateUpdate(sessionID string, u acp.Update) *backend.Event {
+	legacy := !isV3(sessionID)
+	switch u.SessionUpdate {
+	case "agent_message_chunk", "agent_thought_chunk":
+		if u.Text() == "" {
+			return nil
+		}
+		raw, _ := json.Marshal(backend.PartDeltaPayload{Delta: u.Text()})
+		return &backend.Event{Type: backend.EventPartDelta, Raw: raw}
+	case "tool_call":
+		var raw json.RawMessage
+		if legacy {
+			raw = legacyToolCallLine(u)
+		} else {
+			raw = kiroToolCallLine(sessionID, u)
+		}
+		if raw == nil {
+			return nil
+		}
+		return &backend.Event{Type: "kiro", Raw: raw}
+	case "tool_call_update":
+		if u.Status != "completed" && u.Status != "failed" {
+			return nil
+		}
+		var raw json.RawMessage
+		if legacy {
+			raw = legacyToolResultLine(u)
+		} else {
+			raw = kiroToolResultLine(sessionID, u)
+		}
+		if raw == nil {
+			return nil
+		}
+		return &backend.Event{Type: "kiro", Raw: raw}
+	}
+	return nil
+}
+
+// handleServerRequest relays session/request_permission to usher's
+// interaction UI and answers with the chosen option.
+func (r *Runtime) handleServerRequest(w *worker, reqID int64, m acp.ServerRequest) {
+	if m.Method != "session/request_permission" {
+		_ = w.conn.RespondError(reqID, -32601, "unsupported request: "+m.Method)
+		return
+	}
+	var p acp.PermissionParams
+	if json.Unmarshal(m.Params, &p) != nil {
+		_ = w.conn.RespondError(reqID, -32602, "invalid permission params")
+		return
+	}
+	allowAlways := false
+	for _, o := range p.Options {
+		if o.Kind == "allow_always" {
+			allowAlways = true
+		}
+	}
+	input := p.ToolCall.RawInput
+	if len(input) == 0 {
+		input, _ = json.Marshal(map[string]any{"title": p.ToolCall.Title, "kind": p.ToolCall.Kind})
+	}
+	resp, err := r.hooks.Submit(context.Background(), hook.Event{
+		SessionID:   w.id,
+		ToolUseID:   p.ToolCall.ToolCallID,
+		Event:       "PermissionRequest",
+		ToolName:    p.ToolCall.Title,
+		ToolInput:   input,
+		Cwd:         w.cwd,
+		AllowAlways: allowAlways,
+	})
+	if err != nil {
+		_ = w.conn.RespondError(reqID, -32000, err.Error())
+		return
+	}
+	kind := "reject_once"
+	if resp.Behavior == "allow" {
+		if resp.Scope == "session" {
+			kind = "allow_always"
+		} else {
+			kind = "allow_once"
+		}
+	}
+	optionID := ""
+	for _, o := range p.Options {
+		if o.Kind == kind {
+			optionID = o.OptionID
+			break
+		}
+	}
+	if optionID == "" && len(p.Options) > 0 {
+		optionID = p.Options[0].OptionID
+	}
+	_ = w.conn.Respond(reqID, map[string]any{
+		"outcome": map[string]any{"outcome": "selected", "optionId": optionID},
+	})
+}
+
+// modelOf reads the session's model from session.json (v3); legacy sessions
+// carry it in the sidecar's rts_model_state.
+func (r *Runtime) modelOf(id string) string {
+	p := r.locate(id)
 	if p == "" {
 		return ""
 	}
-	if !strings.HasPrefix(id, "sess_") {
-		// Legacy sidecar <id>.json next to cli/<id>.jsonl.
+	if !isV3(id) {
+		raw, err := os.ReadFile(strings.TrimSuffix(p, ".jsonl") + ".json")
+		if err != nil {
+			return ""
+		}
+		var sc legacySidecar
+		if json.Unmarshal(raw, &sc) == nil {
+			return sc.SessionState.RtsModelState.ModelInfo.ModelID
+		}
+		return ""
+	}
+	s, err := readSessionJSON(filepath.Dir(p))
+	if err != nil {
+		return ""
+	}
+	return s.ModelID
+}
+
+// cwdFor returns the cwd recorded for a session ("" when unknown; the worker
+// then inherits usher's cwd, which kiro scopes its session store to).
+func (r *Runtime) cwdFor(id string) string {
+	p := r.locate(id)
+	if p == "" {
+		return ""
+	}
+	if !isV3(id) {
 		raw, err := os.ReadFile(strings.TrimSuffix(p, ".jsonl") + ".json")
 		if err != nil {
 			return ""
@@ -146,439 +463,61 @@ func (r *Runtime) cwdFor(id string) string {
 	return ""
 }
 
-// locate finds the messages.jsonl for id under the sessions root.
-func (r *Runtime) locate(id string) string {
-	r.mu.Lock()
-	if p := r.paths[id]; p != "" {
-		r.mu.Unlock()
-		return p
-	}
-	r.mu.Unlock()
-	found := Locate(r.root, id)
-	if found != "" {
-		r.mu.Lock()
-		r.paths[id] = found
-		r.mu.Unlock()
-	}
-	return found
-}
-
-// sessionIDs lists kiro's known session ids for cwd (empty on any failure —
-// Start then treats every session as new, which is correct on first use).
-func (r *Runtime) sessionIDs(ctx context.Context, cwd string) map[string]bool {
-	out := map[string]bool{}
-	for _, s := range listSessions(ctx, r.cmd, cwd) {
-		out[s] = true
-	}
-	return out
-}
-
-// findNewSession returns the first session id for cwd not in before, plus its
-// transcript path. Falls back to an fs scan when list-sessions lags the write.
-func (r *Runtime) findNewSession(ctx context.Context, cwd string, before map[string]bool) (string, string) {
-	for _, id := range listSessions(ctx, r.cmd, cwd) {
-		if !before[id] {
-			if p := Locate(r.root, id); p != "" {
-				return id, p
-			}
-			return id, ""
-		}
-	}
-	return "", ""
-}
-
-// turn owns one spawned headless chat process and its transcript tailer.
-type turn struct {
-	rt     *Runtime
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-
-	mu       sync.Mutex
-	id       string
-	path     string // messages.jsonl
-	ready    chan struct{}
-	failed   chan error
-	waitDone chan struct{} // closed when the child exits
-	waitErr  error
-
-	out chan backend.Event
-}
-
-func (r *Runtime) spawn(ctx context.Context, id, prompt, cwd, model string) (*turn, error) {
-	childCtx, cancel := context.WithCancel(ctx)
-	// Engine selection: v3 sessions (sess_ ids, and all new sessions) need
-	// --v3; legacy v1/v2 sessions (bare uuids) must NOT pass an engine flag —
-	// the CLI then negotiates the v2 engine from the session itself (passing
-	// --v2 explicitly breaks resume with "ACP load_session failed").
-	var args []string
-	if id == "" || strings.HasPrefix(id, "sess_") {
-		args = append(args, "--v3")
-	}
-	args = append(args, "chat", "--no-interactive", "--trust-all-tools")
-	if id != "" {
-		args = append(args, "--resume-id", id)
-	}
-	if model != "" && model != "default" {
-		args = append(args, "--model", model)
-	}
-	args = append(args, prompt)
-	cmd := exec.CommandContext(childCtx, r.cmd, args...)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	// kiro's final answer text goes to stdout, diagnostics to stderr; the
-	// transcript file is the display source, so both are just drained.
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, err
-	}
-	t := &turn{
-		rt:       r,
-		cmd:      cmd,
-		cancel:   cancel,
-		id:       id,
-		ready:    make(chan struct{}),
-		failed:   make(chan error, 1),
-		waitDone: make(chan struct{}),
-		out:      make(chan backend.Event, 64),
-	}
-	go t.run(stdout, stderr, childCtx, cwd)
-	return t, nil
-}
-
-// attach binds the turn to its transcript once the session id is known.
-func (t *turn) attach(id, path string) {
-	t.mu.Lock()
-	t.id, t.path = id, path
-	t.mu.Unlock()
-	t.rt.mu.Lock()
-	t.rt.paths[id] = path
-	t.rt.mu.Unlock()
-	close(t.ready)
-}
-
-func (t *turn) events() <-chan backend.Event { return t.out }
-
-func (t *turn) run(stdout, stderr io.Reader, ctx context.Context, cwd string) {
-	defer close(t.out)
-	defer t.cancel()
-
-	var errBuf bytes.Buffer
-	errDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(&errBuf, stderr)
-		close(errDone)
-	}()
-	// stdout carries the final answer text only; discard it (transcript wins).
-	discardDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, stdout)
-		close(discardDone)
-	}()
-
-	// Wait in a goroutine so the tailer can observe process exit (ProcessState
-	// is only set once Wait returns).
-	go func() {
-		err := t.cmd.Wait()
-		t.mu.Lock()
-		t.waitErr = err
-		t.mu.Unlock()
-		close(t.waitDone)
-	}()
-
-	// Wait for attach (Start resolves the id asynchronously; Send pre-attaches).
-	select {
-	case <-t.ready:
-	case <-t.waitDone:
-		// Process exited before a session id was resolved (bad prompt, auth,
-		// model error): report it instead of letting Start poll to timeout.
-		<-errDone // process is gone, so stderr hits EOF promptly
-		t.mu.Lock()
-		werr := t.waitErr
-		t.mu.Unlock()
-		msg := stderrTail(&errBuf)
-		if msg == "(no stderr)" && werr != nil {
-			msg = werr.Error()
-		}
-		if msg == "(no stderr)" {
-			msg = "kiro exited without creating a session"
-		}
-		select {
-		case t.failed <- errors.New(msg):
-		default:
-		}
-		<-discardDone
-		return
-	case <-ctx.Done():
-		<-t.waitDone
-		<-errDone
-		<-discardDone
-		return
-	}
-
-	t.mu.Lock()
-	id, path := t.id, t.path
-	t.mu.Unlock()
-
-	t.rt.mu.Lock()
-	if prev := t.rt.running[id]; prev != nil {
-		prev() // a duplicate send kills the older process
-	}
-	t.rt.running[id] = t.cancel
-	t.rt.mu.Unlock()
-	defer func() {
-		t.rt.mu.Lock()
-		delete(t.rt.running, id)
-		t.rt.mu.Unlock()
-	}()
-
-	started, _ := json.Marshal(backend.ProcessStartedPayload{Cwd: cwd, Fresh: true})
-	if !t.emit(ctx, backend.Event{Type: backend.EventProcessStarted, Raw: started}) {
-		t.killAndWait()
-		<-errDone
-		<-discardDone
-		return
-	}
-
-	// Tail the transcript, emitting each appended record until the child exits.
-	usagePct := t.tail(ctx, path)
-
-	<-t.waitDone
-	t.mu.Lock()
-	waitErr := t.waitErr
-	t.mu.Unlock()
-	<-errDone
-	<-discardDone
-	if waitErr != nil && ctx.Err() == nil {
-		msg := strings.TrimSpace(errBuf.String())
-		if msg == "" {
-			msg = waitErr.Error()
-		}
-		t.emitErr("kiro turn failed: " + msg)
-	}
-
-	if usagePct > 0 {
-		rt := core.SessionRuntime{
-			Model:         t.modelOf(id),
-			ContextWindow: t.rt.models.ContextWindow(ctx, t.modelOf(id)),
-		}
-		rt.ContextTokens = int64(usagePct / 100 * float64(rt.ContextWindow))
-		raw, _ := json.Marshal(rt)
-		if !t.emit(ctx, backend.Event{Type: backend.EventRuntime, Raw: raw}) {
-			return
-		}
-	}
-	exited, _ := json.Marshal(map[string]any{"code": exitCode(waitErr)})
-	t.emit(ctx, backend.Event{Type: backend.EventProcessExit, Raw: exited})
-}
-
-// modelOf reads the session's model from session.json (kiro picks the default
-// when none was passed on the command line).
-func (t *turn) modelOf(id string) string {
-	p := t.rt.locate(id)
-	if p == "" {
-		return ""
-	}
-	s, err := readSessionJSON(filepath.Dir(p))
-	if err != nil {
-		return ""
-	}
-	return s.ModelID
-}
-
-// tail polls messages.jsonl for growth and emits each complete new line.
-// Returns the last contextUsage percentage seen (0 when none).
-func (t *turn) tail(ctx context.Context, path string) float64 {
-	var offset int64
-	var usagePct float64
-	var pending []byte
-	for {
-		select {
-		case <-ctx.Done():
-			return usagePct
-		default:
-		}
-		if path == "" {
-			// Transcript not written yet (still booting); keep waiting.
-			t.mu.Lock()
-			path = t.path
-			t.mu.Unlock()
-			if path == "" {
-				if t.exited() {
-					return usagePct
-				}
-				if !sleepOrDone(ctx, 200*time.Millisecond) {
-					return usagePct
-				}
-				continue
-			}
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			if t.exited() {
-				return usagePct
-			}
-			if !sleepOrDone(ctx, 200*time.Millisecond) {
-				return usagePct
-			}
-			continue
-		}
-		if _, err := f.Seek(offset, io.SeekStart); err == nil {
-			buf, _ := io.ReadAll(f)
-			pending = append(pending, buf...)
-			offset += int64(len(buf))
-			for {
-				i := bytes.IndexByte(pending, '\n')
-				if i < 0 {
-					break
-				}
-				line := bytes.TrimSpace(pending[:i])
-				pending = pending[i+1:]
-				if len(line) == 0 {
-					continue
-				}
-				if pct := contextUsagePct(line); pct > 0 {
-					usagePct = pct
-				}
-				if !t.emit(ctx, backend.Event{Type: "kiro", Raw: append([]byte(nil), line...)}) {
-					f.Close()
-					return usagePct
-				}
-			}
-		}
-		f.Close()
-		if t.exited() {
-			// One final drain pass after process exit picks up the last flush.
-			if drained := t.drainOnce(ctx, path, &offset, &pending, &usagePct); drained {
-				return usagePct
-			}
-		}
-		if !sleepOrDone(ctx, 150*time.Millisecond) {
-			return usagePct
-		}
-	}
-}
-
-// drainOnce reads any bytes appended since the last poll; reports false while
-// it consumed something (caller should poll again to confirm quiescence).
-func (t *turn) drainOnce(ctx context.Context, path string, offset *int64, pending *[]byte, usagePct *float64) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true
-	}
-	defer f.Close()
-	if _, err := f.Seek(*offset, io.SeekStart); err != nil {
-		return true
-	}
-	buf, _ := io.ReadAll(f)
-	if len(buf) == 0 {
-		return true
-	}
-	*offset += int64(len(buf))
-	*pending = append(*pending, buf...)
-	for {
-		i := bytes.IndexByte(*pending, '\n')
-		if i < 0 {
-			break
-		}
-		line := bytes.TrimSpace((*pending)[:i])
-		*pending = (*pending)[i+1:]
-		if len(line) == 0 {
-			continue
-		}
-		if pct := contextUsagePct(line); pct > 0 {
-			*usagePct = pct
-		}
-		if !t.emit(ctx, backend.Event{Type: "kiro", Raw: append([]byte(nil), line...)}) {
-			return true
-		}
-	}
-	return false
-}
-
-// exited reports whether the child process has finished (Wait returned).
-func (t *turn) exited() bool {
-	select {
-	case <-t.waitDone:
-		return true
-	default:
-		return false
-	}
-}
-
-func (t *turn) emit(ctx context.Context, ev backend.Event) bool {
-	select {
-	case t.out <- ev:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func (t *turn) emitErr(msg string) {
-	raw, _ := json.Marshal(backend.ErrorPayload{Message: msg})
-	select {
-	case t.out <- backend.Event{Type: backend.EventError, Raw: raw}:
-	default:
-	}
-}
-
-// killAndWait kills the child and blocks until the run's Wait goroutine
-// observes the exit (calling cmd.Wait twice is an error, so wait on waitDone).
-func (t *turn) killAndWait() {
-	_ = t.cmd.Process.Kill()
-	<-t.waitDone
-}
+// locate finds the transcript for id under the sessions root.
+func (r *Runtime) locate(id string) string { return Locate(r.root, id) }
 
 func (r *Runtime) Has(sessionID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, ok := r.running[sessionID]
-	return ok
+	w, ok := r.workers[sessionID]
+	return ok && w.busy
 }
 
 func (r *Runtime) LiveSessions() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]string, 0, len(r.running))
-	for id := range r.running {
+	out := make([]string, 0, len(r.workers))
+	for id := range r.workers {
 		out = append(out, id)
 	}
 	return out
 }
 
-// Interrupt cancels the in-flight turn; headless chat has no softer interrupt.
-func (r *Runtime) Interrupt(sessionID string) error { return r.Kill(sessionID) }
+// Interrupt cancels the in-flight turn via session/cancel.
+func (r *Runtime) Interrupt(sessionID string) error {
+	r.mu.Lock()
+	w := r.workers[sessionID]
+	r.mu.Unlock()
+	if w == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return w.conn.Cancel(ctx, sessionID)
+}
 
+// Kill closes the session's worker (the turn dies with the process).
 func (r *Runtime) Kill(sessionID string) error {
 	r.mu.Lock()
-	cancel := r.running[sessionID]
+	w := r.workers[sessionID]
+	delete(r.workers, sessionID)
 	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if w != nil {
+		w.conn.Close()
 	}
 	return nil
 }
 
 func (r *Runtime) Shutdown() {
 	r.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(r.running))
-	for _, cancel := range r.running {
-		cancels = append(cancels, cancel)
+	workers := make([]*worker, 0, len(r.workers))
+	for _, w := range r.workers {
+		workers = append(workers, w)
 	}
+	r.workers = map[string]*worker{}
 	r.mu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
+	for _, w := range workers {
+		w.conn.Close()
 	}
 }
 
@@ -587,7 +526,7 @@ func (r *Runtime) Shutdown() {
 // <root>/<hash>/sess_<id>/; legacy keeps <id>.json/.history/.lock sidecars in
 // cli/. Without this, kiro's own session list keeps offering a husk.
 func (r *Runtime) DeleteNative(id string) error {
-	if strings.HasPrefix(id, "sess_") {
+	if isV3(id) {
 		var dir string
 		_ = filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info == nil || !info.IsDir() {
@@ -620,7 +559,7 @@ func Locate(root, id string) string {
 	if root == "" || id == "" {
 		return ""
 	}
-	if !strings.HasPrefix(id, "sess_") {
+	if !isV3(id) {
 		p := filepath.Join(root, "cli", id+".jsonl")
 		if _, err := os.Stat(p); err == nil {
 			return p
@@ -645,44 +584,4 @@ func Locate(root, id string) string {
 		return nil
 	})
 	return found
-}
-
-// contextUsagePct extracts session_metadata contextUsage (a percentage).
-func contextUsagePct(line []byte) float64 {
-	var e struct {
-		Payload struct {
-			Type  string `json:"type"`
-			Key   string `json:"key"`
-			Value struct {
-				UsagePercentage float64 `json:"usagePercentage"`
-			} `json:"value"`
-		} `json:"payload"`
-	}
-	if json.Unmarshal(line, &e) != nil {
-		return 0
-	}
-	if e.Payload.Type == "session_metadata" && e.Payload.Key == "contextUsage" {
-		return e.Payload.Value.UsagePercentage
-	}
-	return 0
-}
-
-func sleepOrDone(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-time.After(d):
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func exitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
-	}
-	return 1
 }

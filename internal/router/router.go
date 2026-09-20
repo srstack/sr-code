@@ -142,6 +142,21 @@ func readOnlyError(backendName string) error {
 	return fmt.Errorf("backend %q is read-only", backendName)
 }
 
+// subagentReadOnly reports whether a subagent session is a parent-owned
+// transcript fragment (claude/codex: read-only) or a standalone session that
+// happens to have a parent (kiro legacy: resumable on its own, so sending,
+// deleting, and terminals are all fine).
+func (r *Router) subagentReadOnly(sess core.Session) bool {
+	if !sess.IsSubagent {
+		return false
+	}
+	switch r.backendOf(sess.ID) {
+	case "kiro", "kiro-legacy":
+		return false
+	}
+	return true
+}
+
 // Backend returns the composed capabilities registered for backendName.
 func (r *Router) Backend(backendName string) (backendpkg.Backend, bool) {
 	b, ok := r.backends[backendName]
@@ -384,7 +399,7 @@ func (r *Router) SessionPath(id string) (string, bool) {
 // ForkSession asks the source backend to branch the conversation after the
 // turn containing afterUUID and returns the new session id.
 func (r *Router) ForkSession(srcID, afterUUID string) (string, error) {
-	if sess, ok := r.discovery.Get(srcID); ok && sess.IsSubagent {
+	if sess, ok := r.discovery.Get(srcID); ok && r.subagentReadOnly(sess) {
 		return "", errors.New("subagent transcripts are read-only")
 	}
 	path, ok := r.discovery.Path(srcID)
@@ -457,7 +472,7 @@ func (r *Router) Unarchive(sessionID string) {
 // live-process teardown is best-effort. Unlike Archive (a reversible sidebar
 // hide), this is destructive.
 func (r *Router) DeleteSession(id string) error {
-	if sess, ok := r.discovery.Get(id); ok && sess.IsSubagent {
+	if sess, ok := r.discovery.Get(id); ok && r.subagentReadOnly(sess) {
 		return errors.New("subagent transcripts are read-only")
 	}
 	if r.ReadOnly(id) {
@@ -544,7 +559,7 @@ func (r *Router) deleteSubagentTranscripts(parentID, rootPath string) {
 func (r *Router) PauseSession(id string) error {
 	if sess, ok := r.discovery.Get(id); !ok {
 		return errors.New("session not found")
-	} else if sess.IsSubagent {
+	} else if r.subagentReadOnly(sess) {
 		return errors.New("subagent transcripts are read-only")
 	}
 	r.stopLive(id)
@@ -597,7 +612,7 @@ func (r *Router) enqueueSend(id, text, model string, pre func(), abort func(erro
 	if !ok {
 		return errors.New("session not found")
 	}
-	if sess.IsSubagent {
+	if r.subagentReadOnly(sess) {
 		return errors.New("subagent transcripts are read-only")
 	}
 	if r.ReadOnly(id) {
@@ -998,7 +1013,7 @@ func (r *Router) OpenTerminal(id string, cols, rows int) error {
 	if !ok {
 		return ErrSessionNotFound
 	}
-	if sess.IsSubagent {
+	if r.subagentReadOnly(sess) {
 		return errors.New("subagent transcripts are read-only")
 	}
 	if r.terminal == nil {
@@ -1029,7 +1044,7 @@ func (r *Router) SubmitTerminal(id, requestID, text string) error {
 	if !ok {
 		return ErrSessionNotFound
 	}
-	if sess.IsSubagent {
+	if r.subagentReadOnly(sess) {
 		return errors.New("subagent transcripts are read-only")
 	}
 	if r.terminal == nil {
