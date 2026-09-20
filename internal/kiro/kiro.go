@@ -123,11 +123,25 @@ func (r *Runtime) SendWithModel(ctx context.Context, id, prompt, cwd, model stri
 // child then inherits usher's cwd, which kiro scopes its session store to).
 func (r *Runtime) cwdFor(id string) string {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if p := r.paths[id]; p != "" {
-		if s, err := readSessionJSON(filepath.Dir(p)); err == nil && len(s.WorkspacePaths) > 0 {
-			return s.WorkspacePaths[0]
+	p := r.paths[id]
+	r.mu.Unlock()
+	if p == "" {
+		return ""
+	}
+	if !strings.HasPrefix(id, "sess_") {
+		// Legacy sidecar <id>.json next to cli/<id>.jsonl.
+		raw, err := os.ReadFile(strings.TrimSuffix(p, ".jsonl") + ".json")
+		if err != nil {
+			return ""
 		}
+		var sc legacySidecar
+		if json.Unmarshal(raw, &sc) == nil {
+			return sc.Cwd
+		}
+		return ""
+	}
+	if s, err := readSessionJSON(filepath.Dir(p)); err == nil && len(s.WorkspacePaths) > 0 {
+		return s.WorkspacePaths[0]
 	}
 	return ""
 }
@@ -192,7 +206,15 @@ type turn struct {
 
 func (r *Runtime) spawn(ctx context.Context, id, prompt, cwd, model string) (*turn, error) {
 	childCtx, cancel := context.WithCancel(ctx)
-	args := []string{"--v3", "chat", "--no-interactive", "--trust-all-tools"}
+	// Engine selection: v3 sessions (sess_ ids, and all new sessions) need
+	// --v3; legacy v1/v2 sessions (bare uuids) must NOT pass an engine flag —
+	// the CLI then negotiates the v2 engine from the session itself (passing
+	// --v2 explicitly breaks resume with "ACP load_session failed").
+	var args []string
+	if id == "" || strings.HasPrefix(id, "sess_") {
+		args = append(args, "--v3")
+	}
+	args = append(args, "chat", "--no-interactive", "--trust-all-tools")
 	if id != "" {
 		args = append(args, "--resume-id", id)
 	}
@@ -560,9 +582,49 @@ func (r *Runtime) Shutdown() {
 	}
 }
 
-// Locate finds the messages.jsonl for id under root, "" when absent.
+// DeleteNative sweeps kiro's own records after usher removed the transcript
+// file: v3 keeps session.json (and snapshots) beside messages.jsonl inside
+// <root>/<hash>/sess_<id>/; legacy keeps <id>.json/.history/.lock sidecars in
+// cli/. Without this, kiro's own session list keeps offering a husk.
+func (r *Runtime) DeleteNative(id string) error {
+	if strings.HasPrefix(id, "sess_") {
+		var dir string
+		_ = filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || !info.IsDir() {
+				return nil
+			}
+			if info.Name() == "cli" {
+				return filepath.SkipDir
+			}
+			if info.Name() == id {
+				dir = path
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if dir != "" {
+			return os.RemoveAll(dir)
+		}
+		return nil
+	}
+	for _, ext := range []string{".json", ".history", ".lock"} {
+		_ = os.Remove(filepath.Join(r.root, "cli", id+ext))
+	}
+	return nil
+}
+
+// Locate finds the transcript for id under root, "" when absent. Legacy
+// (v1/v2) sessions are flat files at cli/<uuid>.jsonl; v3 sessions are
+// <project-hash>/sess_<uuid>/messages.jsonl.
 func Locate(root, id string) string {
 	if root == "" || id == "" {
+		return ""
+	}
+	if !strings.HasPrefix(id, "sess_") {
+		p := filepath.Join(root, "cli", id+".jsonl")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 		return ""
 	}
 	var found string

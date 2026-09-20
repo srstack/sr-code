@@ -257,7 +257,7 @@ type legacySidecar struct {
 	Title         string    `json:"title"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
-	CreatedReason string    `json:"session_created_reason"` // "subagent" for agent-spawned sessions
+	CreatedReason string    `json:"session_created_reason"` // informational only; see ReadLegacySessionMeta
 }
 
 // ReadLegacySessionMeta builds the discovery descriptor for a legacy session
@@ -277,12 +277,9 @@ func ReadLegacySessionMeta(path string) (core.SessionMeta, error) {
 	meta.Cwd = sc.Cwd
 	meta.StartedAt = sc.CreatedAt
 	meta.LastInputAt = sc.UpdatedAt
-	// Subagent spawns carry no parent linkage in the sidecar; marking them
-	// keeps them out of the sidebar's root list (they're internal artifacts
-	// of the parent's pipeline, and kiro can't resume them anyway).
-	if sc.CreatedReason == "subagent" {
-		meta.IsSubagent = true
-	}
+	// Note: session_created_reason is NOT a reliable subagent marker (root
+	// sessions resumed standalone carry it too), so it is deliberately not
+	// used to hide sessions.
 	if st, err := os.Stat(path); err == nil {
 		meta.LastEventAt = st.ModTime()
 	}

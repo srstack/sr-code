@@ -124,4 +124,8 @@ type Backend struct {
 	Transcript Transcript
 	Forker     Forker
 	Models     ModelProvider
+	// NoCreate marks a continuation-only backend (e.g. kiro-legacy): existing
+	// sessions can be sent to, but it is never offered as a new-session
+	// choice and explicit creation is rejected.
+	NoCreate bool
 }

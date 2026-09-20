@@ -337,11 +337,18 @@ func serve(args []string) error {
 			defaultBackend = "kiro"
 		}
 		logger.Info("kiro backend enabled", "sessions_dir", dir)
-		// Legacy (v1/v2 engine) sessions in the flat cli/ store can't be
-		// resumed by the v3 engine — list them read-only, like dsh.
+		// Legacy (v1/v2 engine) sessions live in the flat cli/ store. The CLI
+		// resumes them headlessly without an engine flag (it negotiates v2
+		// from the session), so they share the kiro runtime; only the
+		// transcript parser differs.
 		if legacyDir := filepath.Join(dir, "cli"); isDir(legacyDir) {
 			sources = append(sources, discovery.NewKiroLegacySource(dir))
-			backends["kiro-legacy"] = backend.Backend{Transcript: kiro.LegacyTranscript{}}
+			backends["kiro-legacy"] = backend.Backend{
+				Runtime:    kiroRuntime,
+				Transcript: kiro.LegacyTranscript{},
+				Models:     kiroRuntime.Models(),
+				NoCreate:   true,
+			}
 			logger.Info("kiro legacy sessions enabled", "sessions_dir", legacyDir)
 		}
 	}

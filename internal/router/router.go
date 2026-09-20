@@ -120,7 +120,7 @@ func New(d *discovery.Discovery, backends map[string]backendpkg.Backend, default
 func (r *Router) Backends() []string {
 	out := make([]string, 0, len(r.backends))
 	for b, be := range r.backends {
-		if be.Runtime == nil {
+		if be.Runtime == nil || be.NoCreate {
 			continue
 		}
 		out = append(out, b)
@@ -1515,12 +1515,14 @@ func (r *Router) resolveCreateBackend(ctx context.Context, backend, model string
 	if !explicitBackend {
 		backend = backendForModel(model)
 	}
-	_, ok := r.backends[backend]
+	be, ok := r.backends[backend]
 	if !ok {
 		if explicitBackend {
 			return "", fmt.Errorf("backend %q is not enabled", backend)
 		}
 		backend = r.defaultBackend
+	} else if explicitBackend && be.NoCreate {
+		return "", fmt.Errorf("backend %q is continuation-only", backend)
 	}
 	if err := r.ValidateModel(ctx, backend, model); err != nil {
 		return "", err
